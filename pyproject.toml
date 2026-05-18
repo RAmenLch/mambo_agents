@@ -1,0 +1,19 @@
+[project]
+name = "mambo-agents"
+version = "0.1.0"
+description = "Add your description here"
+requires-python = ">=3.11"
+dependencies = [
+    "langchain",
+    "langgraph",
+    "deepagents",
+    "langchain-openai",
+    "wcmatch>=8.0",
+]
+
+[dependency-groups]
+dev = [
+    "pytest>=8.0",
+    "pytest-asyncio>=0.24",
+    "pytest-xdist>=3.8"
+]
