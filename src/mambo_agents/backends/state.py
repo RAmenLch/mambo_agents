@@ -1,12 +1,22 @@
-"""StateBackend – ephemeral in-memory file storage."""
+"""StateBackend — file storage via LangGraph Pregel state channels.
+
+Files are stored in the ``files`` channel of ``FilesystemState``, which
+participates in LangGraph checkpointing automatically.  A memory cache
+(``_pending_files``) bridges the gap between construction-time file
+population and the first graph execution.
+"""
 
 from __future__ import annotations
 
 import asyncio
 import base64
 import fnmatch
+import threading
 
+from langchain_core.runnables import RunnableConfig
 from langchain_core.tools import StructuredTool
+from langgraph._internal._constants import CONFIG_KEY_READ, CONFIG_KEY_SEND
+from langgraph.config import get_config
 from pydantic import Field, create_model
 
 from mambo_agents.backends.protocol import (
@@ -24,14 +34,14 @@ from mambo_agents.backends.protocol import (
     _get_file_type,
     _get_mime_type,
 )
-
-# ---------------------------------------------------------------------------
-# Constants
-# ---------------------------------------------------------------------------
-
-LINE_NUMBER_WIDTH = 6
-MAX_LINE_LENGTH = 5000
-
+from mambo_agents.backends.state_schema import FileData
+from mambo_agents.backends.utils import (
+    LINE_NUMBER_WIDTH,
+    MAX_LINE_LENGTH,
+    detect_trailing_newline_mismatch,
+    format_with_line_numbers,
+    human_size,
+)
 
 # ---------------------------------------------------------------------------
 # StateBackend
@@ -39,25 +49,163 @@ MAX_LINE_LENGTH = 5000
 
 
 class StateBackend(BackendProtocol):
-    """In-memory file storage backed by a ``dict``.
+    """File storage backed by a LangGraph Pregel state channel.
 
-    Files are keyed by absolute path.  Each value is::
-
-        {"content": str, "encoding": "utf-8" | "base64"}
+    Files live in the ``files`` field of ``FilesystemState``, which is
+    automatically checkpointed after each agent step.  A memory cache
+    (``_pending_files``) allows files to be populated *before* the graph
+    starts — via ``initial_files`` or ``upload_files()`` — and is flushed
+    to the Pregel channel on the first file access during execution.
 
     Extra tool provided: ``tree`` — displays directory structure.
 
     Parameters:
         initial_files: Optional ``{path: content_str}`` mapping to
-            pre-populate the store.
+            pre-populate the store before graph execution.
     """
 
     def __init__(self, initial_files: dict[str, str] | None = None) -> None:
-        self._files: dict[str, dict[str, str]] = {}
+        # Memory cache for files populated outside graph context.
+        # Flushed to the Pregel channel on the first ``_read_files()``
+        # call inside a graph execution.
+        self._lock = threading.Lock()
+        self._pending_files: dict[str, FileData] = {}
         if initial_files:
-            for path, content in initial_files.items():
+            for path, content_ in initial_files.items():
                 encoding = "base64" if _get_file_type(path) != "text" else "utf-8"
-                self._files[path] = {"content": content, "encoding": encoding}
+                self._pending_files[path] = FileData(
+                    content=content_, encoding=encoding,
+                )
+
+    # ------------------------------------------------------------------
+    # Dual-mode read / write (graph context or memory cache)
+    # ------------------------------------------------------------------
+    #
+    # **Mirror pattern**: ``_pending_files`` is kept in sync with the
+    # Pregel ``files`` channel during graph execution.  Writes inside a
+    # graph go to *both* the channel and the cache; reads inside a graph
+    # read from the channel and then mirror the result back to the cache.
+    #
+    # This ensures that after ``invoke()`` returns — when we are outside
+    # the graph context — ``_pending_files`` still has the latest state
+    # and callers can read files directly.
+
+    def _get_config(self) -> RunnableConfig:
+        """Return the current LangGraph config, or raise a clear error.
+
+        Raises *RuntimeError* when called outside a graph context.
+        """
+        try:
+            config = get_config()
+        except RuntimeError:
+            raise RuntimeError(
+                "StateBackend must be used inside a LangGraph graph execution. "
+            ) from None
+        configurable = config.get("configurable", {})
+        if CONFIG_KEY_READ not in configurable:
+            raise RuntimeError(
+                "StateBackend requires CONFIG_KEY_READ / CONFIG_KEY_SEND "
+                "in the LangGraph config."
+            )
+        return config
+
+    def _in_graph_context(self) -> bool:
+        """Return ``True`` if we are inside a LangGraph execution with
+        the ``files`` channel available.
+
+        Checks both that ``get_config()`` succeeds AND that
+        ``CONFIG_KEY_READ`` is present in the configurable dict.
+        This correctly returns ``False`` for:
+        - Direct ``read_tool.invoke()`` calls (no Pregel context)
+        - Worker threads spawned by ``asyncio.to_thread`` where the
+          context variable may yield a default config without the keys
+        """
+        try:
+            config = get_config()
+            configurable = config.get("configurable", {})
+            return CONFIG_KEY_READ in configurable
+        except RuntimeError:
+            return False
+
+    def _read_files(self) -> dict[str, FileData]:
+        """Read the files dict — from Pregel channel or memory cache.
+
+        **Mirror pattern**: ``_pending_files`` is the authoritative
+        mutable cache.  It is *never* cleared and *never* overwritten
+        with ``=`` — only ``.update()`` is used so that data written
+        via ``_send_files_update`` cannot be lost by a stale channel
+        read.
+
+        **Inside a graph**: flushes pending (outside-graph) files to
+        the channel on first call, reads from the channel, then merges
+        the channel data into the cache.
+
+        **Subagents** (no ``files`` channel): returns the cache directly.
+
+        **Outside a graph**: returns the cache directly.
+
+        Returns a **shallow copy** of the files dict so callers cannot
+        mutate the internal cache by accident.
+        """
+        if not self._in_graph_context():
+            with self._lock:
+                return dict(self._pending_files)
+
+        # Snapshot pending files under lock, then flush to channel
+        # outside the lock (Pregel operations may be slow).
+        with self._lock:
+            pending = dict(self._pending_files) if self._pending_files else None
+        if pending:
+            self._send_files_update(pending)
+
+        config = self._get_config()
+        read = config["configurable"][CONFIG_KEY_READ]
+        try:
+            channel_files = read("files", fresh=True) or {}
+        except KeyError:
+            # No ``files`` channel in this graph (e.g. subagent)
+            with self._lock:
+                return dict(self._pending_files)
+
+        # Merge channel data into cache under lock (never overwrite,
+        # never clear).  ``_send_files_update`` always mirrors first,
+        # so the cache is a superset of the channel — merging ensures
+        # we pick up files written by other nodes / restored from
+        # checkpoint.
+        with self._lock:
+            self._pending_files.update(channel_files)
+            return dict(self._pending_files)
+
+    def _send_files_update(self, update: dict[str, FileData]) -> None:
+        """Write a partial files update — to Pregel channel + memory cache.
+
+        **Always mirrors to ``_pending_files``** so the cache stays in
+        sync with the channel.  Inside a graph, also queues the update
+        via ``CONFIG_KEY_SEND`` for checkpoint participation.
+
+        Silently degrades to cache-only when the ``files`` channel is
+        absent (e.g. inside subagents that lack ``FilesystemState``).
+
+        Cache mutation is protected by ``self._lock`` to guard against
+        concurrent writes from the ``asyncio.to_thread`` pool.  Pregel
+        ``send()`` is called **outside** the lock to avoid holding it
+        during I/O.
+        """
+        # Mirror into cache under lock
+        with self._lock:
+            self._pending_files.update(update)
+
+        if not self._in_graph_context():
+            return  # Outside graph: cache is the only storage
+
+        try:
+            config = self._get_config()
+            send = config["configurable"][CONFIG_KEY_SEND]
+            send([("files", update)])
+        except (KeyError, RuntimeError):
+            # Channel not available (subagent without files channel) —
+            # mirror already done above, silently OK.
+            pass
 
     # ------------------------------------------------------------------
     # tools – extra tools only (core tools are built by middleware)
@@ -91,7 +239,8 @@ class StateBackend(BackendProtocol):
         infos: list[FileInfo] = []
         subdirs: set[str] = set()
 
-        for fpath, fd in self._files.items():
+        files = self._read_files()
+        for fpath, fd in files.items():
             if not fpath.startswith(normalized):
                 continue
             relative = fpath[len(normalized):]
@@ -115,7 +264,8 @@ class StateBackend(BackendProtocol):
         offset: int = 0,
         limit: int = 2000,
     ) -> ReadResult:
-        fd = self._files.get(file_path)
+        files = self._read_files()
+        fd = files.get(file_path)
         if fd is None:
             return ReadResult(error=f"File '{file_path}' not found")
 
@@ -139,7 +289,7 @@ class StateBackend(BackendProtocol):
 
         sliced = lines[offset: offset + limit]
         return ReadResult(
-            content=_format_with_line_numbers(
+            content=format_with_line_numbers(
                 "\n".join(sliced), start_line=offset + 1,
             ),
             total_lines=total,
@@ -149,7 +299,8 @@ class StateBackend(BackendProtocol):
     def write(
         self, file_path: str, content: str, overwrite: bool = False,
     ) -> WriteResult:
-        if file_path in self._files and not overwrite:
+        files = self._read_files()
+        if file_path in files and not overwrite:
             return WriteResult(
                 error=(
                     f"Cannot write '{file_path}': file already exists. "
@@ -158,7 +309,8 @@ class StateBackend(BackendProtocol):
                 ),
             )
         encoding = "base64" if _get_file_type(file_path) != "text" else "utf-8"
-        self._files[file_path] = {"content": content, "encoding": encoding}
+        fd: FileData = {"content": content, "encoding": encoding}
+        self._send_files_update({file_path: fd})
         return WriteResult(path=file_path)
 
     def edit(
@@ -169,7 +321,8 @@ class StateBackend(BackendProtocol):
         *,
         replace_all: bool = False,
     ) -> EditResult:
-        existing_fd = self._files.get(file_path)
+        files = self._read_files()
+        existing_fd = files.get(file_path)
         if existing_fd is None:
             return EditResult(
                 error=(
@@ -177,6 +330,14 @@ class StateBackend(BackendProtocol):
                     "To create a new file, use write()."
                 ),
             )
+        if existing_fd.get("encoding") == "base64":
+            return EditResult(
+                error=(
+                    f"Cannot edit '{file_path}': file is binary "
+                    f"(base64 encoded). Use write() to replace the file."
+                ),
+            )
+
         existing_content = existing_fd.get("content", "")
 
         occurrences = existing_content.count(old_str)
@@ -184,31 +345,11 @@ class StateBackend(BackendProtocol):
         if occurrences == 0:
             # Detect trailing-newline mismatch: model adds \n to old_str
             # but the file does not end with a newline.
-            if (
-                old_str.endswith("\n")
-                and len(old_str) > 1
-                and existing_content.endswith(old_str.removesuffix("\n"))
-            ):
-                stripped = old_str.removesuffix("\n")
-                stripped_count = existing_content.count(stripped)
-                if stripped_count == 1:
-                    return EditResult(
-                        error=(
-                            "old_str ends with a newline, but the file does not "
-                            "end with a newline. Retry with the trailing newline "
-                            "removed from old_str (and from new_str if it also "
-                            "ends with a newline)."
-                        ),
-                    )
-                return EditResult(
-                    error=(
-                        f"old_str ends with a newline, but the file does not "
-                        f"end with a newline. With the trailing newline removed, "
-                        f"old_str would appear {stripped_count} times. "
-                        f"Retry with the trailing newline removed and add "
-                        f"surrounding context so the match is unique."
-                    ),
-                )
+            mismatch = detect_trailing_newline_mismatch(
+                file_path, old_str, existing_content,
+            )
+            if mismatch is not None:
+                return mismatch
             return EditResult(
                 error=(
                     f"Cannot edit '{file_path}': old_str not found in file. "
@@ -225,10 +366,11 @@ class StateBackend(BackendProtocol):
                 ),
             )
 
-        self._files[file_path] = {
+        fd: FileData = {
             "content": existing_content.replace(old_str, new_str),
             "encoding": existing_fd.get("encoding", "utf-8"),
         }
+        self._send_files_update({file_path: fd})
         return EditResult(path=file_path, occurrences=occurrences)
 
     def grep(
@@ -237,10 +379,12 @@ class StateBackend(BackendProtocol):
         path: str = "/",
         glob: str | None = None,
     ) -> GrepResult:
-        return _grep_in_memory(self._files, pattern, path, glob)
+        files = self._read_files()
+        return _grep_in_memory(files, pattern, path, glob)
 
     def glob(self, pattern: str, path: str = "/") -> GlobResult:
-        return _glob_in_memory(self._files, pattern, path)
+        files = self._read_files()
+        return _glob_in_memory(files, pattern, path)
 
     # ------------------------------------------------------------------
     # Extra operations
@@ -256,13 +400,20 @@ class StateBackend(BackendProtocol):
         return await asyncio.to_thread(self.tree, path, depth)
 
     # ------------------------------------------------------------------
-    # Developer API
+    # Developer API — upload / download
     # ------------------------------------------------------------------
 
     def upload_files(
         self, files: list[tuple[str, bytes]]
     ) -> list[UploadFileResult]:
+        """Upload multiple files (works inside or outside graph context).
+
+        Inside a graph the files go directly to the Pregel channel;
+        outside a graph they are cached in ``_pending_files`` and
+        injected on the first ``_read_files()`` call.
+        """
         results: list[UploadFileResult] = []
+        update: dict[str, FileData] = {}
         for path, raw_content in files:
             try:
                 text = raw_content.decode("utf-8")
@@ -270,16 +421,20 @@ class StateBackend(BackendProtocol):
             except UnicodeDecodeError:
                 text = base64.b64encode(raw_content).decode("ascii")
                 encoding = "base64"
-            self._files[path] = {"content": text, "encoding": encoding}
+            fd: FileData = {"content": text, "encoding": encoding}
+            update[path] = fd
             results.append(UploadFileResult(path=path, error=None))
+
+        self._send_files_update(update)
         return results
 
     def download_files(
         self, paths: list[str]
     ) -> list[DownloadFileResult]:
         results: list[DownloadFileResult] = []
+        files = self._read_files()
         for path in paths:
-            fd = self._files.get(path)
+            fd = files.get(path)
             if fd is None:
                 results.append(
                     DownloadFileResult(path=path, content=None, error="file_not_found")
@@ -302,28 +457,8 @@ class StateBackend(BackendProtocol):
 # ============================================================================
 
 
-def _format_with_line_numbers(content: str, start_line: int = 1) -> str:
-    """Format content with line numbers (``cat -n`` style)."""
-    lines = content.split("\n")
-    if lines and lines[-1] == "":
-        lines = lines[:-1]
-
-    result: list[str] = []
-    for i, line in enumerate(lines):
-        num = i + start_line
-        if len(line) <= MAX_LINE_LENGTH:
-            result.append(f"{num:{LINE_NUMBER_WIDTH}d}\t{line}")
-        else:
-            chunk_count = (len(line) + MAX_LINE_LENGTH - 1) // MAX_LINE_LENGTH
-            for ci in range(chunk_count):
-                chunk = line[ci * MAX_LINE_LENGTH:(ci + 1) * MAX_LINE_LENGTH]
-                marker = f"{num}.{ci}" if ci > 0 else str(num)
-                result.append(f"{marker:>{LINE_NUMBER_WIDTH}}\t{chunk}")
-    return "\n".join(result)
-
-
 def _grep_in_memory(
-    files: dict[str, dict[str, str]],
+    files: dict[str, FileData],
     pattern: str,
     path: str = "/",
     file_glob: str | None = None,
@@ -347,7 +482,7 @@ def _grep_in_memory(
 
 
 def _glob_in_memory(
-    files: dict[str, dict[str, str]],
+    files: dict[str, FileData],
     pattern: str,
     path: str = "/",
 ) -> GlobResult:
@@ -407,15 +542,6 @@ def _format_tree(
             name += "/"
             size_str = ""
         else:
-            size_str = f" ({_human_size(size)})"
+            size_str = f" ({human_size(size)})"
         lines.append(f"{prefix}{connector}{name}{size_str}")
     return "\n".join(lines)
-
-
-def _human_size(size: int) -> str:
-    """Format *size* as a human-readable string."""
-    for unit in ("B", "KB", "MB", "GB"):
-        if size < 1024:
-            return f"{size} {unit}"
-        size //= 1024
-    return f"{size} TB"

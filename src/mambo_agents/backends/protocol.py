@@ -15,6 +15,8 @@ from typing import Literal
 from langchain_core.tools import StructuredTool
 from pydantic import BaseModel, ConfigDict
 
+from mambo_agents.backends.utils import human_size
+
 
 # ============================================================================
 # File type classification
@@ -130,7 +132,7 @@ class LsResult(BaseModel):
             if fi.is_dir:
                 lines.append(f"{fi.path}/")
             else:
-                lines.append(f"{fi.path}  ({_human_size(fi.size)})")
+                lines.append(f"{fi.path}  ({human_size(fi.size)})")
         return "\n".join(lines)
 
 
@@ -467,15 +469,4 @@ class BackendProtocol(abc.ABC):
         return await asyncio.to_thread(self.download_files, paths)
 
 
-# ============================================================================
-# Internal helpers
-# ============================================================================
 
-
-def _human_size(size: int) -> str:
-    """Format *size* as a human-readable string."""
-    for unit in ("B", "KB", "MB", "GB"):
-        if size < 1024:
-            return f"{size} {unit}"
-        size //= 1024
-    return f"{size} TB"

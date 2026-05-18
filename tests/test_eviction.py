@@ -269,11 +269,11 @@ class TestEviction:
 
         # Monkey-patch write to allow overwrites
         _orig_write = mw.backend.write
-        _files = mw.backend._files
+        _pending = mw.backend._pending_files
 
         def _allow_overwrite_write(file_path: str, content: str):
             # Always overwrite: remove existing entry first
-            _files.pop(file_path, None)
+            _pending.pop(file_path, None)
             return _orig_write(file_path, content)
 
         mw.backend.write = _allow_overwrite_write  # type: ignore[method-assign]

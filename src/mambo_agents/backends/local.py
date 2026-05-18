@@ -34,6 +34,13 @@ from mambo_agents.backends.protocol import (
     _get_file_type,
     _get_mime_type,
 )
+from mambo_agents.backends.utils import (
+    LINE_NUMBER_WIDTH,
+    MAX_LINE_LENGTH,
+    detect_trailing_newline_mismatch,
+    format_with_line_numbers,
+    human_size,
+)
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -41,40 +48,6 @@ from mambo_agents.backends.protocol import (
 
 _DEFAULT_EXECUTE_TIMEOUT = 120
 _MAX_OUTPUT_BYTES = 100_000
-_LINE_NUMBER_WIDTH = 6
-_MAX_LINE_LENGTH = 5000
-
-
-# ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
-
-def _human_size(size: int) -> str:
-    for unit in ("B", "KB", "MB", "GB"):
-        if size < 1024:
-            return f"{size} {unit}"
-        size //= 1024
-    return f"{size} TB"
-
-
-def _format_with_line_numbers(content: str, start_line: int = 1) -> str:
-    """Format content with line numbers (``cat -n`` style)."""
-    lines = content.split("\n")
-    if lines and lines[-1] == "":
-        lines = lines[:-1]
-
-    result: list[str] = []
-    for i, line in enumerate(lines):
-        num = i + start_line
-        if len(line) <= _MAX_LINE_LENGTH:
-            result.append(f"{num:{_LINE_NUMBER_WIDTH}d}\t{line}")
-        else:
-            chunk_count = (len(line) + _MAX_LINE_LENGTH - 1) // _MAX_LINE_LENGTH
-            for ci in range(chunk_count):
-                chunk = line[ci * _MAX_LINE_LENGTH:(ci + 1) * _MAX_LINE_LENGTH]
-                marker = f"{num}.{ci}" if ci > 0 else str(num)
-                result.append(f"{marker:>{_LINE_NUMBER_WIDTH}}\t{chunk}")
-    return "\n".join(result)
 
 
 # ---------------------------------------------------------------------------
@@ -310,7 +283,7 @@ class LocalBackend(BackendProtocol):
 
         sliced = lines[offset: offset + limit]
         return ReadResult(
-            content=_format_with_line_numbers("\n".join(sliced), start_line=offset + 1),
+            content=format_with_line_numbers("\n".join(sliced), start_line=offset + 1),
             total_lines=total,
             encoding="utf-8",
         )
@@ -362,31 +335,11 @@ class LocalBackend(BackendProtocol):
 
         if occurrences == 0:
             # Detect trailing-newline mismatch
-            if (
-                old_str.endswith("\n")
-                and len(old_str) > 1
-                and content.endswith(old_str.removesuffix("\n"))
-            ):
-                stripped = old_str.removesuffix("\n")
-                stripped_count = content.count(stripped)
-                if stripped_count == 1:
-                    return EditResult(
-                        error=(
-                            "old_str ends with a newline, but the file does not "
-                            "end with a newline. Retry with the trailing newline "
-                            "removed from old_str (and from new_str if it also "
-                            "ends with a newline)."
-                        ),
-                    )
-                return EditResult(
-                    error=(
-                        f"old_str ends with a newline, but the file does not "
-                        f"end with a newline. With the trailing newline removed, "
-                        f"old_str would appear {stripped_count} times. "
-                        f"Retry with the trailing newline removed and add "
-                        f"surrounding context so the match is unique."
-                    ),
-                )
+            mismatch = detect_trailing_newline_mismatch(
+                file_path, old_str, content,
+            )
+            if mismatch is not None:
+                return mismatch
             return EditResult(
                 error=(
                     f"Cannot edit '{file_path}': old_str not found in file. "
@@ -740,7 +693,7 @@ def _walk_tree(
                 size = child.stat().st_size
             except OSError:
                 size = 0
-            entries.append((f"{child.name} ({_human_size(size)})", current_depth))
+            entries.append((f"{child.name} ({human_size(size)})", current_depth))
 
     return entries
 

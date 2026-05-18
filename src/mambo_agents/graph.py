@@ -146,6 +146,18 @@ def create_mambo_agent(
         agent = create_mambo_agent("gpt-4o")
         result = agent.invoke({"messages": [HumanMessage("Create a hello.py file")]})
 
+    Example with pre-populated files::
+
+        agent = create_mambo_agent(
+            "gpt-4o",
+            backend=StateBackend(initial_files={
+                "/config.json": '{"port": 8080}',
+            }),
+        )
+        result = agent.invoke({
+            "messages": [HumanMessage("analyze config.json")],
+        })
+
     Example with subagents and streaming::
 
         agent = create_mambo_agent(

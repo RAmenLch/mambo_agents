@@ -18,7 +18,6 @@ from typing import Annotated
 
 from langchain.agents.middleware.types import (
     AgentMiddleware,
-    AgentState,
     ModelRequest,
     ModelResponse,
     ResponseT,
@@ -33,6 +32,7 @@ from langgraph.typing import ContextT
 from pydantic import BaseModel, Field
 
 from mambo_agents.backends.protocol import BackendProtocol, ReadResult
+from mambo_agents.backends.state_schema import FilesystemState
 
 
 # ---------------------------------------------------------------------------
@@ -407,7 +407,7 @@ def build_core_tools(backend: BackendProtocol) -> list[StructuredTool]:
 # ---------------------------------------------------------------------------
 
 
-class BackendToolsMiddleware(AgentMiddleware[AgentState, ContextT, ResponseT]):
+class BackendToolsMiddleware(AgentMiddleware[FilesystemState, ContextT, ResponseT]):
     """Middleware that registers all tools: core + backend extras.
 
     Also intercepts oversized tool results and evicts them to the
@@ -423,7 +423,7 @@ class BackendToolsMiddleware(AgentMiddleware[AgentState, ContextT, ResponseT]):
             Defaults to 20000.
     """
 
-    state_schema = AgentState
+    state_schema = FilesystemState
 
     def __init__(
         self,
