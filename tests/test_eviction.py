@@ -9,6 +9,7 @@ from langchain_core.messages import ToolMessage
 from langgraph.prebuilt.tool_node import ToolCallRequest
 
 from mambo_agents.backends.state import StateBackend
+from tests.test_state_backend import _simulate_graph
 from mambo_agents.middleware.backend_tools import (
     BackendToolsMiddleware,
     _build_preview,
@@ -135,7 +136,8 @@ class TestEviction:
         result = ToolMessage(content=huge, tool_call_id="call_002", name="tree")
         request = _make_request("tree", tool_call_id="call_002")
 
-        final = mw._maybe_evict(result, request)
+        with _simulate_graph(mw.backend):
+            final = mw._maybe_evict(result, request)
         assert final is not result
         assert "Tool result too large" in final.content
         assert _EVICTION_PREFIX in final.content
@@ -147,11 +149,13 @@ class TestEviction:
         result = ToolMessage(content=huge, tool_call_id="call_003", name="tree")
         request = _make_request("tree", tool_call_id="call_003")
 
-        mw._maybe_evict(result, request)
+        with _simulate_graph(mw.backend):
+            mw._maybe_evict(result, request)
 
         # Read back from backend
         sane_id = _sanitize_tool_call_id("call_003")
-        read_result = mw.backend.read(f"{_EVICTION_PREFIX}/{sane_id}")
+        with _simulate_graph(mw.backend):
+            read_result = mw.backend.read(f"{_EVICTION_PREFIX}/{sane_id}")
         assert read_result.error is None
         assert "HELLO_EVICTED_CONTENT" in (read_result.content or "")
 
@@ -163,7 +167,8 @@ class TestEviction:
         result = ToolMessage(content=huge, tool_call_id="call_004", name="tree")
         request = _make_request("tree", tool_call_id="call_004")
 
-        final = mw._maybe_evict(result, request)
+        with _simulate_graph(mw.backend):
+            final = mw._maybe_evict(result, request)
 
         assert "     1|line_000" in final.content
         assert "TOOL_RESULT_EVICTED" not in final.content  # should not be the raw template
@@ -176,7 +181,8 @@ class TestEviction:
         result = ToolMessage(content=huge, tool_call_id="call_007", name="tree")
         request = _make_request("tree", tool_call_id="call_007")
 
-        final = mw._maybe_evict(result, request)
+        with _simulate_graph(mw.backend):
+            final = mw._maybe_evict(result, request)
         assert final.tool_call_id == "call_007"
 
     def test_eviction_preserves_tool_name(self):
@@ -186,7 +192,8 @@ class TestEviction:
         result = ToolMessage(content=huge, tool_call_id="call_008", name="execute")
         request = _make_request("execute", tool_call_id="call_008")
 
-        final = mw._maybe_evict(result, request)
+        with _simulate_graph(mw.backend):
+            final = mw._maybe_evict(result, request)
         assert final.name == "execute"
 
     def test_excluded_tool_ls_not_evicted(self):
@@ -262,36 +269,35 @@ class TestEviction:
     def test_same_tool_call_id_no_conflict(self):
         """Two evictions with the same tool_call_id: the second overwrites.
 
-        Since StateBackend.write fails on existing files, we patch write
-        to allow overwrites for this test only.
+        Since StateBackend.write fails on existing files, we clear the
+        file from the snapshot before the second eviction to simulate
+        the overwrite.
         """
         mw = _make_middleware(threshold=30)
-
-        # Monkey-patch write to allow overwrites
-        _orig_write = mw.backend.write
-        _pending = mw.backend._pending_files
-
-        def _allow_overwrite_write(file_path: str, content: str):
-            # Always overwrite: remove existing entry first
-            _pending.pop(file_path, None)
-            return _orig_write(file_path, content)
-
-        mw.backend.write = _allow_overwrite_write  # type: ignore[method-assign]
 
         # First eviction
         huge1 = "FIRST_CONTENT" * 40  # ~130 tokens
         result1 = ToolMessage(content=huge1, tool_call_id="call_dup", name="tree")
         req1 = _make_request("tree", tool_call_id="call_dup")
-        mw._maybe_evict(result1, req1)
+        with _simulate_graph(mw.backend):
+            mw._maybe_evict(result1, req1)
+
+        sane_id = _sanitize_tool_call_id("call_dup")
+        file_path = f"{_EVICTION_PREFIX}/{sane_id}"
+
+        # Remove the file from the snapshot so overwrite succeeds
+        with mw.backend._lock:
+            mw.backend._snapshots["test"].pop(file_path, None)
 
         # Second eviction
         huge2 = "SECOND_CONTENT" * 40  # ~130 tokens
         result2 = ToolMessage(content=huge2, tool_call_id="call_dup", name="tree")
         req2 = _make_request("tree", tool_call_id="call_dup")
-        mw._maybe_evict(result2, req2)
+        with _simulate_graph(mw.backend):
+            mw._maybe_evict(result2, req2)
 
-        sane_id = _sanitize_tool_call_id("call_dup")
-        read = mw.backend.read(f"{_EVICTION_PREFIX}/{sane_id}")
+        with _simulate_graph(mw.backend):
+            read = mw.backend.read(file_path)
         assert "SECOND_CONTENT" in (read.content or "")
         assert "FIRST_CONTENT" not in (read.content or "")
 
@@ -339,7 +345,8 @@ class TestEvictionAsync:
         result = ToolMessage(content=huge, tool_call_id="call_async_02", name="tree")
         request = _make_request("tree", tool_call_id="call_async_02")
 
-        final = await mw._amaybe_evict(result, request)
+        with _simulate_graph(mw.backend):
+            final = await mw._amaybe_evict(result, request)
         assert final is not result
         assert "Tool result too large" in final.content
 
@@ -351,10 +358,12 @@ class TestEvictionAsync:
         result = ToolMessage(content=huge, tool_call_id="call_async_03", name="tree")
         request = _make_request("tree", tool_call_id="call_async_03")
 
-        await mw._amaybe_evict(result, request)
+        with _simulate_graph(mw.backend):
+            await mw._amaybe_evict(result, request)
 
         sane_id = _sanitize_tool_call_id("call_async_03")
-        read_result = await mw.backend.aread(f"{_EVICTION_PREFIX}/{sane_id}")
+        with _simulate_graph(mw.backend):
+            read_result = await mw.backend.aread(f"{_EVICTION_PREFIX}/{sane_id}")
         assert read_result.error is None
         assert "ASYNC_CONTENT" in (read_result.content or "")
 

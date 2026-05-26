@@ -1,3 +1,7 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
 [project]
 name = "mambo-agents"
 version = "0.1.0"
@@ -6,10 +10,16 @@ requires-python = ">=3.11"
 dependencies = [
     "langchain",
     "langgraph",
-    "deepagents",
-    "langchain-openai",
+    "deepagents", # 仅用于代码参考 后续删除
+    "paramiko>=3.0",
     "wcmatch>=8.0",
 ]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/mambo_agents"]
+
+[project.scripts]
+mambo-chat = "mambo_agents.cli.chat:main"
 
 [dependency-groups]
 dev = [

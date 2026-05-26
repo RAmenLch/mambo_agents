@@ -4,6 +4,10 @@ from mambo_agents.backends.protocol import BackendProtocol
 from mambo_agents.backends.state import StateBackend
 from mambo_agents.backends.state_schema import FileData, FilesystemState
 from mambo_agents.graph import create_mambo_agent
+from mambo_agents.middleware.async_subagents import (
+    AsyncSubAgentMiddleware,
+    AsyncTaskData,
+)
 from mambo_agents.middleware.planning import (
     MamboPlanMiddleware,
     Plan,
@@ -28,6 +32,8 @@ from mambo_agents.middleware.summarization import (
 )
 
 __all__ = [
+    "AsyncSubAgentMiddleware",
+    "AsyncTaskData",
     "BackendProtocol",
     "CompiledSubAgent",
     "EventGranularity",

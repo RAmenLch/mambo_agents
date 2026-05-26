@@ -24,12 +24,21 @@ from langgraph.store.base import BaseStore
 from mambo_agents._version import __version__
 from mambo_agents.backends.protocol import BackendProtocol
 from mambo_agents.backends.state import StateBackend
-from mambo_agents.middleware.backend_tools import BackendToolsMiddleware, build_core_tools
+from mambo_agents.middleware.backend_tools import (
+    BackendToolsMiddleware,
+    build_core_tools,
+    build_tool_descriptions,
+)
 from mambo_agents.middleware.patch_tool_calls import PatchToolCallsMiddleware
+from mambo_agents.middleware.security_review import (
+    AutoSecurityReviewMiddleware,
+    SecurityReviewConfig,
+)
 from mambo_agents.middleware.skills import (
     SkillSource,
     SkillsMiddleware,
 )
+from mambo_agents.middleware.async_subagents import AsyncSubAgentMiddleware
 from mambo_agents.middleware.subagents import (
     CompiledSubAgent,
     EventGranularity,
@@ -41,6 +50,7 @@ from mambo_agents.middleware.subagents import (
 )
 from mambo_agents.middleware.summarization import (
     DEFAULT_MAMBO_SUMMARY_PROMPT,
+    DEFAULT_MAMBO_CHAINED_SUMMARY_PROMPT,
     MamboSummarizationMiddleware,
     SummarizationConfig,
     SummaryHook,
@@ -69,12 +79,15 @@ def create_mambo_agent(
     system_prompt: str | None = None,
     subagents: Sequence[SubAgent | CompiledSubAgent] | None = None,
     include_general_purpose: bool = False,
+    async_subagents: Sequence[SubAgent | CompiledSubAgent] | None = None,
+    async_subagent_timeout: float = 3600.0,
     event_granularity: EventGranularity = "updates",
     middleware: Sequence[AgentMiddleware] | None = None,
     summarization: SummarizationConfig | None = None,
     skills: Sequence[SkillSource] | None = None,
     tools: Sequence[BaseTool] | None = None,
     interrupt_on: dict[str, bool | InterruptOnConfig] | None = None,
+    security_review: SecurityReviewConfig | None = None,
     checkpointer: BaseCheckpointSaver | None = None,
     store: BaseStore | None = None,
     name: str | None = None,
@@ -92,6 +105,13 @@ def create_mambo_agent(
             ``"general-purpose"`` subagent (with the same model, backend
             tools, and system prompt as the main agent).  Default:
             ``False``.
+        async_subagents: Optional async subagent specs.  Each runs in a
+            background thread — ``async_task()`` returns immediately with
+            a ``task_id``, and results are retrieved later via
+            ``async_status(task_id)``.  Subagents receive a
+            ``report_progress`` tool for intermediate progress reporting.
+        async_subagent_timeout: Maximum seconds an async subagent may run
+            before being force-cancelled.  Default: ``3600`` (1 hour).
         event_granularity: Streaming detail level for subagent custom
             events. ``"messages"`` (finest, token-level), ``"updates"``
             (default, per-node), ``"values"`` (coarsest, per-step).
@@ -128,9 +148,39 @@ def create_mambo_agent(
             Default: ``None`` (skills disabled).
         tools: Additional (non-file-system) tools.
         interrupt_on: Mapping of ``tool_name → bool or InterruptOnConfig``.
-            When set, the ``HumanInTheLoopMiddleware`` is added so that
-            calls to the specified tools pause for human approval.
-            Requires a *checkpointer* (e.g. ``MemorySaver()``).
+            When set, adds human-in-the-loop so that calls to the specified
+            tools pause for human approval.  Requires a *checkpointer*
+            (e.g. ``MemorySaver()``).
+
+            By default the classic ``HumanInTheLoopMiddleware`` is used
+            (direct human review every time).  To enable AI-assisted
+            pre-screening, pass ``security_review=SecurityReviewConfig()``.
+
+        security_review: Optional configuration to enable AI-assisted
+            security pre-screening before human-in-the-loop.  When set,
+            ``AutoSecurityReviewMiddleware`` replaces the default
+            ``HumanInTheLoopMiddleware``.
+
+            .. code-block:: python
+
+                from mambo_agents.middleware import SecurityReviewConfig
+
+                # Enable AI review for all interrupt_on tools
+                security_review=SecurityReviewConfig()
+
+                # Custom: cheaper model + selective tool review
+                security_review=SecurityReviewConfig(
+                    model="gpt-4o-mini",
+                    review_tools=frozenset(["edit", "delete"]),
+                    system_prompt="You are an expert security auditor...",
+                )
+
+            - ``model``: review model (``None`` = reuse agent model).
+            - ``system_prompt``: custom security review prompt.
+            - ``review_tools``: ``"all"`` (default) or ``frozenset[str]``.
+              Tools not in the set get direct HITL (no AI review).
+
+            Default: ``None`` (no AI pre-screening, classic HITL).
         checkpointer: Optional LangGraph checkpointer.  Required when using
             ``interrupt_on``.
         store: Optional LangGraph store.
@@ -179,6 +229,32 @@ def create_mambo_agent(
             stream_mode=["updates", "custom"],
         ):
             print(event)
+
+    Example with async subagents::
+
+        agent = create_mambo_agent(
+            "gpt-4o",
+            backend=LocalBackend(),
+            async_subagents=[
+                {
+                    "name": "deployer",
+                    "description": "Deploy services to Kubernetes",
+                    "system_prompt": "You are a deployment expert...",
+                    "model": "gpt-4o",
+                    "tools": [kubectl_tool, helm_tool],
+                },
+            ],
+            async_subagent_timeout=1800,  # 30 minutes
+        )
+        result = agent.invoke(
+            {"messages": [HumanMessage("Deploy v2.3 to prod")]}
+        )
+        # Agent: "Launched task a3f4b2c1, running in background..."
+        # ... later ...
+        result = agent.invoke(
+            {"messages": [HumanMessage("Check a3f4b2c1")]}
+        )
+        # Agent reads progress/result via async_status
     """
     if backend is None:
         backend = StateBackend()
@@ -227,6 +303,9 @@ def create_mambo_agent(
                 summary_prompt=summarization.get(
                     "summary_prompt", DEFAULT_MAMBO_SUMMARY_PROMPT
                 ),
+                chained_summary_prompt=summarization.get(
+                    "chained_summary_prompt", DEFAULT_MAMBO_CHAINED_SUMMARY_PROMPT
+                ),
                 trim_tokens_to_summarize=summarization.get(
                     "trim_tokens_to_summarize", 4000
                 ),
@@ -268,13 +347,39 @@ def create_mambo_agent(
             )
         )
 
+    # ---- Async Subagents (opt-in) -----------------------------------------
+    if async_subagents is not None:
+        mw.append(
+            AsyncSubAgentMiddleware(
+                backend=backend,
+                async_subagents=list(async_subagents),
+                default_timeout=async_subagent_timeout,
+            )
+        )
+
     if interrupt_on is not None:
         if checkpointer is None:
             raise ValueError(
                 "interrupt_on requires a checkpointer (e.g. MemorySaver()). "
                 "Pass `checkpointer=MemorySaver()` to create_mambo_agent."
             )
-        mw.append(HumanInTheLoopMiddleware(interrupt_on=interrupt_on))
+        if security_review is not None:
+            # ---- AI-assisted security pre-screening ----
+            _review_model: str | BaseChatModel = security_review.model or model
+            _review_tools = security_review.review_tools
+            _descs = build_tool_descriptions(backend, tools=tools)
+            mw.append(
+                AutoSecurityReviewMiddleware(
+                    interrupt_on=interrupt_on,
+                    model=_review_model,
+                    review_tools=_review_tools,
+                    security_review_system_prompt=security_review.system_prompt,
+                    tool_descriptions=_descs,
+                )
+            )
+        else:
+            # ---- Classic HITL (no AI review) ----
+            mw.append(HumanInTheLoopMiddleware(interrupt_on=interrupt_on))
 
     # ---- Safety net (always on) -------------------------------------------
     mw.append(PatchToolCallsMiddleware())

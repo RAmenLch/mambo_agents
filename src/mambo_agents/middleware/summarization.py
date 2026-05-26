@@ -124,8 +124,7 @@ Messages to summarize:
 {messages}
 </messages>"""  # noqa: E501
 
-
-CHAINED_MAMBO_SUMMARY_PROMPT = """<role>
+DEFAULT_MAMBO_CHAINED_SUMMARY_PROMPT = """<role>
 Context Extraction Assistant
 </role>
 
@@ -451,6 +450,12 @@ class SummarizationConfig(TypedDict, total=False):
     trigger: ContextSize | list[ContextSize] | None
     keep: ContextSize
     summary_prompt: str
+    chained_summary_prompt: NotRequired[str]
+    """Prompt template for chained summarization (when prior summaries exist).
+
+    Must contain ``{previous_summaries}`` and ``{messages}`` placeholders.
+    Default: ``DEFAULT_MAMBO_CHAINED_SUMMARY_PROMPT``.
+    """
     trim_tokens_to_summarize: int | None
     token_counter: TokenCounter
     chars_per_token: float | None
@@ -537,6 +542,7 @@ class MamboSummarizationMiddleware(AgentMiddleware[SummarizationState, ContextT,
         trigger: ContextSize | list[ContextSize] | None = None,
         keep: ContextSize = ("messages", _DEFAULT_MESSAGES_TO_KEEP),
         summary_prompt: str = DEFAULT_MAMBO_SUMMARY_PROMPT,
+        chained_summary_prompt: str = DEFAULT_MAMBO_CHAINED_SUMMARY_PROMPT,
         trim_tokens_to_summarize: int | None = _DEFAULT_TRIM_TOKEN_LIMIT,
         token_counter: TokenCounter | None = None,
         chars_per_token: float | None = None,
@@ -568,6 +574,11 @@ class MamboSummarizationMiddleware(AgentMiddleware[SummarizationState, ContextT,
             summary_prompt=summary_prompt,
             trim_tokens_to_summarize=trim_tokens_to_summarize,
         )
+
+        # Store both summary prompts so _create_summary can pick the right
+        # one based on whether prior summaries exist.
+        self._summary_prompt = summary_prompt
+        self._chained_summary_prompt = chained_summary_prompt
 
         self._token_counter = token_counter
         self._offload_to_backend_flag = offload_to_backend
@@ -975,18 +986,13 @@ class MamboSummarizationMiddleware(AgentMiddleware[SummarizationState, ContextT,
     # ------------------------------------------------------------------
 
     def _create_summary(self, messages_to_summarize: list[AnyMessage]) -> str:
-        """Generate a summary, preserving content from prior summaries.
+        """Generate a summary using the configured prompt.
 
         When ``messages_to_summarize`` contains previous summary
         ``HumanMessage`` objects (tagged ``lc_source="summarization"``),
-        those are extracted and injected into a dedicated
-        ``<previous_summaries>`` section of the prompt.  The LLM is
-        explicitly instructed that this content is non-negotiable — it
-        represents earlier conversation detail that has already been
-        permanently removed.
-
-        For the first summarization (no prior summaries), delegates directly
-        to the langchain helper.
+        the ``chained_summary_prompt`` is used with ``{previous_summaries}``
+        and ``{messages}``.  Otherwise the ``summary_prompt`` is used
+        with only ``{messages}``.
 
         Args:
             messages_to_summarize: Messages to be summarized (may include
@@ -996,39 +1002,37 @@ class MamboSummarizationMiddleware(AgentMiddleware[SummarizationState, ContextT,
             The generated summary text.
         """
         prev_summaries = [msg for msg in messages_to_summarize if self._is_summary_message(msg)]
-        if not prev_summaries:
-            return self._lc_helper._create_summary(messages_to_summarize)
-
-        # Chained summarization — merge previous summaries with new context.
         non_summary = [msg for msg in messages_to_summarize if not self._is_summary_message(msg)]
+        buffer = get_buffer_string(non_summary)
 
-        prev_text = "\n\n".join(
-            f"### Previous Summary {i + 1}\n{msg.content}"
-            for i, msg in enumerate(prev_summaries)
-        )
-
-        prompt = CHAINED_MAMBO_SUMMARY_PROMPT.format(
-            previous_summaries=prev_text,
-            messages=get_buffer_string(non_summary),
-        )
+        if prev_summaries:
+            prev_text = "\n\n".join(
+                f"### Previous Summary {i + 1}\n{msg.content}"
+                for i, msg in enumerate(prev_summaries)
+            )
+            prompt = self._chained_summary_prompt.format(
+                previous_summaries=prev_text,
+                messages=buffer,
+            )
+        else:
+            prompt = self._summary_prompt.format(messages=buffer)
 
         # Respect trim_tokens_to_summarize: cap the total prompt tokens.
         max_tokens = self._lc_helper.trim_tokens_to_summarize
         if max_tokens is not None:
             current = self._token_counter([HumanMessage(content=prompt)])
             if current > max_tokens:
-                # Truncate non_summary messages buffer-only portion
-                # (the {messages} part) to stay within budget.
                 allowed = max(0, max_tokens - self._token_counter([
                     HumanMessage(content=prompt.split("<messages>")[0]),
                 ]))
-                truncated_buffer = self._truncate_buffer_string(
-                    get_buffer_string(non_summary), allowed
-                )
-                prompt = CHAINED_MAMBO_SUMMARY_PROMPT.format(
-                    previous_summaries=prev_text,
-                    messages=truncated_buffer,
-                )
+                truncated_buffer = self._truncate_buffer_string(buffer, allowed)
+                if prev_summaries:
+                    prompt = self._chained_summary_prompt.format(
+                        previous_summaries=prev_text,
+                        messages=truncated_buffer,
+                    )
+                else:
+                    prompt = self._summary_prompt.format(messages=truncated_buffer)
 
         response = self._lc_helper.model.invoke([HumanMessage(content=prompt)])
         content = response.content
@@ -1039,20 +1043,20 @@ class MamboSummarizationMiddleware(AgentMiddleware[SummarizationState, ContextT,
     async def _acreate_summary(self, messages_to_summarize: list[AnyMessage]) -> str:
         """Async variant of :meth:`_create_summary`."""
         prev_summaries = [msg for msg in messages_to_summarize if self._is_summary_message(msg)]
-        if not prev_summaries:
-            return await self._lc_helper._acreate_summary(messages_to_summarize)
-
         non_summary = [msg for msg in messages_to_summarize if not self._is_summary_message(msg)]
+        buffer = get_buffer_string(non_summary)
 
-        prev_text = "\n\n".join(
-            f"### Previous Summary {i + 1}\n{msg.content}"
-            for i, msg in enumerate(prev_summaries)
-        )
-
-        prompt = CHAINED_MAMBO_SUMMARY_PROMPT.format(
-            previous_summaries=prev_text,
-            messages=get_buffer_string(non_summary),
-        )
+        if prev_summaries:
+            prev_text = "\n\n".join(
+                f"### Previous Summary {i + 1}\n{msg.content}"
+                for i, msg in enumerate(prev_summaries)
+            )
+            prompt = self._chained_summary_prompt.format(
+                previous_summaries=prev_text,
+                messages=buffer,
+            )
+        else:
+            prompt = self._summary_prompt.format(messages=buffer)
 
         max_tokens = self._lc_helper.trim_tokens_to_summarize
         if max_tokens is not None:
@@ -1061,13 +1065,14 @@ class MamboSummarizationMiddleware(AgentMiddleware[SummarizationState, ContextT,
                 allowed = max(0, max_tokens - self._token_counter([
                     HumanMessage(content=prompt.split("<messages>")[0]),
                 ]))
-                truncated_buffer = self._truncate_buffer_string(
-                    get_buffer_string(non_summary), allowed
-                )
-                prompt = CHAINED_MAMBO_SUMMARY_PROMPT.format(
-                    previous_summaries=prev_text,
-                    messages=truncated_buffer,
-                )
+                truncated_buffer = self._truncate_buffer_string(buffer, allowed)
+                if prev_summaries:
+                    prompt = self._chained_summary_prompt.format(
+                        previous_summaries=prev_text,
+                        messages=truncated_buffer,
+                    )
+                else:
+                    prompt = self._summary_prompt.format(messages=truncated_buffer)
 
         response = await self._lc_helper.model.ainvoke([HumanMessage(content=prompt)])
         content = response.content

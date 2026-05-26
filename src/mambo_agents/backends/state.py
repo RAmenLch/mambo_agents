@@ -1,9 +1,10 @@
 """StateBackend — file storage via LangGraph Pregel state channels.
 
 Files are stored in the ``files`` channel of ``FilesystemState``, which
-participates in LangGraph checkpointing automatically.  A memory cache
-(``_pending_files``) bridges the gap between construction-time file
-population and the first graph execution.
+participates in LangGraph checkpointing automatically.  Per-thread
+snapshots (``_snapshots``) mirror the channel faithfully, using full
+replacement (not incremental merge) to correctly handle checkpoint
+rollbacks, branch switches, and file deletions.
 """
 
 from __future__ import annotations
@@ -52,43 +53,56 @@ class StateBackend(BackendProtocol):
     """File storage backed by a LangGraph Pregel state channel.
 
     Files live in the ``files`` field of ``FilesystemState``, which is
-    automatically checkpointed after each agent step.  A memory cache
-    (``_pending_files``) allows files to be populated *before* the graph
-    starts — via ``initial_files`` or ``upload_files()`` — and is flushed
-    to the Pregel channel on the first file access during execution.
+    automatically checkpointed after each agent step.
+
+    **Per-thread snapshots** mirror the Pregel channel faithfully: each
+    ``_read_files()`` inside a graph **fully replaces** the snapshot for
+    that thread, so checkpoint rollbacks and file deletions are honoured.
+    Graph-outside uploads are queued per-thread and flushed on first access.
 
     Extra tool provided: ``tree`` — displays directory structure.
 
     Parameters:
         initial_files: Optional ``{path: content_str}`` mapping to
-            pre-populate the store before graph execution.
+            pre-populate new threads on first access.  Files already
+            present in the checkpoint are *not* overwritten — only
+            genuinely new paths are injected.
     """
 
     def __init__(self, initial_files: dict[str, str] | None = None) -> None:
-        # Memory cache for files populated outside graph context.
-        # Flushed to the Pregel channel on the first ``_read_files()``
-        # call inside a graph execution.
-        self._lock = threading.Lock()
-        self._pending_files: dict[str, FileData] = {}
+        self._lock = threading.RLock()
+
+        # --- Per-thread channel mirrors (full-replaced on every _read_files) ---
+        self._snapshots: dict[str, dict[str, FileData]] = {}
+
+        # --- Per-thread pending uploads (queued outside graph, flushed on
+        #     first _read_files for that thread) ---
+        self._pending_uploads: dict[str, dict[str, FileData]] = {}
+
+        # --- Immutable template – injected on each new thread's first access
+        #     (only for paths NOT already in the checkpoint) ---
+        self._initial_files: dict[str, FileData] = {}
         if initial_files:
             for path, content_ in initial_files.items():
                 encoding = "base64" if _get_file_type(path) != "text" else "utf-8"
-                self._pending_files[path] = FileData(
+                self._initial_files[path] = FileData(
                     content=content_, encoding=encoding,
                 )
 
     # ------------------------------------------------------------------
-    # Dual-mode read / write (graph context or memory cache)
+    # Per-thread read / write (graph context only; outside-graph ops use
+    # upload_files / download_files with explicit thread_id)
     # ------------------------------------------------------------------
     #
-    # **Mirror pattern**: ``_pending_files`` is kept in sync with the
-    # Pregel ``files`` channel during graph execution.  Writes inside a
-    # graph go to *both* the channel and the cache; reads inside a graph
-    # read from the channel and then mirror the result back to the cache.
+    # **Snapshot pattern**: ``_snapshots[tid]`` mirrors the Pregel
+    # ``files`` channel faithfully.  ``_read_files()`` **fully replaces**
+    # the snapshot with channel data — never incrementally merges — so
+    # checkpoint rollbacks, branch switches, and file deletions are
+    # automatically reflected.
     #
-    # This ensures that after ``invoke()`` returns — when we are outside
-    # the graph context — ``_pending_files`` still has the latest state
-    # and callers can read files directly.
+    # Graph-outside uploads are queued in ``_pending_uploads[tid]`` and
+    # flushed to the channel (together with ``_initial_files``) on the
+    # first ``_read_files()`` for that thread.
 
     def _get_config(self) -> RunnableConfig:
         """Return the current LangGraph config, or raise a clear error.
@@ -127,85 +141,156 @@ class StateBackend(BackendProtocol):
         except RuntimeError:
             return False
 
+    def _resolve_thread_id(self, thread_id: str | None) -> str:
+        """Resolve the thread_id in three-tier priority order.
+
+        1. **Explicit** — caller passed a ``thread_id`` value (graph-in or
+           graph-out).  Always honoured first.
+        2. **Implicit (graph context)** — ``thread_id`` is ``None`` but we
+           are inside a Pregel execution.  Extract from
+           ``config["configurable"]["thread_id"]``, defaulting to
+           ``"__default__"`` if absent.
+        3. **Error (outside graph, no explicit value)** — raise
+           ``ValueError`` because there is no way to infer which session
+           the caller intends.
+        """
+        if thread_id is not None:
+            return thread_id
+        if self._in_graph_context():
+            config = self._get_config()
+            return config["configurable"].get("thread_id", "__default__")
+        raise ValueError(
+            "thread_id is required when calling upload_files/download_files "
+            "outside a graph context."
+        )
+
     def _read_files(self) -> dict[str, FileData]:
-        """Read the files dict — from Pregel channel or memory cache.
+        """Read files from Pregel channel with full-replace snapshot sync.
 
-        **Mirror pattern**: ``_pending_files`` is the authoritative
-        mutable cache.  It is *never* cleared and *never* overwritten
-        with ``=`` — only ``.update()`` is used so that data written
-        via ``_send_files_update`` cannot be lost by a stale channel
-        read.
+        **Execution order** (each step is critical for correctness):
 
-        **Inside a graph**: flushes pending (outside-graph) files to
-        the channel on first call, reads from the channel, then merges
-        the channel data into the cache.
+        1. **Read channel FIRST** — the current channel content determines
+           which ``_initial_files`` entries are genuinely new (paths
+           absent from the channel).  This ordering prevents accidentally
+           overwriting existing checkpoint data with stale initial values.
+        2. **Build flush set** — two sources:
+           - ``_initial_files`` (only paths missing from the channel)
+           - ``_pending_uploads[tid]`` (always flushed — user-explicit)
+        3. **Flush to channel** via ``CONFIG_KEY_SEND``, then **re-read**
+           to capture the merged state.
+        4. **Full-replace snapshot** — ``_snapshots[tid]`` is set to
+           ``dict(channel_files)``, *not* incrementally ``.update()``.
+           This guarantees that file deletions and checkpoint rollbacks
+           are reflected immediately.
 
-        **Subagents** (no ``files`` channel): returns the cache directly.
+        **Subagent fallback**: when the ``files`` channel is absent
+        (this graph is a subagent without ``FilesystemState``),
+        ``read("files")`` raises ``KeyError``.  We catch it and proceed
+        with an empty dict — ``_initial_files`` and pending uploads will
+        be flushed to the parent graph's channel on next re-entry.
 
-        **Outside a graph**: returns the cache directly.
+        Requires graph context.  For outside-graph access, use
+        ``download_files(thread_id=...)``.
 
         Returns a **shallow copy** of the files dict so callers cannot
-        mutate the internal cache by accident.
+        mutate the internal snapshot by accident.
         """
         if not self._in_graph_context():
-            with self._lock:
-                return dict(self._pending_files)
-
-        # Snapshot pending files under lock, then flush to channel
-        # outside the lock (Pregel operations may be slow).
-        with self._lock:
-            pending = dict(self._pending_files) if self._pending_files else None
-        if pending:
-            self._send_files_update(pending)
+            raise RuntimeError(
+                "StateBackend._read_files requires graph context. "
+                "Use download_files(thread_id=...) for outside-graph access."
+            )
 
         config = self._get_config()
+        thread_id = config["configurable"].get("thread_id", "__default__")
         read = config["configurable"][CONFIG_KEY_READ]
-        try:
-            channel_files = read("files", fresh=True) or {}
-        except KeyError:
-            # No ``files`` channel in this graph (e.g. subagent)
-            with self._lock:
-                return dict(self._pending_files)
 
-        # Merge channel data into cache under lock (never overwrite,
-        # never clear).  ``_send_files_update`` always mirrors first,
-        # so the cache is a superset of the channel — merging ensures
-        # we pick up files written by other nodes / restored from
-        # checkpoint.
+        # (1) Read channel FIRST to determine which initial_files are new.
+        #     ``fresh=True`` ensures Pregel reads the latest committed
+        #     value for this key, bypassing any in-flight writes.
+        try:
+            channel_files: dict[str, FileData] = read("files", fresh=True) or {}
+        except KeyError:
+            # No ``files`` channel in this graph (e.g. subagent) —
+            # initial_files and pending uploads will be flushed to the
+            # parent graph on next re-entry.
+            channel_files = {}
+
+        # (2) Build flush set under lock — guard against concurrent
+        #     graph-outside upload_files() calls.
+        to_flush: dict[str, FileData] = {}
         with self._lock:
-            self._pending_files.update(channel_files)
-            return dict(self._pending_files)
+            if thread_id not in self._snapshots:
+                # First access for this thread → inject initial_files,
+                # but ONLY for paths not already in the checkpoint.
+                # Existing checkpoint data is *never* overwritten by
+                # initial_files — this preserves edits made by the LLM
+                # across backend instance restarts.
+                for path, fd in self._initial_files.items():
+                    if path not in channel_files:
+                        to_flush[path] = fd
+
+            # Pending uploads are always flushed regardless of whether
+            # the path exists in the channel — they represent an explicit
+            # user action and should overwrite.
+            to_flush.update(self._pending_uploads.pop(thread_id, {}))
+
+        # (3) Flush to channel *outside* the lock (Pregel send() may
+        #     interact with the event loop).  Re-read immediately after
+        #     to capture the reducer-merged state.
+        if to_flush:
+            send = config["configurable"][CONFIG_KEY_SEND]
+            send([("files", to_flush)])
+            channel_files = read("files", fresh=True) or {}
+
+        # (4) Full-replace snapshot — guarantees that any files deleted
+        #     since the last _read_files (e.g. via channel ``{path: None}``
+        #     updates) are gone from our mirror too.
+        with self._lock:
+            self._snapshots[thread_id] = dict(channel_files)
+
+        return dict(channel_files)
 
     def _send_files_update(self, update: dict[str, FileData]) -> None:
-        """Write a partial files update — to Pregel channel + memory cache.
+        """Write a partial files update — to Pregel channel + per-thread snapshot.
 
-        **Always mirrors to ``_pending_files``** so the cache stays in
-        sync with the channel.  Inside a graph, also queues the update
-        via ``CONFIG_KEY_SEND`` for checkpoint participation.
+        1. Validates we are in graph context (raises ``RuntimeError``
+           otherwise — graph-outside writes must go through
+           ``upload_files(thread_id=...)``).
+        2. Queues the update via ``CONFIG_KEY_SEND`` so LangGraph's
+           channel reducer processes it and includes it in the checkpoint.
+        3. Lazily mirrors the update to the per-thread snapshot with
+           ``.update()``.  This mirror is *best-effort* — the next
+           ``_read_files()`` call will full-replace the snapshot from
+           the channel, correcting any discrepancies.  So the lazy
+           ``.update()`` cannot cause permanent data corruption; it
+           merely provides a temporary read cache between channel reads.
 
-        Silently degrades to cache-only when the ``files`` channel is
-        absent (e.g. inside subagents that lack ``FilesystemState``).
-
-        Cache mutation is protected by ``self._lock`` to guard against
-        concurrent writes from the ``asyncio.to_thread`` pool.  Pregel
-        ``send()`` is called **outside** the lock to avoid holding it
-        during I/O.
+        **Note on subagents**: if the current graph has no ``files``
+        channel, ``send()`` will raise ``KeyError``.  This is propagated
+        to the caller — subagent middleware is expected to handle it.
         """
-        # Mirror into cache under lock
-        with self._lock:
-            self._pending_files.update(update)
-
         if not self._in_graph_context():
-            return  # Outside graph: cache is the only storage
+            raise RuntimeError(
+                "StateBackend._send_files_update requires graph context. "
+                "Use upload_files(thread_id=...) for outside-graph access."
+            )
 
-        try:
-            config = self._get_config()
-            send = config["configurable"][CONFIG_KEY_SEND]
-            send([("files", update)])
-        except (KeyError, RuntimeError):
-            # Channel not available (subagent without files channel) —
-            # mirror already done above, silently OK.
-            pass
+        config = self._get_config()
+        thread_id = config["configurable"].get("thread_id", "__default__")
+
+        # Queue write to Pregel channel (participates in checkpointing)
+        send = config["configurable"][CONFIG_KEY_SEND]
+        send([("files", update)])
+
+        # Best-effort mirror to snapshot — next _read_files full-replace
+        # will correct any drift.  Using .update() is acceptable here
+        # because it's additive only (new or updated files), never stale
+        # deletions — those are corrected by _read_files.
+        with self._lock:
+            if thread_id not in self._snapshots:
+                self._snapshots[thread_id] = {}
+            self._snapshots[thread_id].update(update)
 
     # ------------------------------------------------------------------
     # tools – extra tools only (core tools are built by middleware)
@@ -263,6 +348,7 @@ class StateBackend(BackendProtocol):
         file_path: str,
         offset: int = 0,
         limit: int = 2000,
+        include_line_numbers: bool = False,
     ) -> ReadResult:
         files = self._read_files()
         fd = files.get(file_path)
@@ -288,10 +374,14 @@ class StateBackend(BackendProtocol):
         total = len(lines)
 
         sliced = lines[offset: offset + limit]
+        raw_slice = "\n".join(sliced)
+        content = (
+            format_with_line_numbers(raw_slice, start_line=offset + 1)
+            if include_line_numbers
+            else raw_slice
+        )
         return ReadResult(
-            content=format_with_line_numbers(
-                "\n".join(sliced), start_line=offset + 1,
-            ),
+            content=content,
             total_lines=total,
             encoding="utf-8",
         )
@@ -404,14 +494,32 @@ class StateBackend(BackendProtocol):
     # ------------------------------------------------------------------
 
     def upload_files(
-        self, files: list[tuple[str, bytes]]
+        self,
+        files: list[tuple[str, bytes]],
+        *,
+        thread_id: str | None = None,
     ) -> list[UploadFileResult]:
-        """Upload multiple files (works inside or outside graph context).
+        """Upload multiple files.
 
-        Inside a graph the files go directly to the Pregel channel;
-        outside a graph they are cached in ``_pending_files`` and
-        injected on the first ``_read_files()`` call.
+        **Dual-path branching** (based on ``_in_graph_context()``):
+
+        **Graph-in path** (``thread_id`` auto-resolved from config):
+        writes directly to the Pregel channel via ``_send_files_update()``,
+        which also lazily mirrors to the per-thread snapshot.  The files
+        immediately participate in checkpointing.
+
+        **Graph-out path** (``thread_id`` **required**): queues files in
+        ``_pending_uploads[tid]``.  They are flushed to the channel on
+        the next ``_read_files()`` call for that thread — which happens
+        on the first file operation (read/write/ls/etc.) during the next
+        graph execution.
+
+        Parameters:
+            files: List of ``(path, raw_bytes)`` tuples.
+            thread_id: Explicit thread identifier.  Required outside a
+                graph; optional (auto-resolved) inside a graph.
         """
+        tid = self._resolve_thread_id(thread_id)
         results: list[UploadFileResult] = []
         update: dict[str, FileData] = {}
         for path, raw_content in files:
@@ -425,14 +533,59 @@ class StateBackend(BackendProtocol):
             update[path] = fd
             results.append(UploadFileResult(path=path, error=None))
 
-        self._send_files_update(update)
+        # Branch: graph-in → write channel + snapshot; graph-out → queue
+        if self._in_graph_context():
+            self._send_files_update(update)
+        else:
+            with self._lock:
+                pending = self._pending_uploads.setdefault(tid, {})
+                pending.update(update)
+
         return results
 
     def download_files(
-        self, paths: list[str]
+        self,
+        paths: list[str],
+        *,
+        thread_id: str | None = None,
     ) -> list[DownloadFileResult]:
+        """Download multiple files.
+
+        **Dual-path branching** (based on ``_in_graph_context()``):
+
+        **Graph-in path** (``thread_id`` auto-resolved from config):
+        delegates to ``_read_files()``, which reads the Pregel channel and
+        full-replaces the per-thread snapshot.  This guarantees the files
+        are consistent with the current checkpoint.
+
+        **Graph-out path** (``thread_id`` **required**): reads from the
+        last-synced per-thread snapshot, merged with any pending uploads
+        that haven't been flushed yet.  This is the best-effort view of
+        files *between* graph executions — no channel access is possible
+        outside the graph.
+
+        Parameters:
+            paths: List of absolute file paths to download.
+            thread_id: Explicit thread identifier.  Required outside a
+                graph; optional (auto-resolved) inside a graph.
+        """
+        tid = self._resolve_thread_id(thread_id)
         results: list[DownloadFileResult] = []
-        files = self._read_files()
+
+        # Branch: graph-in → read channel directly; graph-out → read cache
+        if self._in_graph_context():
+            files = self._read_files()
+        else:
+            # Merge snapshot (last synced channel state) with pending
+            # uploads (graph-outside writes not yet flushed).  Pending
+            # takes precedence via .update() so callers see their own
+            # recently-uploaded files.
+            with self._lock:
+                snapshot = self._snapshots.get(tid, {})
+                pending = self._pending_uploads.get(tid, {})
+                files = dict(snapshot)
+                files.update(pending)
+
         for path in paths:
             fd = files.get(path)
             if fd is None:

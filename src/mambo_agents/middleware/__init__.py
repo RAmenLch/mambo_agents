@@ -1,11 +1,21 @@
 """Middleware for Mambo Agents."""
 
+from mambo_agents.middleware.async_subagents import (
+    AsyncSubAgentMiddleware,
+    AsyncTaskData,
+)
 from mambo_agents.middleware.backend_tools import BackendToolsMiddleware
 from mambo_agents.middleware.patch_tool_calls import PatchToolCallsMiddleware
 from mambo_agents.middleware.planning import (
     MamboPlanMiddleware,
     Plan,
     WritePlansInput,
+)
+from mambo_agents.middleware.security_review import (
+    AutoSecurityReviewMiddleware,
+    DEFAULT_SECURITY_REVIEW_SYSTEM_PROMPT,
+    SecurityReviewConfig,
+    SecurityReviewResult,
 )
 from mambo_agents.middleware.skills import (
     SkillMetadata,
@@ -19,6 +29,7 @@ from mambo_agents.middleware.subagents import (
     SubAgentMiddleware,
 )
 from mambo_agents.middleware.summarization import (
+    DEFAULT_MAMBO_CHAINED_SUMMARY_PROMPT,
     DEFAULT_MAMBO_SUMMARY_PROMPT,
     MamboSummarizationMiddleware,
     SummarizationConfig,
@@ -27,14 +38,21 @@ from mambo_agents.middleware.summarization import (
 )
 
 __all__ = [
+    "AsyncSubAgentMiddleware",
+    "AsyncTaskData",
+    "AutoSecurityReviewMiddleware",
     "BackendToolsMiddleware",
     "CompiledSubAgent",
+    "DEFAULT_MAMBO_CHAINED_SUMMARY_PROMPT",
     "DEFAULT_MAMBO_SUMMARY_PROMPT",
+    "DEFAULT_SECURITY_REVIEW_SYSTEM_PROMPT",
     "EventGranularity",
     "MamboPlanMiddleware",
     "MamboSummarizationMiddleware",
     "PatchToolCallsMiddleware",
     "Plan",
+    "SecurityReviewConfig",
+    "SecurityReviewResult",
     "SkillMetadata",
     "SkillSource",
     "SkillsMiddleware",

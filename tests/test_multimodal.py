@@ -14,6 +14,7 @@ from mambo_agents.backends.protocol import (
     _get_mime_type,
 )
 from mambo_agents.backends.state import StateBackend
+from tests.test_state_backend import _simulate_graph
 from mambo_agents.middleware.backend_tools import (
     BackendToolsMiddleware,
     _build_evicted_content,
@@ -162,7 +163,8 @@ class TestStateBackendMultimodal:
     def test_read_image_returns_file_type(self):
         b64 = base64.b64encode(b"\x89PNG\r\n").decode("ascii")
         backend = StateBackend(initial_files={"/photo.png": b64})
-        result = backend.read("/photo.png")
+        with _simulate_graph(backend):
+            result = backend.read("/photo.png")
         assert result.error is None
         assert result.encoding == "base64"
         assert result.file_type == "image"
@@ -171,26 +173,30 @@ class TestStateBackendMultimodal:
     def test_read_audio_returns_file_type(self):
         b64 = base64.b64encode(b"fake_audio").decode("ascii")
         backend = StateBackend(initial_files={"/song.mp3": b64})
-        result = backend.read("/song.mp3")
+        with _simulate_graph(backend):
+            result = backend.read("/song.mp3")
         assert result.file_type == "audio"
         assert result.mime_type == "audio/mpeg"
 
     def test_read_video_returns_file_type(self):
         b64 = base64.b64encode(b"fake_video").decode("ascii")
         backend = StateBackend(initial_files={"/clip.mp4": b64})
-        result = backend.read("/clip.mp4")
+        with _simulate_graph(backend):
+            result = backend.read("/clip.mp4")
         assert result.file_type == "video"
 
     def test_read_pdf_returns_file_type(self):
         b64 = base64.b64encode(b"fake_pdf").decode("ascii")
         backend = StateBackend(initial_files={"/doc.pdf": b64})
-        result = backend.read("/doc.pdf")
+        with _simulate_graph(backend):
+            result = backend.read("/doc.pdf")
         assert result.file_type == "file"
         assert result.mime_type == "application/pdf"
 
     def test_read_text_file_type_unchanged(self):
         backend = StateBackend(initial_files={"/hello.py": "print('hi')"})
-        result = backend.read("/hello.py")
+        with _simulate_graph(backend):
+            result = backend.read("/hello.py")
         assert result.file_type == "text"
         assert result.mime_type == ""
         assert result.encoding == "utf-8"
@@ -199,14 +205,16 @@ class TestStateBackendMultimodal:
     def test_write_image_auto_encoding(self):
         backend = StateBackend()
         b64 = base64.b64encode(b"img_data").decode("ascii")
-        backend.write("/new_img.png", b64)
-        result = backend.read("/new_img.png")
+        with _simulate_graph(backend):
+            backend.write("/new_img.png", b64)
+            result = backend.read("/new_img.png")
         assert result.encoding == "base64"
         assert result.file_type == "image"
 
     def test_read_not_found(self):
         backend = StateBackend()
-        result = backend.read("/missing.png")
+        with _simulate_graph(backend):
+            result = backend.read("/missing.png")
         assert result.error is not None
         assert result.file_type == "text"  # default
 
@@ -214,7 +222,8 @@ class TestStateBackendMultimodal:
         """Binary file content should NOT have line number formatting."""
         b64 = base64.b64encode(b"\x89PNG\r\n").decode("ascii")
         backend = StateBackend(initial_files={"/photo.png": b64})
-        result = backend.read("/photo.png")
+        with _simulate_graph(backend):
+            result = backend.read("/photo.png")
         assert "\t" not in (result.content or "")
 
 
@@ -232,7 +241,8 @@ class TestBuildCoreToolsMultimodal:
         tools = build_core_tools(backend)
         read_tool = next(t for t in tools if t.name == "read")
 
-        result = read_tool.invoke({"file_path": "/photo.png"})
+        with _simulate_graph(backend):
+            result = read_tool.invoke({"file_path": "/photo.png"})
 
         assert isinstance(result, ToolMessage)
         assert result.content_blocks is not None
@@ -247,7 +257,8 @@ class TestBuildCoreToolsMultimodal:
         tools = build_core_tools(backend)
         read_tool = next(t for t in tools if t.name == "read")
 
-        result = read_tool.invoke({"file_path": "/hello.py"})
+        with _simulate_graph(backend):
+            result = read_tool.invoke({"file_path": "/hello.py"})
 
         assert isinstance(result, str)
         assert "print" in result
@@ -258,7 +269,8 @@ class TestBuildCoreToolsMultimodal:
         tools = build_core_tools(backend)
         read_tool = next(t for t in tools if t.name == "read")
 
-        result = read_tool.invoke({"file_path": "/song.mp3"})
+        with _simulate_graph(backend):
+            result = read_tool.invoke({"file_path": "/song.mp3"})
 
         assert isinstance(result, ToolMessage)
         blocks = result.content_blocks
@@ -270,7 +282,8 @@ class TestBuildCoreToolsMultimodal:
         tools = build_core_tools(backend)
         read_tool = next(t for t in tools if t.name == "read")
 
-        result = read_tool.invoke({"file_path": "/clip.mp4"})
+        with _simulate_graph(backend):
+            result = read_tool.invoke({"file_path": "/clip.mp4"})
 
         assert isinstance(result, ToolMessage)
         blocks = result.content_blocks
@@ -282,7 +295,8 @@ class TestBuildCoreToolsMultimodal:
         tools = build_core_tools(backend)
         read_tool = next(t for t in tools if t.name == "read")
 
-        result = read_tool.invoke({"file_path": "/doc.pdf"})
+        with _simulate_graph(backend):
+            result = read_tool.invoke({"file_path": "/doc.pdf"})
 
         assert isinstance(result, ToolMessage)
         blocks = result.content_blocks
@@ -293,7 +307,8 @@ class TestBuildCoreToolsMultimodal:
         tools = build_core_tools(backend)
         read_tool = next(t for t in tools if t.name == "read")
 
-        result = read_tool.invoke({"file_path": "/missing.png"})
+        with _simulate_graph(backend):
+            result = read_tool.invoke({"file_path": "/missing.png"})
 
         assert isinstance(result, str)
         assert "Error" in result
@@ -305,7 +320,8 @@ class TestBuildCoreToolsMultimodal:
         tools = build_core_tools(backend)
         read_tool = next(t for t in tools if t.name == "read")
 
-        result = await read_tool.ainvoke({"file_path": "/photo.png"})
+        with _simulate_graph(backend):
+            result = await read_tool.ainvoke({"file_path": "/photo.png"})
 
         assert isinstance(result, ToolMessage)
         blocks = result.content_blocks
@@ -317,7 +333,8 @@ class TestBuildCoreToolsMultimodal:
         tools = build_core_tools(backend)
         read_tool = next(t for t in tools if t.name == "read")
 
-        result = await read_tool.ainvoke({"file_path": "/hello.py"})
+        with _simulate_graph(backend):
+            result = await read_tool.ainvoke({"file_path": "/hello.py"})
 
         assert isinstance(result, str)
         assert "print" in result
@@ -413,7 +430,8 @@ class TestEvictionMultimodalPreservation:
         from mambo_agents.middleware.backend_tools import _sanitize_tool_call_id
         sane_id = _sanitize_tool_call_id("call_mm_01")
 
-        result = mw._evict(msg, sane_id)
+        with _simulate_graph(mw.backend):
+            result = mw._evict(msg, sane_id)
 
         # Content should be a list with text replacement + image block
         assert isinstance(result.content, list)
@@ -443,7 +461,8 @@ class TestEvictionMultimodalPreservation:
         from mambo_agents.middleware.backend_tools import _sanitize_tool_call_id
         sane_id = _sanitize_tool_call_id("call_mm_async")
 
-        result = await mw._aevict(msg, sane_id)
+        with _simulate_graph(mw.backend):
+            result = await mw._aevict(msg, sane_id)
 
         assert isinstance(result.content, list)
         audio_block = next(b for b in result.content if b["type"] == "audio")

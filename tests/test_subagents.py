@@ -17,6 +17,7 @@ from mambo_agents import (
     create_mambo_agent,
 )
 from mambo_agents.backends.state import StateBackend
+from tests.test_state_backend import _simulate_graph
 from mambo_agents.middleware.subagents import (
     DEFAULT_GENERAL_PURPOSE_DESCRIPTION,
     DEFAULT_SUBAGENT_PROMPT,
@@ -660,6 +661,7 @@ class TestSubagentStreamingE2E:
                 )
             )]},
             stream_mode=["updates", "custom"],
+            config={"configurable": {"thread_id": "test_subagent_e2e"}},
         ):
             if mode == "custom":
                 payload: dict = data  # type: ignore[assignment]
@@ -683,7 +685,8 @@ class TestSubagentStreamingE2E:
             assert "chunk" in event
 
         # Verify the file was actually created by the subagent
-        result = backend.read("/research.txt")
+        with _simulate_graph(backend, thread_id="test_subagent_e2e"):
+            result = backend.read("/research.txt")
         assert result.error is None, (
             f"Subagent should have created /research.txt: {result.error}"
         )

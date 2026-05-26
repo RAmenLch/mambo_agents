@@ -6,8 +6,6 @@ duplicated between ``LocalBackend``, ``StateBackend``, and protocol.
 
 from __future__ import annotations
 
-from mambo_agents.backends.protocol import EditResult
-
 # ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
@@ -62,6 +60,49 @@ def format_with_line_numbers(content: str, start_line: int = 1) -> str:
 # ---------------------------------------------------------------------------
 
 
+def format_tree_entries(
+    entries: list[tuple[str, int]],
+) -> str:
+    """Render ``(display_name, depth)`` entries as a visual directory tree.
+
+    Used by both ``LocalBackend`` and ``SshBackend`` – the tree-walk
+    logic is backend-specific, but the formatting is shared.
+    """
+    if not entries:
+        return "(empty)"
+
+    lines: list[str] = []
+    for i, (display, depth) in enumerate(entries):
+        # Determine connector: look ahead to see if there are siblings at the same depth
+        has_more_siblings = False
+        for j in range(i + 1, len(entries)):
+            next_depth = entries[j][1]
+            if next_depth < depth:
+                break
+            if next_depth == depth:
+                has_more_siblings = True
+                break
+
+        connector = "├── " if has_more_siblings else "└── "
+        if depth == 0:
+            lines.append(display)
+        else:
+            prefix_parts: list[str] = []
+            for level in range(1, depth + 1):
+                active = False
+                for j in range(i + 1, len(entries)):
+                    if entries[j][1] < level:
+                        break
+                    if entries[j][1] == level:
+                        active = True
+                        break
+                prefix_parts.append("│   " if active else "    ")
+            prefix = "".join(prefix_parts)
+            lines.append(f"{prefix}{connector}{display}")
+
+    return "\n".join(lines)
+
+
 def detect_trailing_newline_mismatch(
     file_path: str,
     old_str: str,
@@ -76,6 +117,8 @@ def detect_trailing_newline_mismatch(
     Returns ``None`` when no trailing-newline mismatch is detected (the
     caller should fall through to the generic "not found" error).
     """
+    from mambo_agents.backends.protocol import EditResult  # lazy – avoids circular import
+
     if not (
         old_str.endswith("\n")
         and len(old_str) > 1

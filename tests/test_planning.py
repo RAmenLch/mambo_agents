@@ -21,6 +21,7 @@ from mambo_agents import (
     create_mambo_agent,
 )
 from mambo_agents.backends.state import StateBackend
+from tests.test_state_backend import _simulate_graph
 
 
 # ---------------------------------------------------------------------------
@@ -634,7 +635,8 @@ class TestPlanSummarizationE2E:
                         )
                     )
                 ]
-            }
+            },
+            config={"configurable": {"thread_id": "test_plan_e2e_1"}},
         )
 
         # Verify plans were tracked
@@ -655,7 +657,8 @@ class TestPlanSummarizationE2E:
 
         # Verify files were actually created
         for fname in ["/t1.txt", "/t2.txt", "/t3.txt"]:
-            r = backend.read(fname)
+            with _simulate_graph(backend, thread_id="test_plan_e2e_1"):
+                r = backend.read(fname)
             assert r.error is None, f"File {fname} should exist: {r.error}"
             assert "E2E_OK" in (r.content or ""), (
                 f"File {fname} content mismatch: {r.content}"
@@ -689,6 +692,8 @@ class TestPlanSummarizationE2E:
             },
         )
 
+        thread_cfg = {"configurable": {"thread_id": "test_plan_e2e_2"}}
+
         # Phase 1: Create plan list and do some work
         result1 = agent.invoke(
             {
@@ -703,11 +708,27 @@ class TestPlanSummarizationE2E:
                         )
                     )
                 ]
-            }
+            },
+            config=thread_cfg,
         )
 
         plans1 = result1.get("plans")
         assert plans1 is not None, "Agent should have used write_plans in phase 1"
+
+        # Verify a.txt was created in phase 1 (needed for phase 2 assertions)
+        with _simulate_graph(backend, thread_id="test_plan_e2e_2"):
+            r_a_phase1 = backend.read("/a.txt")
+        if r_a_phase1.error is not None:
+            last_ai_msg = None
+            for m in reversed(result1.get("messages", [])):
+                if isinstance(m, AIMessage) and not m.tool_calls:
+                    last_ai_msg = m
+                    break
+            pytest.fail(
+                f"Phase 1 agent did NOT create /a.txt (required for subsequent steps). "
+                f"Last AI response: {last_ai_msg.content if last_ai_msg else 'N/A'}. "
+                f"Read error: {r_a_phase1.error}"
+            )
 
         # Phase 2: Continue working — this will generate enough messages
         # to trigger summarization, compacting the phase 1 plan interaction.
@@ -727,21 +748,25 @@ class TestPlanSummarizationE2E:
                         )
                     ),
                 ]
-            }
+            },
+            config=thread_cfg,
         )
 
         # Verify b.txt was created
-        r_b = backend.read("/b.txt")
+        with _simulate_graph(backend, thread_id="test_plan_e2e_2"):
+            r_b = backend.read("/b.txt")
         assert r_b.error is None
         assert "PHASE2_DONE" in (r_b.content or "")
 
         # Verify a.txt still exists (phase 1 work not lost)
-        r_a = backend.read("/a.txt")
+        with _simulate_graph(backend, thread_id="test_plan_e2e_2"):
+            r_a = backend.read("/a.txt")
         assert r_a.error is None
         assert "PHASE1_DONE" in (r_a.content or "")
 
         # Verify c.txt was created with combined content
-        r_c = backend.read("/c.txt")
+        with _simulate_graph(backend, thread_id="test_plan_e2e_2"):
+            r_c = backend.read("/c.txt")
         assert r_c.error is None
         assert "PHASE1_DONE" in (r_c.content or "")
         assert "PHASE2_DONE" in (r_c.content or "")

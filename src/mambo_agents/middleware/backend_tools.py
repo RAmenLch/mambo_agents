@@ -13,7 +13,7 @@ it with a truncated preview to prevent context-window saturation.
 from __future__ import annotations
 
 import re
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Sequence
 from typing import Annotated
 
 from langchain.agents.middleware.types import (
@@ -25,7 +25,7 @@ from langchain.agents.middleware.types import (
 from langchain.tools import ToolRuntime
 from langchain_core.messages import SystemMessage, ToolMessage
 from langchain_core.runnables.config import RunnableConfig
-from langchain_core.tools import StructuredTool
+from langchain_core.tools import BaseTool, StructuredTool
 from langgraph.prebuilt.tool_node import ToolCallRequest
 from langgraph.types import Command
 from langgraph.typing import ContextT
@@ -276,6 +276,17 @@ class _ReadSchema(BaseModel):
     file_path: Annotated[str, Field(description="Absolute file path")]
     offset: Annotated[int, Field(default=0, description="Line offset from start")]
     limit: Annotated[int, Field(default=2000, description="Max lines to return")]
+    include_line_numbers: Annotated[
+        bool,
+        Field(
+            default=False,
+            description=(
+                "If True, prefix each line with its 1-indexed line number "
+                "(cat -n style). Recommended when you need to reference "
+                "specific lines for editing or patching."
+            ),
+        ),
+    ]
 
 
 def _build_sync_read_tool(backend: BackendProtocol) -> StructuredTool:
@@ -290,9 +301,22 @@ def _build_sync_read_tool(backend: BackendProtocol) -> StructuredTool:
         file_path: Annotated[str, Field(description="Absolute file path")],
         offset: Annotated[int, Field(default=0, description="Line offset from start")],
         limit: Annotated[int, Field(default=2000, description="Max lines to return")],
+        include_line_numbers: Annotated[
+            bool,
+            Field(
+                default=False,
+                description=(
+                    "If True, prefix each line with its 1-indexed line number "
+                    "(cat -n style). Recommended when you need to reference "
+                    "specific lines for editing or patching."
+                ),
+            ),
+        ] = False,
         runtime: Annotated[ToolRuntime | None, "Injected by LangChain ToolNode"] = None,
     ) -> ToolMessage | str:
-        result: ReadResult = backend.read(file_path, offset, limit)
+        result: ReadResult = backend.read(
+            file_path, offset, limit, include_line_numbers,
+        )
         if result.is_multimodal and result.content is not None:
             tool_call_id = getattr(runtime, "tool_call_id", "") or ""
             return ToolMessage(
@@ -317,9 +341,22 @@ def _build_sync_read_tool(backend: BackendProtocol) -> StructuredTool:
         file_path: Annotated[str, Field(description="Absolute file path")],
         offset: Annotated[int, Field(default=0, description="Line offset from start")],
         limit: Annotated[int, Field(default=2000, description="Max lines to return")],
+        include_line_numbers: Annotated[
+            bool,
+            Field(
+                default=False,
+                description=(
+                    "If True, prefix each line with its 1-indexed line number "
+                    "(cat -n style). Recommended when you need to reference "
+                    "specific lines for editing or patching."
+                ),
+            ),
+        ] = False,
         runtime: Annotated[ToolRuntime | None, "Injected by LangChain ToolNode"] = None,
     ) -> ToolMessage | str:
-        result: ReadResult = await backend.aread(file_path, offset, limit)
+        result: ReadResult = await backend.aread(
+            file_path, offset, limit, include_line_numbers,
+        )
         if result.is_multimodal and result.content is not None:
             tool_call_id = getattr(runtime, "tool_call_id", "") or ""
             return ToolMessage(
@@ -344,7 +381,10 @@ def _build_sync_read_tool(backend: BackendProtocol) -> StructuredTool:
         name="read",
         description=(
             "Read the contents of a file. "
-            "For text files, returns content with line numbers. "
+            "For text files, returns plain content by default (no line numbers). "
+            "Set include_line_numbers=True to get cat -n style output with "
+            "each line prefixed by its 1-indexed line number – recommended "
+            "when you need to reference specific lines for editing or patching. "
             "For image, audio, video, and PDF files, returns multimodal "
             "content blocks that the model can understand directly. "
             "Supports offset and limit for pagination (text only)."
@@ -400,6 +440,39 @@ def build_core_tools(backend: BackendProtocol) -> list[StructuredTool]:
             )
         )
     return tools
+
+
+def build_tool_descriptions(
+    backend: BackendProtocol,
+    *,
+    tools: Sequence[BaseTool] | None = None,
+) -> dict[str, str]:
+    """Build a ``{tool_name: description}`` mapping for all registered tools.
+
+    Includes the six core backend tools (from ``_CORE_TOOLS``) plus any
+    extra tools attached to the backend or passed in via *tools*.
+
+    Intended for use by ``AutoSecurityReviewMiddleware`` so that the AI
+    security reviewer can see the full purpose of each tool, not just its
+    name and raw arguments.
+    """
+    descriptions: dict[str, str] = {}
+
+    # Core tools
+    for spec in _CORE_TOOLS:
+        descriptions[spec["name"]] = spec["description"]
+
+    # Extra tools from backend
+    for tool in backend.tools:
+        if tool.name not in descriptions:
+            descriptions[tool.name] = tool.description
+
+    # User-supplied tools
+    for tool in tools or []:
+        if tool.name not in descriptions:
+            descriptions[tool.name] = tool.description
+
+    return descriptions
 
 
 # ---------------------------------------------------------------------------

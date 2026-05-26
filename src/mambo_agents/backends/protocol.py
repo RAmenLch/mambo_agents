@@ -123,25 +123,28 @@ class LsResult(BaseModel):
     entries: list[FileInfo] | None = None
 
     def __str__(self) -> str:
-        if self.error is not None:
-            return f"Error: {self.error}"
-        if self.entries is None or not self.entries:
-            return "(empty directory)"
         lines: list[str] = []
-        for fi in self.entries:
-            if fi.is_dir:
-                lines.append(f"{fi.path}/")
-            else:
-                lines.append(f"{fi.path}  ({human_size(fi.size)})")
+        if self.error is not None:
+            lines.append(f"Warning: {self.error}")
+        if self.entries is not None:
+            for fi in self.entries:
+                if fi.is_dir:
+                    lines.append(f"{fi.path}/")
+                else:
+                    lines.append(f"{fi.path}  ({human_size(fi.size)})")
+        if not lines:
+            return "(empty directory)"
         return "\n".join(lines)
 
 
 class ReadResult(BaseModel):
     """Result from ``read()``.
 
-    For text files, ``content`` carries line-numbered text and
-    ``encoding`` is ``"utf-8"``.  For binary files, ``content`` is
-    base64-encoded (no line numbers) and ``encoding`` is ``"base64"``.
+    For text files, ``content`` carries plain text (no line numbers by
+    default) and ``encoding`` is ``"utf-8"``.  Pass
+    ``include_line_numbers=True`` to the ``read()`` call to get
+    ``cat -n``-style line-numbered output.  For binary files,
+    ``content`` is base64-encoded and ``encoding`` is ``"base64"``.
 
     For non-text (multimodal) files, ``file_type`` is set to the
     appropriate classification (``"image"``, ``"audio"``, ``"video"``,
@@ -205,13 +208,14 @@ class GrepResult(BaseModel):
     matches: list[GrepMatch] | None = None
 
     def __str__(self) -> str:
+        lines: list[str] = []
         if self.error is not None:
-            return f"Error: {self.error}"
-        if not self.matches:
+            lines.append(f"Warning: {self.error}")
+        if self.matches:
+            lines.extend(f"{m.path}:{m.line}: {m.text}" for m in self.matches)
+        if not lines:
             return "No matches found."
-        return "\n".join(
-            f"{m.path}:{m.line}: {m.text}" for m in self.matches
-        )
+        return "\n".join(lines)
 
 
 class GlobResult(BaseModel):
@@ -221,11 +225,14 @@ class GlobResult(BaseModel):
     matches: list[FileInfo] | None = None
 
     def __str__(self) -> str:
+        lines: list[str] = []
         if self.error is not None:
-            return f"Error: {self.error}"
-        if not self.matches:
+            lines.append(f"Warning: {self.error}")
+        if self.matches:
+            lines.extend(fi.path for fi in self.matches)
+        if not lines:
             return "No files found."
-        return "\n".join(fi.path for fi in self.matches)
+        return "\n".join(lines)
 
 
 class UploadFileResult(BaseModel):
@@ -292,8 +299,20 @@ class BackendProtocol(abc.ABC):
         Override this to tell the agent about backend-specific
         capabilities (e.g. "Local file system with delete and shell
         execute support").
+
+        .. note::
+
+            The ``read`` tool defaults to **no line numbers**.  When
+            you need to reference specific lines (e.g. for targeted
+            edits), set ``include_line_numbers=True`` so that each
+            output line is prefixed with its 1-indexed line number.
         """
-        return f"File system backend: {type(self).__name__.replace('Backend', '').lower()}"
+        return (
+            f"File system backend: {type(self).__name__.replace('Backend', '').lower()}. "
+            "The read tool defaults to no line numbers. "
+            "Set include_line_numbers=True when you need to reference specific lines "
+            "(e.g. for edits or patching)."
+        )
 
     # ------------------------------------------------------------------
     # Core file operations (abstract — every backend MUST implement)
@@ -306,9 +325,19 @@ class BackendProtocol(abc.ABC):
 
     @abc.abstractmethod
     def read(
-        self, file_path: str, offset: int = 0, limit: int = 2000
+        self,
+        file_path: str,
+        offset: int = 0,
+        limit: int = 2000,
+        include_line_numbers: bool = False,
     ) -> ReadResult:
-        """Read the contents of *file_path*."""
+        """Read the contents of *file_path*.
+
+        For text files, the returned ``content`` is plain text by
+        default (no line numbers).  Set *include_line_numbers* to
+        ``True`` to get ``cat -n``-style output where each line is
+        prefixed with its 1-indexed line number.
+        """
         ...
 
     @abc.abstractmethod
@@ -365,10 +394,19 @@ class BackendProtocol(abc.ABC):
         return await asyncio.to_thread(self.ls, path)
 
     async def aread(
-        self, file_path: str, offset: int = 0, limit: int = 2000
+        self,
+        file_path: str,
+        offset: int = 0,
+        limit: int = 2000,
+        include_line_numbers: bool = False,
     ) -> ReadResult:
-        """Async: Read the contents of *file_path*."""
-        return await asyncio.to_thread(self.read, file_path, offset, limit)
+        """Async: Read the contents of *file_path*.
+
+        See :meth:`read` for full documentation.
+        """
+        return await asyncio.to_thread(
+            self.read, file_path, offset, limit, include_line_numbers,
+        )
 
     async def awrite(
         self, file_path: str, content: str, overwrite: bool = False,

@@ -16,6 +16,7 @@ from mambo_agents import (
     create_mambo_agent,
 )
 from mambo_agents.backends.state import StateBackend
+from tests.test_state_backend import _simulate_graph
 from mambo_agents.middleware.summarization import (
     DEFAULT_MAMBO_SUMMARY_PROMPT,
 )
@@ -2255,6 +2256,14 @@ class TestDefaultPrompt:
     def test_not_empty(self):
         """Prompt should be substantial."""
         assert len(DEFAULT_MAMBO_SUMMARY_PROMPT) > 100
+
+    def test_chained_has_required_sections(self):
+        """Chained prompt must contain SESSION INTENT, SUMMARY, ARTIFACTS, and {previous_summaries}."""
+        from mambo_agents.middleware.summarization import DEFAULT_MAMBO_CHAINED_SUMMARY_PROMPT
+        assert "SESSION INTENT" in DEFAULT_MAMBO_CHAINED_SUMMARY_PROMPT
+        assert "ARTIFACTS" in DEFAULT_MAMBO_CHAINED_SUMMARY_PROMPT
+        assert "{previous_summaries}" in DEFAULT_MAMBO_CHAINED_SUMMARY_PROMPT
+        assert "{messages}" in DEFAULT_MAMBO_CHAINED_SUMMARY_PROMPT
 
 
 # ---------------------------------------------------------------------------
@@ -10214,11 +10223,13 @@ class TestSummarizationE2E:
                         )
                     )
                 ]
-            }
+            },
+            config={"configurable": {"thread_id": "test"}},
         )
 
         # Verify the file was created
-        r = backend.read("/summary_test.txt")
+        with _simulate_graph(backend):
+            r = backend.read("/summary_test.txt")
         assert r.error is None, f"File should be created: {r.error}"
         assert "summarization E2E passed" in (r.content or ""), (
             f"Expected content not found: {r.content}"
@@ -10256,6 +10267,8 @@ class TestSummarizationE2E:
             },
         )
 
+        thread_cfg = {"configurable": {"thread_id": "test"}}
+
         # Step 1: create a file (this generates user+AI+tool messages)
         result = agent.invoke(
             {
@@ -10267,11 +10280,13 @@ class TestSummarizationE2E:
                         )
                     )
                 ]
-            }
+            },
+            config=thread_cfg,
         )
 
         # Verify step 1 file
-        r1 = backend.read("/step1.txt")
+        with _simulate_graph(backend):
+            r1 = backend.read("/step1.txt")
         assert r1.error is None
         assert "STEP1_OK" in (r1.content or "")
 
@@ -10288,11 +10303,13 @@ class TestSummarizationE2E:
                         )
                     ),
                 ]
-            }
+            },
+            config=thread_cfg,
         )
 
         # Verify step 2 file has same content
-        r2 = backend.read("/step2.txt")
+        with _simulate_graph(backend):
+            r2 = backend.read("/step2.txt")
         assert r2.error is None, f"Step 2 file should exist: {r2.error}"
         assert "STEP1_OK" in (r2.content or ""), (
             f"Step 2 should contain same content, got: {r2.content}"

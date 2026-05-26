@@ -9,7 +9,9 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -35,9 +37,8 @@ from mambo_agents.backends.protocol import (
     _get_mime_type,
 )
 from mambo_agents.backends.utils import (
-    LINE_NUMBER_WIDTH,
-    MAX_LINE_LENGTH,
     detect_trailing_newline_mismatch,
+    format_tree_entries,
     format_with_line_numbers,
     human_size,
 )
@@ -48,6 +49,7 @@ from mambo_agents.backends.utils import (
 
 _DEFAULT_EXECUTE_TIMEOUT = 120
 _MAX_OUTPUT_BYTES = 100_000
+_DEFAULT_MAX_FILE_SIZE_MB = 10
 
 
 # ---------------------------------------------------------------------------
@@ -81,6 +83,8 @@ class LocalBackend(BackendProtocol):
         enable_execute: Whether to provide the ``execute`` tool to the
             LLM, allowing it to run arbitrary shell commands.
             Default ``False``. Set to ``True`` to enable shell execution.
+        max_file_size_mb: Maximum file size in MB for ``grep`` search.
+            Files exceeding this limit are skipped.  Default 10 MB.
     """
 
     def __init__(
@@ -92,6 +96,7 @@ class LocalBackend(BackendProtocol):
         env: dict[str, str] | None = None,
         inherit_env: bool = False,
         enable_execute: bool = False,
+        max_file_size_mb: int = _DEFAULT_MAX_FILE_SIZE_MB,
     ) -> None:
         if timeout <= 0:
             msg = f"timeout must be positive, got {timeout}"
@@ -101,6 +106,7 @@ class LocalBackend(BackendProtocol):
         self._default_timeout = timeout
         self._max_output_bytes = max_output_bytes
         self._enable_execute = enable_execute
+        self._max_file_size_bytes = max_file_size_mb * 1024 * 1024
 
         # Build environment
         if inherit_env:
@@ -206,10 +212,14 @@ class LocalBackend(BackendProtocol):
 
     def ls(self, path: str) -> LsResult:
         resolved = self._resolve(path)
-        if not resolved.exists() or not resolved.is_dir():
-            return LsResult(error=f"Directory '{path}' not found")
+        try:
+            if not resolved.exists() or not resolved.is_dir():
+                return LsResult(error=f"Directory '{path}' not found")
+        except OSError as e:
+            return LsResult(error=f"Cannot access '{path}': {e}")
 
         infos: list[FileInfo] = []
+        errors: list[str] = []
         try:
             for child in sorted(resolved.iterdir(), key=lambda c: (not c.is_dir(), c.name)):
                 try:
@@ -232,41 +242,39 @@ class LocalBackend(BackendProtocol):
                             size=st.st_size,
                             modified_at=modified_at,
                         ))
-                except OSError:
-                    continue
+                except OSError as e:
+                    errors.append(f"Cannot stat '{child.name}': {e}")
         except OSError as e:
-            return LsResult(error=f"Error listing '{path}': {e}")
+            errors.append(f"Listing aborted: {e}")
 
-        return LsResult(entries=infos)
+        error_msg = "\n".join(errors) if errors else None
+        return LsResult(error=error_msg, entries=infos)
 
     def read(
         self,
         file_path: str,
         offset: int = 0,
         limit: int = 2000,
+        include_line_numbers: bool = False,
     ) -> ReadResult:
         resolved = self._resolve(file_path)
-        if not resolved.exists():
-            return ReadResult(error=f"File '{file_path}' not found")
-        if resolved.is_dir():
-            return ReadResult(error=f"'{file_path}' is a directory")
+        try:
+            if not resolved.exists():
+                return ReadResult(error=f"File '{file_path}' not found")
+            if resolved.is_dir():
+                return ReadResult(error=f"'{file_path}' is a directory")
+        except OSError as e:
+            return ReadResult(error=f"Error accessing '{file_path}': {e}")
+
+        _O_NOFOLLOW = getattr(os, "O_NOFOLLOW", 0)
 
         if _get_file_type(file_path) != "text":
-            raw = resolved.read_bytes()
-            encoded = base64.b64encode(raw).decode("ascii")
-            file_type = _get_file_type(file_path)
-            return ReadResult(
-                content=encoded,
-                total_lines=1,
-                encoding="base64",
-                file_type=file_type,
-                mime_type=_get_mime_type(file_path),
-            )
-
-        try:
-            content = resolved.read_text(encoding="utf-8")
-        except UnicodeDecodeError:
-            raw = resolved.read_bytes()
+            try:
+                fd = os.open(resolved, os.O_RDONLY | _O_NOFOLLOW)
+                with os.fdopen(fd, "rb") as f:
+                    raw = f.read()
+            except OSError as e:
+                return ReadResult(error=f"Error reading '{file_path}': {e}")
             encoded = base64.b64encode(raw).decode("ascii")
             return ReadResult(
                 content=encoded,
@@ -276,14 +284,46 @@ class LocalBackend(BackendProtocol):
                 mime_type=_get_mime_type(file_path),
             )
 
-        lines = content.split("\n")
-        if lines and lines[-1] == "":
-            lines = lines[:-1]
+        # Text file: attempt UTF-8 read, fallback to base64
+        try:
+            fd = os.open(resolved, os.O_RDONLY | _O_NOFOLLOW)
+            with os.fdopen(fd, "r", encoding="utf-8") as f:
+                content = f.read()
+        except UnicodeDecodeError:
+            try:
+                fd = os.open(resolved, os.O_RDONLY | _O_NOFOLLOW)
+                with os.fdopen(fd, "rb") as f:
+                    raw = f.read()
+            except OSError as e:
+                return ReadResult(error=f"Error reading '{file_path}': {e}")
+            encoded = base64.b64encode(raw).decode("ascii")
+            return ReadResult(
+                content=encoded,
+                total_lines=1,
+                encoding="base64",
+                file_type=_get_file_type(file_path),
+                mime_type=_get_mime_type(file_path),
+            )
+        except OSError as e:
+            return ReadResult(error=f"Error reading '{file_path}': {e}")
+
+        lines = content.splitlines(keepends=True)
         total = len(lines)
 
-        sliced = lines[offset: offset + limit]
+        if offset >= total:
+            return ReadResult(
+                error=f"Line offset {offset} exceeds file length ({total} lines)",
+            )
+
+        sliced = lines[offset : offset + limit]
+        raw_slice = "".join(sliced)
+        content = (
+            format_with_line_numbers(raw_slice, start_line=offset + 1)
+            if include_line_numbers
+            else raw_slice
+        )
         return ReadResult(
-            content=format_with_line_numbers("\n".join(sliced), start_line=offset + 1),
+            content=content,
             total_lines=total,
             encoding="utf-8",
         )
@@ -303,7 +343,11 @@ class LocalBackend(BackendProtocol):
 
         try:
             resolved.parent.mkdir(parents=True, exist_ok=True)
-            resolved.write_text(content, encoding="utf-8")
+            _O_NOFOLLOW = getattr(os, "O_NOFOLLOW", 0)
+            flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC | _O_NOFOLLOW
+            fd = os.open(resolved, flags, 0o644)
+            with os.fdopen(fd, "w", encoding="utf-8", newline="") as f:
+                f.write(content)
         except OSError as e:
             return WriteResult(error=f"Error writing '{file_path}': {e}")
 
@@ -318,18 +362,29 @@ class LocalBackend(BackendProtocol):
         replace_all: bool = False,
     ) -> EditResult:
         resolved = self._resolve(file_path)
-        if not resolved.exists():
-            return EditResult(
-                error=(
-                    f"Cannot edit '{file_path}': file not found. "
-                    "To create a new file, use write()."
-                ),
-            )
-
         try:
-            content = resolved.read_text(encoding="utf-8")
+            if not resolved.exists():
+                return EditResult(
+                    error=(
+                        f"Cannot edit '{file_path}': file not found. "
+                        "To create a new file, use write()."
+                    ),
+                )
+        except OSError as e:
+            return EditResult(error=f"Error accessing '{file_path}': {e}")
+
+        _O_NOFOLLOW = getattr(os, "O_NOFOLLOW", 0)
+        try:
+            fd = os.open(resolved, os.O_RDONLY | _O_NOFOLLOW)
+            with os.fdopen(fd, "r", encoding="utf-8") as f:
+                content = f.read()
         except OSError as e:
             return EditResult(error=f"Error reading '{file_path}': {e}")
+
+        # Normalize line endings in old_str / new_str so that LLM-provided
+        # CRLF strings match files that were read as LF by Python text mode.
+        old_str = old_str.replace("\r\n", "\n").replace("\r", "\n")
+        new_str = new_str.replace("\r\n", "\n").replace("\r", "\n")
 
         occurrences = content.count(old_str)
 
@@ -357,11 +412,18 @@ class LocalBackend(BackendProtocol):
             )
 
         try:
-            resolved.write_text(content.replace(old_str, new_str), encoding="utf-8")
+            flags = os.O_WRONLY | os.O_TRUNC | _O_NOFOLLOW
+            fd = os.open(resolved, flags)
+            with os.fdopen(fd, "w", encoding="utf-8", newline="") as f:
+                f.write(content.replace(old_str, new_str))
         except OSError as e:
             return EditResult(error=f"Error writing '{file_path}': {e}")
 
         return EditResult(path=file_path, occurrences=occurrences)
+
+    # ------------------------------------------------------------------
+    # grep — ripgrep-first with Python fallback and file-size guard
+    # ------------------------------------------------------------------
 
     def grep(
         self,
@@ -370,57 +432,169 @@ class LocalBackend(BackendProtocol):
         glob: str | None = None,
     ) -> GrepResult:
         resolved = self._resolve(path)
-        if not resolved.exists():
-            return GrepResult(error=f"Path '{path}' not found")
+        try:
+            if not resolved.exists():
+                return GrepResult(error=f"Path '{path}' not found")
+        except OSError as e:
+            return GrepResult(error=f"Error accessing '{path}': {e}")
 
+        search_dir = resolved if resolved.is_dir() else resolved.parent
+
+        # 1) Try ripgrep (orders of magnitude faster on large trees)
+        results = self._ripgrep_grep(pattern, search_dir, glob)
+        if results is not None:
+            # ripgrep paths are physical → convert to virtual
+            matches: list[GrepMatch] = []
+            for fpath, items in results.items():
+                try:
+                    virt = "/" + str(Path(fpath).relative_to(self._cwd)).replace("\\", "/")
+                except ValueError:
+                    continue
+                for li, text in items:
+                    matches.append(GrepMatch(path=virt, line=li, text=text))
+            return GrepResult(matches=matches)
+
+        # 2) Python fallback with file-size guard
         import fnmatch as _fnmatch
 
         matches: list[GrepMatch] = []
-        search_dir = resolved if resolved.is_dir() else resolved.parent
+        skipped: int = 0
+        regex = re.compile(re.escape(pattern))
 
         try:
             for fp in search_dir.rglob("*"):
-                if not fp.is_file():
+                try:
+                    if not fp.is_file():
+                        continue
+                except OSError:
                     continue
+
                 if glob and not _fnmatch.fnmatch(fp.name, glob):
                     continue
                 if _get_file_type(fp.suffix) != "text":
                     continue
+
+                # Skip files exceeding the size limit
+                try:
+                    if fp.stat().st_size > self._max_file_size_bytes:
+                        skipped += 1
+                        continue
+                except OSError:
+                    continue
+
                 try:
                     lines = fp.read_text(encoding="utf-8").split("\n")
                 except (UnicodeDecodeError, OSError):
                     continue
+
                 for li, line in enumerate(lines, start=1):
-                    if pattern in line:
+                    if regex.search(line):
                         virt_path = "/" + str(fp.relative_to(self._cwd)).replace("\\", "/")
                         matches.append(GrepMatch(path=virt_path, line=li, text=line))
         except OSError as e:
-            return GrepResult(error=f"Error during grep: {e}", matches=matches)
+            return GrepResult(
+                error=f"Error during grep: {e}",
+                matches=matches,
+            )
 
-        return GrepResult(matches=matches)
+        error_msg: str | None = None
+        if skipped:
+            error_msg = (
+                f"Skipped {skipped} file(s) exceeding "
+                f"{self._max_file_size_bytes // (1024 * 1024)} MB size limit"
+            )
+
+        return GrepResult(error=error_msg, matches=matches)
+
+    # ------------------------------------------------------------------
+    # ripgrep helper
+    # ------------------------------------------------------------------
+
+    def _ripgrep_grep(
+        self,
+        pattern: str,
+        base_dir: Path,
+        include_glob: str | None,
+    ) -> dict[str, list[tuple[int, str]]] | None:
+        """Search with ripgrep (literal mode, JSON output).
+
+        Returns:
+            Dict mapping physical file paths → list of (line, text), or
+            ``None`` if ripgrep is unavailable or times out.
+        """
+        if not shutil.which("rg"):
+            return None
+
+        cmd = ["rg", "--json", "-F"]
+        if include_glob:
+            cmd.extend(["--glob", include_glob])
+        cmd.extend(["--", pattern, str(base_dir)])
+
+        try:
+            proc = subprocess.run(
+                cmd,
+                capture_output=True,
+                text=True,
+                timeout=30,
+                check=False,
+            )
+        except (subprocess.TimeoutExpired, FileNotFoundError, PermissionError):
+            return None
+
+        results: dict[str, list[tuple[int, str]]] = {}
+        for line in proc.stdout.splitlines():
+            try:
+                data = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if data.get("type") != "match":
+                continue
+            pdata = data.get("data", {})
+            ftext = pdata.get("path", {}).get("text")
+            if not ftext:
+                continue
+            ln = pdata.get("line_number")
+            lt = pdata.get("lines", {}).get("text", "").rstrip("\n")
+            if ln is None:
+                continue
+            results.setdefault(ftext, []).append((int(ln), lt))
+
+        return results
 
     def glob(self, pattern: str, path: str = "/") -> GlobResult:
         resolved = self._resolve(path)
 
-        if not resolved.exists() or not resolved.is_dir():
-            return GlobResult(error=f"Path '{path}' not found")
+        try:
+            if not resolved.exists() or not resolved.is_dir():
+                return GlobResult(error=f"Path '{path}' not found")
+        except OSError as e:
+            return GlobResult(error=f"Error accessing '{path}': {e}")
 
         matches: list[FileInfo] = []
+        errors: list[str] = []
         try:
             for fp in resolved.rglob(pattern):
-                if not fp.is_file():
+                try:
+                    if not fp.is_file():
+                        continue
+                except OSError:
                     continue
-                virt_path = "/" + str(fp.relative_to(self._cwd)).replace("\\", "/")
-                st = fp.stat()
+                try:
+                    virt_path = "/" + str(fp.relative_to(self._cwd)).replace("\\", "/")
+                    st = fp.stat()
+                except OSError as e:
+                    errors.append(f"Cannot stat '{fp}': {e}")
+                    continue
                 matches.append(FileInfo(
                     path=virt_path,
                     is_dir=False,
                     size=st.st_size,
                 ))
         except OSError as e:
-            return GlobResult(error=f"Error during glob: {e}")
+            errors.append(f"Glob aborted: {e}")
 
-        return GlobResult(matches=matches)
+        error_msg = "\n".join(errors) if errors else None
+        return GlobResult(error=error_msg, matches=matches)
 
     # ------------------------------------------------------------------
     # Extra operations: tree, delete, execute
@@ -443,7 +617,7 @@ class LocalBackend(BackendProtocol):
             return f"Path '{path}' is not a directory."
 
         entries = _walk_tree(resolved, depth)
-        return _format_tree_entries(entries)
+        return format_tree_entries(entries)
 
     def delete(self, path: str) -> str:
         """Delete a file or directory.
@@ -696,47 +870,3 @@ def _walk_tree(
             entries.append((f"{child.name} ({human_size(size)})", current_depth))
 
     return entries
-
-
-def _format_tree_entries(
-    entries: list[tuple[str, int]],
-) -> str:
-    """Render tree entries with indent-based tree display."""
-    if not entries:
-        return "(empty)"
-
-    lines: list[str] = []
-    for i, (display, depth) in enumerate(entries):
-        # Determine connector: look ahead to see if there are siblings at the same depth
-        has_more_siblings = False
-        for j in range(i + 1, len(entries)):
-            next_depth = entries[j][1]
-            if next_depth < depth:
-                break
-            if next_depth == depth:
-                has_more_siblings = True
-                break
-
-        connector = "├── " if has_more_siblings else "└── "
-        if depth == 0:
-            # Root-level entry — no indent prefix, just show it
-            lines.append(display)
-        else:
-            # Build prefix: for each parent level, decide "│   " or "    "
-            prefix_parts: list[str] = []
-            # Walk backward to find active parent lines
-            for level in range(1, depth + 1):
-                # Check if there's any future entry at this level or deeper after us
-                active = False
-                for j in range(i + 1, len(entries)):
-                    if entries[j][1] < level:
-                        break
-                    if entries[j][1] == level:
-                        active = True
-                        break
-                prefix_parts.append("│   " if active else "    ")
-
-            prefix = "".join(prefix_parts)
-            lines.append(f"{prefix}{connector}{display}")
-
-    return "\n".join(lines)
