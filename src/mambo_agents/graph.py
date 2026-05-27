@@ -26,10 +26,10 @@ from mambo_agents.backends.protocol import BackendProtocol
 from mambo_agents.backends.state import StateBackend
 from mambo_agents.middleware.backend_tools import (
     BackendToolsMiddleware,
-    build_core_tools,
     build_tool_descriptions,
 )
 from mambo_agents.middleware.patch_tool_calls import PatchToolCallsMiddleware
+from mambo_agents.middleware.reorder_tool_messages import ReorderToolMessagesMiddleware
 from mambo_agents.middleware.security_review import (
     AutoSecurityReviewMiddleware,
     SecurityReviewConfig,
@@ -328,13 +328,19 @@ def create_mambo_agent(
         == GENERAL_PURPOSE_NAME
         for s in inline_subagents
     ):
-        # Build general-purpose subagent with main model + backend tools
+        # Build general-purpose subagent with main model + backend tools.
+        # BackendToolsMiddleware provides:
+        #   - FilesystemState (state_schema) → files channel → subagent
+        #     can read/write files and propagate them back to the parent.
+        #   - Core tools (build_core_tools + backend.tools).
+        # Extra user tools are passed via the ``tools`` field.
         gp_spec: SubAgent = {
             "name": GENERAL_PURPOSE_NAME,
             "description": DEFAULT_GENERAL_PURPOSE_DESCRIPTION,
             "system_prompt": DEFAULT_SUBAGENT_PROMPT,
             "model": model,
-            "tools": build_core_tools(backend) + list(backend.tools) + list(tools or []),
+            "tools": list(tools or []),
+            "middleware": [BackendToolsMiddleware(backend)],
         }
         inline_subagents.insert(0, gp_spec)
 
@@ -382,7 +388,11 @@ def create_mambo_agent(
             mw.append(HumanInTheLoopMiddleware(interrupt_on=interrupt_on))
 
     # ---- Safety net (always on) -------------------------------------------
+    # Patch first to fill dangling ToolMessages, then reorder to match
+    # AIMessage.tool_calls order.  Reorder relies on complete batches
+    # (len(buffered) == len(ordered_ids)), so Patch must run first.
     mw.append(PatchToolCallsMiddleware())
+    mw.append(ReorderToolMessagesMiddleware())
 
     return _langchain_create_agent(
         model=model,

@@ -6,6 +6,7 @@ from mambo_agents.middleware.async_subagents import (
 )
 from mambo_agents.middleware.backend_tools import BackendToolsMiddleware
 from mambo_agents.middleware.patch_tool_calls import PatchToolCallsMiddleware
+from mambo_agents.middleware.reorder_tool_messages import ReorderToolMessagesMiddleware
 from mambo_agents.middleware.planning import (
     MamboPlanMiddleware,
     Plan,
@@ -51,6 +52,7 @@ __all__ = [
     "MamboSummarizationMiddleware",
     "PatchToolCallsMiddleware",
     "Plan",
+    "ReorderToolMessagesMiddleware",
     "SecurityReviewConfig",
     "SecurityReviewResult",
     "SkillMetadata",
