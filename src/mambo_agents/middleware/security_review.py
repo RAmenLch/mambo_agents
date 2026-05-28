@@ -5,6 +5,12 @@ immediately pausing for human approval, this middleware **first** asks an
 AI to review each tool call for security risks.  Only tool calls that the
 AI flags as **unsafe** are escalated to human review via ``interrupt()``.
 
+When a ``backend`` is provided, the middleware can also inspect the
+**actual file content** involved—particularly useful for reviewing
+scripts (e.g., Python, shell, batch) that the AI agent generates.
+For ``write`` / ``edit`` operations the file path and content are
+read via the backend and included in the review context.
+
 Users opt-in via the ``security_review`` parameter of ``create_mambo_agent``.
 
 .. code-block:: python
@@ -27,6 +33,14 @@ Users opt-in via the ``security_review`` parameter of ``create_mambo_agent``.
             model="gpt-4o-mini",
             review_tools=frozenset(["edit"]),
         ),
+    )
+
+    # With backend — reads actual file content for deeper script review
+    agent = create_mambo_agent(
+        "gpt-4o",
+        interrupt_on={"write": True, "edit": True},
+        security_review=SecurityReviewConfig(),
+        backend=my_backend,
     )
 """
 
@@ -56,6 +70,8 @@ from langgraph.runtime import Runtime
 from langgraph.types import interrupt
 from langgraph.typing import ContextT
 from pydantic import BaseModel, ConfigDict, Field
+
+from mambo_agents.backends.protocol import BackendProtocol
 
 
 # ---------------------------------------------------------------------------
@@ -166,16 +182,35 @@ def _build_review_messages(
     tool_call: ToolCall,
     *,
     tool_description: str | None = None,
+    file_content: str | None = None,
+    file_content_label: str = "File content",
 ) -> list[SystemMessage | HumanMessage]:
     """Construct messages for the security review model call.
 
     When *tool_description* is provided, it is included so the AI reviewer
     understands the tool's purpose and capabilities, not just its name.
+
+    When *file_content* is provided (via the backend), the actual script/file
+    body is included so the reviewer can inspect it for security risks.
+    *file_content_label* specifies how the content block is titled
+    (e.g. "Current file content" for edits, "New file content" for writes).
     """
     description_block = ""
     if tool_description:
         description_block = (
             f"**Tool description:** {tool_description}\n\n"
+        )
+
+    file_block = ""
+    if file_content is not None:
+        # Truncate very large files to avoid blowing context
+        max_chars = 12000
+        if len(file_content) > max_chars:
+            truncated = file_content[:max_chars] + "\n\n... [truncated]"
+        else:
+            truncated = file_content
+        file_block = (
+            f"**{file_content_label}:**\n```\n{truncated}\n```\n\n"
         )
 
     return [
@@ -185,8 +220,9 @@ def _build_review_messages(
                 f"Please review the following tool call for security risks:\n\n"
                 f"**Tool name:** `{tool_call['name']}`\n"
                 f"{description_block}"
-                f"**Arguments:**\n```json\n{tool_call['args']}\n```"
-            ),
+                f"**Arguments:**\n```json\n{tool_call['args']}\n```\n"
+                f"{file_block}"
+            ).rstrip()
         ),
     ]
 
@@ -216,6 +252,12 @@ class AutoSecurityReviewMiddleware(
     model:
         Chat model used for the security review.  Set to the agent model
         by default.
+    backend:
+        Optional backend for reading file content during review.
+        When provided and a tool call targets ``write`` or ``edit``,
+        the actual file content is read via the backend and included
+        in the review context so the AI can audit the script body.
+        ``None`` (default) reviews only the tool arguments.
     review_tools:
         Set of tool names to AI-review.  ``None`` (or empty) means every
         tool gets direct HITL (no AI).  ``"all"`` means every
@@ -226,6 +268,10 @@ class AutoSecurityReviewMiddleware(
     description_prefix:
         Prefix used when constructing human-facing action-request
         descriptions.
+    tool_descriptions:
+        Optional mapping of tool name → description for richer review
+        context.  If omitted, the reviewer only sees the tool name and
+        raw arguments, not its purpose or capabilities.
     """
 
     # ------------------------------------------------------------------
@@ -234,6 +280,7 @@ class AutoSecurityReviewMiddleware(
         interrupt_on: dict[str, bool | InterruptOnConfig],
         *,
         model: str | BaseChatModel,
+        backend: BackendProtocol | None = None,
         review_tools: frozenset[str] | Literal["all"] = "all",
         security_review_system_prompt: str | None = None,
         description_prefix: str = "Tool execution requires approval",
@@ -266,11 +313,75 @@ class AutoSecurityReviewMiddleware(
             security_review_system_prompt or DEFAULT_SECURITY_REVIEW_SYSTEM_PROMPT
         )
 
+        # ---------- backend for file-content inspection ----------
+        self._backend: BackendProtocol | None = backend
+
         # ---------- which tools get AI-reviewed ----------
         self._review_tools: frozenset[str] | Literal["all"] = review_tools
 
         # ---------- tool descriptions for richer review context ----------
         self._tool_descriptions: dict[str, str] = tool_descriptions or {}
+
+    # ------------------------------------------------------------------
+    # Resolve file content from backend (for write / edit tools)
+    # ------------------------------------------------------------------
+
+    _FILE_PATH_KEYS: tuple[str, ...] = ("file_path", "path")
+
+    def _resolve_file_content(
+        self,
+        tool_call: ToolCall,
+    ) -> tuple[str | None, str | None]:
+        """Read the file that the tool call targets, if a backend is available.
+
+        Returns
+        -------
+        (file_content, file_content_label)
+            - For ``write``: reads the *new* content from ``tool_call['args']['content']``
+              (if present) directly without a round-trip — the AI is evaluating
+              the content before it hits disk.
+            - For ``edit``: reads the *current* file via the backend so the
+              AI can see what's already on disk alongside the proposed changes.
+            - For other tools: ``(None, None)``.
+        """
+        if self._backend is None:
+            return None, None
+
+        args = tool_call.get("args", {})
+        tool_name = tool_call["name"]
+
+        # --- write tool: the new content is already in the arguments ---
+        if tool_name in ("write", "awsrite", "awrite"):
+            content = args.get("content")
+            if isinstance(content, str) and content.strip():
+                return content, "New file content"
+            # If no inline content, try reading the target path
+            for key in self._FILE_PATH_KEYS:
+                path = args.get(key)
+                if path:
+                    break
+            else:
+                return None, None
+            result = self._backend.read(path)
+            if result.error is None and result.content:
+                return result.content, "Current file content"
+            return None, None
+
+        # --- edit tool: read the current file to show what's being changed ---
+        if tool_name in ("edit", "aedit"):
+            for key in self._FILE_PATH_KEYS:
+                path = args.get(key)
+                if path:
+                    break
+            else:
+                return None, None
+            result = self._backend.read(path)
+            if result.error is None and result.content:
+                return result.content, "Current file content (pre-edit)"
+            return None, None
+
+        # --- other tools: no file content needed ---
+        return None, None
 
     # ------------------------------------------------------------------
     # AI security review (single tool call)
@@ -279,14 +390,23 @@ class AutoSecurityReviewMiddleware(
     def _ai_review(self, tool_call: ToolCall) -> SecurityReviewResult:
         """Ask the AI model to review a single tool call for security.
 
+        When a backend is configured, this method reads the actual file
+        content involved in ``write`` / ``edit`` calls so the reviewer
+        can inspect scripts for malicious patterns, backdoors, etc.
+
         Returns
         -------
         SecurityReviewResult
             Structured assessment with ``is_safe``, ``reason`` and ``risk_level``.
         """
         tool_desc = self._tool_descriptions.get(tool_call["name"])
+        file_content, file_label = self._resolve_file_content(tool_call)
         messages = _build_review_messages(
-            self._review_system_prompt, tool_call, tool_description=tool_desc,
+            self._review_system_prompt,
+            tool_call,
+            tool_description=tool_desc,
+            file_content=file_content,
+            file_content_label=file_label,
         )
 
         # Attempt structured-output (JSON-schema mode) for reliable parsing.

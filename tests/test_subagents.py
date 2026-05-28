@@ -37,6 +37,7 @@ _GLM_MODEL_NAME = "Pro/zai-org/GLM-4.7"
 
 def _get_model():
     """Return a test ChatOpenAI model instance."""
+    pytest.importorskip("langchain_openai")
     from langchain_openai import ChatOpenAI
 
     return ChatOpenAI(

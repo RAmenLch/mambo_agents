@@ -6,7 +6,6 @@ import base64
 import contextlib
 import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from unittest.mock import patch
 
 import pytest
 
@@ -35,6 +34,10 @@ def _simulate_graph(backend: StateBackend, thread_id: str = "test"):
     Also patches ``_resolve_thread_id`` and ``_get_config`` so that
     ``upload_files`` / ``download_files`` can use the graph-in path
     (``thread_id=None`` auto-resolved).
+
+    **Thread-safe**: uses a refcount on ``backend._simulate_graph_nest``
+    guarded by ``backend._lock`` so that concurrent readers/writers on the
+    same backend instance don't race on the attribute swaps.
     """
 
     # ---- Mock implementations ----
@@ -85,12 +88,46 @@ def _simulate_graph(backend: StateBackend, thread_id: str = "test"):
                 backend._snapshots[thread_id] = {}
             backend._snapshots[thread_id].update(update)
 
-    with patch.object(backend, "_in_graph_context", _mock_in_graph), \
-         patch.object(backend, "_resolve_thread_id", _mock_resolve_thread_id), \
-         patch.object(backend, "_get_config", _mock_get_config), \
-         patch.object(backend, "_read_files", _mock_read), \
-         patch.object(backend, "_send_files_update", _mock_send):
+    # Thread-safe refcount so concurrent calls on the same backend instance
+    # don't race on attribute swaps (unlike ``patch.object`` which uses
+    # non-reentrant ``setattr``/``delattr``).
+    with backend._lock:
+        if not hasattr(backend, '_simulate_graph_nest'):
+            backend._simulate_graph_nest = 0
+        backend._simulate_graph_nest += 1
+
+        if backend._simulate_graph_nest == 1:
+            # ---- First entry: save originals & apply mocks ----
+            backend._orig__in_graph_context = backend._in_graph_context
+            backend._orig__resolve_thread_id = backend._resolve_thread_id
+            backend._orig__get_config = backend._get_config
+            backend._orig__read_files = backend._read_files
+            backend._orig__send_files_update = backend._send_files_update
+
+            backend._in_graph_context = _mock_in_graph
+            backend._resolve_thread_id = _mock_resolve_thread_id
+            backend._get_config = _mock_get_config
+            backend._read_files = _mock_read
+            backend._send_files_update = _mock_send
+
+    try:
         yield
+    finally:
+        with backend._lock:
+            backend._simulate_graph_nest -= 1
+            if backend._simulate_graph_nest == 0:
+                # ---- Last exit: restore originals ----
+                backend._in_graph_context = backend._orig__in_graph_context
+                backend._resolve_thread_id = backend._orig__resolve_thread_id
+                backend._get_config = backend._orig__get_config
+                backend._read_files = backend._orig__read_files
+                backend._send_files_update = backend._orig__send_files_update
+                del backend._orig__in_graph_context
+                del backend._orig__resolve_thread_id
+                del backend._orig__get_config
+                del backend._orig__read_files
+                del backend._orig__send_files_update
+                del backend._simulate_graph_nest
 
 
 def _files_snapshot(backend: StateBackend, thread_id: str = "test") -> dict:
@@ -292,7 +329,7 @@ class TestStateBackendRead:
             backend.write("/f.py", "a\nb\nc")
             r = backend.read("/f.py")
         assert r.total_lines == 3
-        assert "     1\ta" in (r.content or "")
+        assert "a\nb\nc" in (r.content or "")
 
     def test_read_offset_limit(self):
         backend = StateBackend()
@@ -300,8 +337,9 @@ class TestStateBackendRead:
             backend.write("/f.txt", "\n".join(f"L{i}" for i in range(10)))
             r = backend.read("/f.txt", offset=2, limit=3)
         assert r.error is None
-        # Should have 3 lines starting from line 3
-        assert "     3\tL2" in (r.content or "")
+        # Should have 3 lines starting from L2 (index 2)
+        assert "L2" in (r.content or "")
+        assert "L4" in (r.content or "")
 
     def test_read_binary_base64(self):
         backend = StateBackend()

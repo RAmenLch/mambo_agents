@@ -32,6 +32,7 @@ _GLM_MODEL_NAME = "Pro/zai-org/GLM-4.7"
 
 
 def _get_model():
+    pytest.importorskip("langchain_openai")
     from langchain_openai import ChatOpenAI
 
     return ChatOpenAI(
@@ -43,11 +44,15 @@ def _get_model():
 
 
 def _make_mock_summary_model(summary_text: str = "Mock summary: plan stuff happened."):
+    from unittest.mock import AsyncMock
+
     mock = MagicMock()
-    mock.invoke.return_value = MagicMock()
-    mock.invoke.return_value.text = summary_text
-    mock.ainvoke.return_value = MagicMock()
-    mock.ainvoke.return_value.text = summary_text
+    mock_response = MagicMock()
+    mock_response.content = summary_text
+    mock.invoke.return_value = mock_response
+    mock_async_response = MagicMock()
+    mock_async_response.content = summary_text
+    mock.ainvoke = AsyncMock(return_value=mock_async_response)
     mock._llm_type = "mock-chat"
     return mock
 

@@ -3,6 +3,7 @@
 from mambo_agents.backends.protocol import BackendProtocol
 from mambo_agents.backends.state import StateBackend
 from mambo_agents.backends.state_schema import FileData, FilesystemState
+from mambo_agents.backends.temp_workspace import TempWorkspaceBackend
 from mambo_agents.graph import create_mambo_agent
 from mambo_agents.middleware.async_subagents import (
     AsyncSubAgentMiddleware,
@@ -46,6 +47,7 @@ __all__ = [
     "SkillSource",
     "SkillsMiddleware",
     "StateBackend",
+    "TempWorkspaceBackend",
     "SubAgent",
     "SubAgentMiddleware",
     "SummarizationConfig",

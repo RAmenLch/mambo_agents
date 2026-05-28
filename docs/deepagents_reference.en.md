@@ -1,0 +1,108 @@
+# Reference Statement Regarding deepagents
+
+## 1. Acknowledgement
+
+**Mambo Agents** acknowledges and thanks the [deepagents](https://github.com/langchain-ai/deepagents) project (v0.5.7, by the LangChain team) for its open-source work. This project has undergone substantial refactoring and extension on top of deepagents' foundational architecture, with core inspiration drawn from its two primary design paradigms: the **Middleware Pipeline** and the **Backend Protocol** abstraction.
+
+Specifically, we drew architectural ideas from the following deepagents components:
+
+| Architectural Dimension | Reference Source | Description |
+|-------------------------|------------------|-------------|
+| Middleware Pipeline | `deepagents.graph.create_deep_agent()` | Chaining `AgentMiddleware` instances to intercept the agent lifecycle |
+| Backend Protocol | `deepagents.backends.protocol.BackendProtocol` | Six core file operations: `ls` / `read` / `write` / `edit` / `grep` / `glob` |
+| State Backend | `deepagents.backends.state.StateBackend` | In-memory file storage via LangGraph state channels |
+| Filesystem Backend | `deepagents.backends.filesystem.FilesystemBackend` | Real filesystem wrapping |
+| Skills System | `deepagents.middleware.skills.SkillsMiddleware` | Progressive disclosure via `SKILL.md` |
+| Sub-agent System | `deepagents.middleware.subagents.SubAgentMiddleware` | Sync / async sub-agent delegation |
+| Conversation Summarization | `deepagents.middleware.summarization.SummarizationMiddleware` | Context window compaction |
+| Tool Call Patching | `deepagents.middleware.patch_tool_calls.PatchToolCallsMiddleware` | Repairing dangling tool calls |
+
+> **Important:** This project is not a fork or branch of deepagents. It is an independently implemented agent framework guided by deepagents' architectural ideas. At the code level, only the early prototyping stage drew upon portions of the implementation; the current codebase is entirely independently written.
+
+---
+
+## 2. Design Directions and Trade-offs
+
+The differences below do not imply that deepagents' design is "wrong." They reflect trade-offs made by two projects with **different goals and contexts**. deepagents targets general-purpose agent development with broad model compatibility and ecosystem integration; Mambo Agents emphasizes transparent multi-backend operation, security review, and a pragmatic toolchain.
+
+### 2.1 Multi-backend and Command Execution
+
+| Dimension | deepagents | Mambo Agents | Trade-off |
+|-----------|------------|--------------|-----------|
+| **Local Filesystem + Execution** | `LocalShellBackend` (`FilesystemBackend` + `SandboxBackendProtocol`) <br>• Gains `execute()` by inheriting `SandboxBackendProtocol` <br>• Runs `subprocess.run(shell=True)` directly on host, no isolation | `LocalBackend` (self-contained `execute()`) <br>• `execute()` is a method on the backend itself, no additional protocol layer required <br>• Same direct host execution, but co-located in a single class | Mambo avoids the `LocalShellBackend` / `FilesystemBackend` class split; local file operations and local shell execution are naturally unified |
+| **Remote Filesystem + Execution** | `LangSmithSandbox` (extends `BaseSandbox`) <br>• Targets LangSmith's cloud container service, achieving true process isolation <br>• All file operations delegate to `execute()`, communicating via SDK | `SshBackend` (based on paramiko) <br>• `execute()` runs remotely through an SSH channel <br>• File operations directly manipulate the remote filesystem (`ls` / `read` / `write` do not go through `execute`; they have native implementations) | deepagents' remote solution is tied to the LangSmith cloud service, suitable for pre-configured containerized environments; Mambo's SSH approach is more general — any machine running sshd works |
+| **Execute Architecture Philosophy** | `execute()` requires `SandboxBackendProtocol` <br>• Protocol stack: `BackendProtocol` (files only) → `SandboxBackendProtocol` (+ execute) → `BaseSandbox` (convenience wrappers) <br>• Only backends declared as "Sandbox" can execute commands | `execute()` is an inherent, optional capability of the backend <br>• Protocol stack: only `BackendProtocol`. Any backend that wants `execute` simply implements it on its own class <br>• `LocalBackend` and `SshBackend` each carry `execute`; `StateBackend` does not — enabled on demand, no forced classification | Mambo pursues a more general, more flexible way to enable `execute`: no separate Sandbox protocol layer, `execute` is just a regular method, each backend decides for itself whether to provide it |
+| **Cross-session Persistence** | ✅ `StoreBackend` (backed by LangGraph `BaseStore`) | ❌ Not implemented | Current phase focuses on single-session scenarios; to be added as needed |
+
+### 2.2 Middleware Stack Differences
+
+| Dimension | deepagents | Mambo Agents | Trade-off |
+|-----------|------------|--------------|-----------|
+| **Security Review** | `HumanInTheLoopMiddleware` (simple human approval) | `AutoSecurityReviewMiddleware` (AI pre-review + human fallback) | Mambo adds an AI auto-review layer to reduce human approval interruption frequency |
+| **Task Planning** | `TodoListMiddleware` (simple TODO management) | `MamboPlanMiddleware` (structured plans + summarization integration hooks) | Mambo's planning is deeply coupled with the summarization system, preventing compaction from losing plan state |
+| **Multi-model Compatibility** | ❌ No tool message reordering | ✅ `ReorderToolMessagesMiddleware` | Some multimodal models are sensitive to tool message ordering; Mambo handles this explicitly |
+| **Tool Extensibility** | `FilesystemMiddleware` (6 core tools + backend extra tools + multimodal read) | ✅ `BackendToolsMiddleware` (6 core tools + auto-injection of backend extra tools) <br>• `include_line_numbers` parameter: Mambo's `read` does not return line numbers by default; the model can choose to pass `True` when it needs to reference specific lines (deepagents unconditionally adds line numbers, with no off switch) <br>• `build_tool_descriptions()` extracts all tool descriptions into a mapping, consumable by `AutoSecurityReviewMiddleware` for understanding tool purpose | Differentiated at the basic tool layer: controllable `include_line_numbers` reduces irrelevant noise; `build_tool_descriptions()` makes tool metadata consumable by other middleware |
+| **Large Result Eviction** | ✅ `FilesystemMiddleware` built-in eviction (saves to `/large_tool_results/`) <br>• Eviction timing: `wrap_model_call` (batch processing of message history before the model call) | ✅ `BackendToolsMiddleware` eviction (saves to `/.mambo/large_tool_results/`) <br>• Eviction timing: `wrap_tool_call` (immediate interception after tool returns results, rather than waiting for the next model call) | Both implement large-result eviction (including multimodal block preservation and Command multi-message scenarios); the only difference is eviction timing: Mambo acts immediately after tool return, deepagents batches before model invocation |
+| **Memory System** | ✅ `MemoryMiddleware` (`AGENTS.md`) | ❌ Not implemented | The current Skills system already covers knowledge injection needs; independent memory support to be evaluated later |
+| **Profile System** | ✅ `ProviderProfile` + `HarnessProfile` (model/provider tuning) | ❌ Not implemented | Mambo currently does not focus on model-level fine-grained tuning; configuration left to the user |
+| **Anthropic Caching** | ✅ `AnthropicPromptCachingMiddleware` | ❌ Not implemented | Mambo currently does not bind to provider-specific optimizations |
+| **Sub-agent State Passthrough** | Sub-agent results returned as `ToolMessage` | ✅ Sub-agents return via `Command` <br>• `_return_command_with_state_update()` transparently passes non-excluded state keys (e.g. filesystem state) from the sub-agent back to the parent <br>• Three levels of streaming event granularity (`messages` / `updates` / `values`), with `subagent_event` custom events pushing sub-agent internal progress <br>• Parallel sub-agents are distinguished by `tool_call_id` in their event streams | Sub-agents not only return results but also surface their conversational state to the parent agent, allowing the parent to understand which files were created or modified during execution |
+
+### 2.3 Architecture Design Trade-offs
+
+| Dimension | deepagents | Mambo Agents | Trade-off |
+|-----------|------------|--------------|-----------|
+| **Type Safety** | Partial use of TypedDict | ✅ End-to-end Pydantic types (no Dict/Any duck typing) | Strict type control is a core Mambo coding standard |
+| **Temp Workspace** | ❌ None | ✅ `TempWorkspaceBackend` (`/.mambo/` routes to in-memory) | Provides an isolated space for middleware file storage and sub-agent communication |
+| **Backend Architecture** | `CompositeBackend` (flexible path-prefix routing to different backends) <br>• Can mix backends like `/memories/` → `StoreBackend`, `/workspace/` → `FilesystemBackend` <br>• Risk: when `execute()` is available, the AI may `cat /memories/...` directly, bypassing the routing layer and causing unexpected behavior | ✅ `TempWorkspaceBackend` (simplified dual routing) <br>• Forgoes flexible path routing; keeps only the clean `/`.mambo/` → `StateBackend` model, everything else → delegate <br>• System prompt explicitly tells the AI the semantics of `/.mambo/` (scratchpad, isolated files, middleware-internal storage), reducing route-related hallucinations <br>• No routing layer interference: backend tool parameters pass through directly, improving flexibility | deepagents uses flexible routing to cover multi-backend mixing; Mambo chooses simple routing + explicit conventions for AI predictability |
+| **Plugin Discovery** | ✅ `importlib.metadata` entry points (Profile system) | ❌ Not implemented | Current phase focuses on core functionality; plugin system deferred |
+
+---
+
+## 3. Feature Comparison Table
+
+A side-by-side mapping of equivalent capabilities:
+
+### 3.1 Backend
+
+| Feature | deepagents | Mambo Agents |
+|---------|------------|--------------|
+| Protocol Definition | `BackendProtocol` + `SandboxBackendProtocol` (independent execute layer) | `BackendProtocol` (execute is also a backend method; no independent protocol layer) |
+| In-memory Storage | `StateBackend` | `StateBackend` (reconstructed) |
+| Local Execute | `LocalShellBackend` (`FilesystemBackend` + `SandboxBackendProtocol`, two layers of parent classes) | `LocalBackend` (single class with built-in `execute()`, `tree`, `delete`) |
+| Remote Execute | `LangSmithSandbox` (cloud container service, all file operations delegated to `execute()`) | `SshBackend` (native SSH, `execute()` via SSH channel, file operations have native implementations) |
+| Path Routing | `CompositeBackend` (flexible multi-backend routing; `execute()` may bypass the routing layer) | `TempWorkspaceBackend` (simplified dual route: `/.mambo/` → memory, rest → delegate; system prompt explicitly communicates workspace semantics to the AI) |
+| Cross-session Storage | `StoreBackend` | ❌ |
+
+### 3.2 Middleware
+
+| Feature | deepagents | Mambo Agents |
+|---------|------------|--------------|
+| File Tool Injection | `FilesystemMiddleware` (6 core + extra tools + large result eviction + multimodal read) | `BackendToolsMiddleware` (6 core + extra tools + large result eviction + multimodal read; optional `include_line_numbers`, `build_tool_descriptions()` for external consumption) |
+| Skill Disclosure | `SkillsMiddleware` | `SkillsMiddleware` (reconstructed) |
+| Sync Sub-agents | `SubAgentMiddleware` | `SubAgentMiddleware` (reconstructed; `subagent_event` streaming, three granularity levels, state passthrough) |
+| Async Sub-agents | `AsyncSubAgentMiddleware` | `AsyncSubAgentMiddleware` (reconstructed) |
+| Conversation Summarization | `SummarizationMiddleware` | `MamboSummarizationMiddleware` (extended) <br>• **Chained Summaries**: preserves prior summary content across multiple summarization rounds; uses `CHAINED_SUMMARY_PROMPT` to instruct the model to merge historical summaries rather than overwrite, preventing cross-round information loss <br>• **CJK Token Counting**: auto-detects CJK character ratio, applying a different chars-per-token ratio than English to avoid severe token under-counting for CJK text <br>• **Latest User Message Protection**: ensures the most recent user message is never summarized away (the langchain base implementation lacks this safeguard) <br>• **Optional Backend Persistence**: evicted original messages can be written via `BackendProtocol` to `/conversation_history/{thread_id}.md` |
+| Dangling Tool Call Patching | `PatchToolCallsMiddleware` | `PatchToolCallsMiddleware` (preserved) |
+| Tool Message Reordering | ❌ | ✅ `ReorderToolMessagesMiddleware` |
+| Security Review | `HumanInTheLoopMiddleware` | ✅ `AutoSecurityReviewMiddleware` (AI pre-review + human approval) |
+| Task Planning | `TodoListMiddleware` | ✅ `MamboPlanMiddleware` (structured + summarization integration) |
+| Memory Loading | `MemoryMiddleware` | ❌ |
+| Tool Exclusion | `_ToolExclusionMiddleware` | ❌ |
+| Anthropic Caching | `AnthropicPromptCachingMiddleware` | ❌ |
+
+### 3.3 Entry Points
+
+| Feature | deepagents | Mambo Agents |
+|---------|------------|--------------|
+| Primary Constructor | `create_deep_agent()` | `create_mambo_agent()` |
+| Profile System | ✅ `ProviderProfile` + `HarnessProfile` | ❌ |
+| Sub-agent Types | `SubAgent` / `CompiledSubAgent` / `AsyncSubAgent` | `SubAgent` / `CompiledSubAgent` / `AsyncSubAgent` |
+
+---
+
+## Closing
+
+deepagents is an outstanding open-source project in the Agent framework space. Its **Middleware Pipeline + Backend Protocol** architecture provided a clear blueprint for Mambo Agents. Building on that foundation, Mambo Agents has pursued refactoring and extension in the following directions: strengthened security review, added remote SSH operation capability, introduced a strict type system, and addressed specific concerns around large result handling, multi-model compatibility, and plan-summarization coordination.
+
+We remain grateful for the deepagents team's contributions to Agent infrastructure. All unique extensions in this project are intentional choices made for our own needs, not dismissals of deepagents' design.

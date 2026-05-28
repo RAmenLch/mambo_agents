@@ -1,20 +1,20 @@
 # Mambo Agents
 
-**基于 LangChain/LangGraph 的 AI Agent 框架** — 提供多后端文件系统、子代理并行调度、对话摘要、安全审查、技能系统等开箱即用的能力。
+**AI Agent framework built on LangChain/LangGraph** — multi-backend filesystem, sub-agent parallel scheduling, conversation summarization, security review, skills system, and more, out of the box.
 
-> 本项目参考了 [deepagents](https://github.com/langchain-ai/deepagents) 的架构设计，在其基础上进行了独立重构与扩展。详见 [与 deepagents 的对比](docs/deepagents_reference.md)。
+> This project draws architectural inspiration from [deepagents](https://github.com/langchain-ai/deepagents), with independent refactoring and extensions. See [comparison with deepagents](docs/deepagents_reference.en.md).
 
-## 核心特性
+## Key Features
 
-- **多后端文件系统** — `StateBackend`(内存)、`LocalBackend`(本地磁盘)、`SshBackend`(远程SSH)、`TempWorkspaceBackend`(混合路由)，统一通过 `BackendProtocol` 抽象
-- **子代理系统** — 同步/异步子代理，支持并行调度、流式事件、隔离上下文窗口
-- **对话摘要** — 自动压缩长对话历史，防止上下文窗口溢出，支持链式摘要与后端持久化
-- **任务规划** — `MamboPlanMiddleware` 提供结构化 TODO 列表，与摘要系统深度集成
-- **AI 安全审查** — 工具调用前用廉价模型预审，高风险操作才升级到人工审核
-- **技能系统** — 渐进式披露的技能加载，支持多层来源覆盖
-- **开箱即用** — `create_powerful_agent()` 一行代码启动全功能 Agent
+- **Multi-backend Filesystem** — `StateBackend` (in-memory), `LocalBackend` (local disk), `SshBackend` (remote SSH), `TempWorkspaceBackend` (hybrid routing), unified through `BackendProtocol`
+- **Sub-agent System** — sync/async sub-agents with parallel scheduling, streaming events, and isolated context windows
+- **Conversation Summarization** — automatic long-history compaction with chained summaries and optional backend persistence
+- **Task Planning** — `MamboPlanMiddleware` provides structured TODO lists, deeply integrated with the summarization system
+- **AI Security Review** — pre-approve tool calls with a cheap model, escalating only high-risk operations to human review
+- **Skills System** — progressive disclosure of skills, with multi-source overlay support
+- **Plug-and-Play** — `create_powerful_agent()` launches a full-featured agent in one line
 
-## 快速开始
+## Quick Start
 
 ```bash
 pip install mambo-agents
@@ -24,12 +24,12 @@ pip install mambo-agents
 from mambo_agents.quickstart import create_powerful_agent
 from langchain_core.messages import HumanMessage
 
-# 一行创建全功能Agent（自动开启摘要、规划、通用子代理）
+# One line to create a full-featured agent (summarization, planning, general-purpose sub-agent enabled)
 agent = create_powerful_agent("gpt-4o")
-result = agent.invoke({"messages": [HumanMessage("创建一个 hello.py 文件")]})
+result = agent.invoke({"messages": [HumanMessage("Create a hello.py file")]})
 ```
 
-## 架构
+## Architecture
 
 ```
 ┌──────────────────────────────────────────────────────────┐
@@ -55,15 +55,11 @@ result = agent.invoke({"messages": [HumanMessage("创建一个 hello.py 文件")
 └──────────────────────────────────────────────────────────┘
 ```
 
-## 文档
+## Docs
 
-| 中文 | English |
-|------|---------|
-| [详细使用文档](docs/usage.md) | [Usage Guide](docs/usage.en.md) |
-| [与 deepagents 的对比](docs/deepagents_reference.md) | [Comparison with deepagents](docs/deepagents_reference.en.md) |
+- [Detailed Usage Guide](docs/usage.en.md) — API reference, configuration, advanced usage
+- [Comparison with deepagents](docs/deepagents_reference.en.md) — architectural differences, feature mapping, design trade-offs
 
-[English README](README.en.md)
-
-## 许可证
+## License
 
 MIT License

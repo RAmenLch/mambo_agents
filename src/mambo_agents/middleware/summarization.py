@@ -587,7 +587,7 @@ class MamboSummarizationMiddleware(AgentMiddleware[SummarizationState, ContextT,
 
         # Default history path prefix — stored under a fixed virtual directory
         # on the backend (does NOT require a real filesystem root).
-        self._history_path_prefix = "/conversation_history"
+        self._history_path_prefix = "/.mambo/conversation_history"
 
     # ------------------------------------------------------------------
     # Hook management

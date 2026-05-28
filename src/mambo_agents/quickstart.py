@@ -7,7 +7,7 @@ don't have to configure everything by hand.
 Features enabled by default:
 
 * **Auto-summarisation** — long conversations are automatically compacted
-  (trigger at 100 k tokens, keep the last 20 messages, persist evicted
+  (trigger at 200 k tokens, keep the last 20 messages, persist evicted
   messages to the backend so nothing is lost).
 * **Planning middleware** — the agent can create and update structured TODO
   lists via ``write_plans``.
@@ -17,8 +17,7 @@ Features enabled by default:
 * **MemorySaver checkpointer** — always wired so you can enable
   ``interrupt_on`` without extra ceremony.
 * **AI-assisted security review** — when you pass ``interrupt_on=…``, tool
-  calls are pre-screened by an AI (default: ``gpt-4o-mini``) before any
-  human is interrupted.
+  calls are pre-screened by the same model before any human is interrupted.
 
 Example::
 
@@ -65,18 +64,18 @@ from mambo_agents.middleware.summarization import SummarizationConfig
 # Power defaults (constants — importable so callers can copy & tweak)
 # ---------------------------------------------------------------------------
 POWER_DEFAULT_SUMMARIZATION: SummarizationConfig = {
-    "trigger": ("tokens", 100_000),
+    "trigger": ("tokens", 200_000),
     "keep": ("messages", 20),
     "offload_to_backend": True,
 }
-"""Default summarization config: compact when tokens exceed 100 k, keep the
+"""Default summarization config: compact when tokens exceed 200 k, keep the
 last 20 messages, and persist evicted history to the backend."""
 
 POWER_DEFAULT_SECURITY_REVIEW = SecurityReviewConfig(
-    model="gpt-4o-mini",
+    model=None,
     review_tools="all",
 )
-"""Default AI-assisted security review: use a cheaper model for pre-screening,
+"""Default AI-assisted security review: reuse the agent model for pre-screening,
 review all interrupt-on tools."""
 
 
@@ -139,7 +138,7 @@ def create_powerful_agent(
         ``POWER_DEFAULT_SECURITY_REVIEW``.
     summarization:
         * ``True`` (default) — enable summarization with power defaults
-          (trigger at 100 k tokens, keep 20 messages, offload to backend).
+          (trigger at 200 k tokens, keep 20 messages, offload to backend).
         * ``False`` / ``None`` — disable summarization entirely.
         * A ``SummarizationConfig`` dict — your own settings.
     enable_planning:
