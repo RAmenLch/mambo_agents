@@ -720,6 +720,7 @@ class TestSubagentStreamingE2E:
                 )
             )]},
             stream_mode=["updates", "custom"],
+            config={"configurable": {"thread_id": "test_parallel_subagents_dtci"}},
         ):
             if mode == "custom":
                 payload: dict = data  # type: ignore[assignment]

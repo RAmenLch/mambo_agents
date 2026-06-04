@@ -6,6 +6,10 @@ duplicated between ``LocalBackend``, ``StateBackend``, and protocol.
 
 from __future__ import annotations
 
+from typing import Literal
+
+from pydantic import BaseModel
+
 # ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
@@ -56,27 +60,67 @@ def format_with_line_numbers(content: str, start_line: int = 1) -> str:
 
 
 # ---------------------------------------------------------------------------
+# Tree display types
+# ---------------------------------------------------------------------------
+
+
+class TreeEntry(BaseModel):
+    """A single entry in a directory tree display.
+
+    Attributes:
+        name: Display name (e.g. ``"subdir/"``, ``"file.txt (1 KB)"``).
+        depth: Nesting depth (0 = root level).
+        marker: Optional status marker for directories.
+            ``""`` = normal, ``"empty"`` → ``/(empty)``,
+            ``"ignore"`` → ``/(ignore)``,
+            ``"depth_exceeded"`` → ``/(...)``.
+    """
+
+    name: str
+    depth: int
+    marker: Literal["", "empty", "ignore", "depth_exceeded"] = ""
+
+
+# ---------------------------------------------------------------------------
 # Edit helpers
 # ---------------------------------------------------------------------------
 
 
 def format_tree_entries(
-    entries: list[tuple[str, int]],
+    entries: list[TreeEntry],
 ) -> str:
-    """Render ``(display_name, depth)`` entries as a visual directory tree.
+    """Render ``TreeEntry`` list as a visual directory tree.
 
     Used by both ``LocalBackend`` and ``SshBackend`` – the tree-walk
     logic is backend-specific, but the formatting is shared.
+
+    Directory markers are appended to the display name:
+    - ``/(empty)`` — directory has no children
+    - ``/(ignore)`` — directory in ignore_dirs (children hidden)
+    - ``/(...)`` — depth limit reached, children not shown
     """
     if not entries:
         return "(empty)"
 
+    _MARKER_SUFFIX: dict[str, str] = {
+        "empty": "/(empty)",
+        "ignore": "/(ignore)",
+        "depth_exceeded": "/(...)",
+    }
+
     lines: list[str] = []
-    for i, (display, depth) in enumerate(entries):
+    for i, entry in enumerate(entries):
+        marker_suffix = _MARKER_SUFFIX.get(entry.marker, "")
+        if marker_suffix:
+            display = entry.name.rstrip("/") + marker_suffix
+        else:
+            display = entry.name
+        depth = entry.depth
+
         # Determine connector: look ahead to see if there are siblings at the same depth
         has_more_siblings = False
         for j in range(i + 1, len(entries)):
-            next_depth = entries[j][1]
+            next_depth = entries[j].depth
             if next_depth < depth:
                 break
             if next_depth == depth:
@@ -91,9 +135,9 @@ def format_tree_entries(
             for level in range(1, depth + 1):
                 active = False
                 for j in range(i + 1, len(entries)):
-                    if entries[j][1] < level:
+                    if entries[j].depth < level:
                         break
-                    if entries[j][1] == level:
+                    if entries[j].depth == level:
                         active = True
                         break
                 prefix_parts.append("│   " if active else "    ")
@@ -101,6 +145,40 @@ def format_tree_entries(
             lines.append(f"{prefix}{connector}{display}")
 
     return "\n".join(lines)
+
+
+def check_path_allowed(
+    path: str,
+    *,
+    whitelist: frozenset[str] | None = None,
+    blacklist: frozenset[str] | None = None,
+) -> bool:
+    """Check whether *path* (virtual) is allowed for edit/write/delete.
+
+    When *whitelist* is set, *path* must start with (or equal) one of
+    its entries.  When *blacklist* is set, *path* must NOT start with
+    (or equal) any entry.  The two are mutually exclusive and the caller
+    must enforce that.
+
+    Args:
+        path: Virtual absolute path to check (e.g. ``"/src/foo.py"``).
+        whitelist: Allowed path prefixes (e.g. ``{"/src"}``).
+        blacklist: Forbidden path prefixes (e.g. ``{"/build"}``).
+
+    Returns:
+        ``True`` if the path is permitted.
+    """
+    if whitelist is not None:
+        return any(
+            path == prefix or path.startswith(prefix + "/")
+            for prefix in whitelist
+        )
+    if blacklist is not None:
+        return not any(
+            path == prefix or path.startswith(prefix + "/")
+            for prefix in blacklist
+        )
+    return True
 
 
 def detect_trailing_newline_mismatch(

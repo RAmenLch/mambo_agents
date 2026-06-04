@@ -235,14 +235,14 @@ class TestGetHistoryPath:
         runtime = MagicMock()
         runtime.config = {"configurable": {"thread_id": "t42"}}
         path = mw._get_history_path(runtime)
-        assert path == "/conversation_history/t42.md"
+        assert path == "/.mambo/conversation_history/t42.md"
 
     def test_path_with_session_fallback(self):
         model = _make_mock_summary_model()
         mw = MamboSummarizationMiddleware(model=model)
         runtime = MagicMock(spec=[])
         path = mw._get_history_path(runtime)
-        assert path.startswith("/conversation_history/session_")
+        assert path.startswith("/.mambo/conversation_history/session_")
         assert path.endswith(".md")
 
 
@@ -278,11 +278,11 @@ class TestOffloadToBackend:
         ]
         path = mw._offload_to_backend(messages, runtime)
 
-        assert path == "/conversation_history/t1.md"
-        backend.download_files.assert_called_once_with(["/conversation_history/t1.md"])
+        assert path == "/.mambo/conversation_history/t1.md"
+        backend.download_files.assert_called_once_with(["/.mambo/conversation_history/t1.md"])
         backend.write.assert_called_once()
         call_args = backend.write.call_args[0]
-        assert call_args[0] == "/conversation_history/t1.md"
+        assert call_args[0] == "/.mambo/conversation_history/t1.md"
         written = call_args[1]
         assert "## Summarized at" in written
         assert "Human: User question" in written
@@ -311,10 +311,10 @@ AI: old response
         messages = [HumanMessage(content="new message")]
         path = mw._offload_to_backend(messages, runtime)
 
-        assert path == "/conversation_history/t1.md"
+        assert path == "/.mambo/conversation_history/t1.md"
         backend.edit.assert_called_once()
         edit_args = backend.edit.call_args[0]
-        assert edit_args[0] == "/conversation_history/t1.md"
+        assert edit_args[0] == "/.mambo/conversation_history/t1.md"
         assert edit_args[1] == existing
         new_content = edit_args[2]
         assert new_content.startswith(existing)
@@ -341,7 +341,7 @@ AI: old response
         ]
         path = mw._offload_to_backend(messages, runtime)
 
-        assert path == "/conversation_history/t1.md"
+        assert path == "/.mambo/conversation_history/t1.md"
         written = backend.write.call_args[0][1]
         assert "Old summary" not in written
         assert "Real user message" in written
@@ -551,7 +551,7 @@ class TestAsyncOffload:
         messages = [HumanMessage(content="async test")]
         path = await mw._aoffload_to_backend(messages, runtime)
 
-        assert path == "/conversation_history/t-async.md"
+        assert path == "/.mambo/conversation_history/t-async.md"
         backend.awrite.assert_called_once()
 
     @pytest.mark.asyncio

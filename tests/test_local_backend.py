@@ -227,6 +227,134 @@ class TestLocalBackend:
         for core in ("ls", "read", "write", "edit", "grep", "glob"):
             assert core not in names, f"Core tool '{core}' should not be in backend.tools"
 
+    # ------------------------------------------------------------------
+    # edit_whitelist / edit_blacklist
+    # ------------------------------------------------------------------
+
+    def test_whitelist_blacklist_mutual_exclusive(self, tmp_root):
+        """edit_whitelist and edit_blacklist cannot both be provided."""
+        with pytest.raises(ValueError, match="mutually exclusive"):
+            LocalBackend(
+                root_dir=str(tmp_root),
+                edit_whitelist=frozenset({"/src"}),
+                edit_blacklist=frozenset({"/build"}),
+            )
+
+    def test_edit_whitelist_blocks_write(self, tmp_root):
+        """write to a non-whitelisted path is rejected."""
+        backend = LocalBackend(
+            root_dir=str(tmp_root),
+            edit_whitelist=frozenset({"/src"}),
+        )
+        r = backend.write("/outside.txt", "hello")
+        assert r.error is not None
+        assert "not allowed" in (r.error or "")
+
+    def test_edit_whitelist_allows_write(self, tmp_root):
+        """write to a whitelisted path is allowed."""
+        backend = LocalBackend(
+            root_dir=str(tmp_root),
+            edit_whitelist=frozenset({"/src"}),
+        )
+        r = backend.write("/src/hello.txt", "hello")
+        assert r.error is None
+        assert r.path == "/src/hello.txt"
+
+    def test_edit_blacklist_blocks_edit(self, tmp_root):
+        """edit on a blacklisted path is rejected."""
+        backend = LocalBackend(
+            root_dir=str(tmp_root),
+            edit_blacklist=frozenset({"/build"}),
+        )
+        r = backend.edit("/build/output.o", "a", "b")
+        assert r.error is not None
+        assert "not allowed" in (r.error or "")
+
+    def test_edit_blacklist_allows_other_paths(self, tmp_root):
+        """edit on a non-blacklisted path works normally."""
+        backend = LocalBackend(
+            root_dir=str(tmp_root),
+            edit_blacklist=frozenset({"/build"}),
+        )
+        backend.write("/src/code.py", "x = 1")
+        r = backend.edit("/src/code.py", "x = 1", "x = 2")
+        assert r.error is None
+        assert r.occurrences == 1
+
+    def test_whitelist_blocks_delete(self, tmp_root):
+        """delete on a non-whitelisted path is rejected."""
+        backend = LocalBackend(
+            root_dir=str(tmp_root),
+            edit_whitelist=frozenset({"/src"}),
+        )
+        r = backend.delete("/outside/secret.txt")
+        assert "not allowed" in r
+
+    def test_blacklist_blocks_delete(self, tmp_root):
+        """delete on a blacklisted path is rejected."""
+        backend = LocalBackend(
+            root_dir=str(tmp_root),
+            edit_blacklist=frozenset({"/important"}),
+        )
+        (tmp_root / "important").mkdir()
+        r = backend.delete("/important")
+        assert "not allowed" in r
+
+    # ------------------------------------------------------------------
+    # tree with ignore_dirs
+    # ------------------------------------------------------------------
+
+    def test_tree_ignore_dirs(self, tmp_root):
+        """ignore_dirs hides children of marked directories but still shows the dir."""
+        backend = LocalBackend(
+            root_dir=str(tmp_root),
+            ignore_dirs=frozenset({"/node_modules"}),
+        )
+        (tmp_root / "src").mkdir()
+        backend.write("/src/main.py", "code")
+        nm = tmp_root / "node_modules"
+        nm.mkdir()
+        (nm / "package.json").write_text("{}")
+        (nm / "lodash").mkdir()
+
+        result = backend.tree("/", depth=3)
+        assert "node_modules/(ignore)" in result
+        # Children of node_modules should not appear
+        assert "package.json" not in result
+        assert "lodash" not in result
+        # src should still be shown
+        assert "src/" in result
+        assert "main.py" in result
+
+    def test_tree_empty_directory(self, tmp_root):
+        """Empty directories show /(empty) marker."""
+        backend = LocalBackend(root_dir=str(tmp_root))
+        (tmp_root / "empty_dir").mkdir()
+        (tmp_root / "non_empty").mkdir()
+        backend.write("/non_empty/file.txt", "data")
+
+        result = backend.tree("/", depth=2)
+        assert "empty_dir/(empty)" in result
+        assert "non_empty/" in result
+        assert "file.txt" in result
+
+    def test_tree_depth_exceeded(self, tmp_root):
+        """Directories at max depth with children show /(...) marker."""
+        backend = LocalBackend(root_dir=str(tmp_root))
+        deep = tmp_root / "deep"
+        deep.mkdir()
+        (deep / "child").mkdir()
+        (deep / "child" / "grandchild").mkdir()
+
+        result = backend.tree("/", depth=2)
+        # deep/ is at depth 0 (root's child), child/ is at depth 1
+        # At depth=2, "deep/child/" would be reached, which has grandchild
+        # With max_depth=2, _walk_tree at current_depth=1 for child:
+        #   current_depth+1=2 >= max_depth=2 → check if child has children → yes → depth_exceeded
+        assert "child/(...)" in result
+        # grandchild should not appear (past depth limit)
+        assert "grandchild" not in result
+
 
 # ===================================================================
 # Integration test: create_mambo_agent with LocalBackend
@@ -259,7 +387,8 @@ class TestCreateAgentLocal:
                         )
                     )
                 ]
-            }
+            },
+            config={"configurable": {"thread_id": "test_local_backend_fwtr"}},
         )
         # Verify on disk
         file_path = tmp_root / "greeting.txt"

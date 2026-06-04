@@ -15,6 +15,7 @@ import shlex
 from datetime import datetime, timezone
 from pathlib import PurePosixPath
 from types import TracebackType
+from typing import Literal
 
 import paramiko
 from langchain_core.tools import StructuredTool
@@ -30,12 +31,15 @@ from mambo_agents.backends.protocol import (
     GrepResult,
     LsResult,
     ReadResult,
+    ReadSummarizer,
     UploadFileResult,
     WriteResult,
     _get_file_type,
     _get_mime_type,
 )
 from mambo_agents.backends.utils import (
+    TreeEntry,
+    check_path_allowed,
     format_tree_entries,
     format_with_line_numbers,
     human_size,
@@ -82,6 +86,13 @@ class SshBackend(BackendProtocol):
         connect_timeout: SSH connection timeout in seconds (default 30).
         execute_timeout: Default timeout for shell commands (default 120).
         max_output_bytes: Max bytes captured from command output.
+        edit_whitelist: Virtual path prefixes allowed for edit/write/delete.
+            Mutually exclusive with *edit_blacklist*.
+        edit_blacklist: Virtual path prefixes forbidden for edit/write/delete.
+            Mutually exclusive with *edit_whitelist*.
+        ignore_dirs: Virtual directory paths whose children are hidden
+            in ``tree()`` output.  The directory itself is shown with
+            an ``/(ignore)`` marker but its content is not expanded.
     """
 
     def __init__(
@@ -96,10 +107,22 @@ class SshBackend(BackendProtocol):
         connect_timeout: int = _DEFAULT_SSH_CONNECT_TIMEOUT,
         execute_timeout: int = _DEFAULT_EXECUTE_TIMEOUT,
         max_output_bytes: int = _MAX_OUTPUT_BYTES,
+        edit_whitelist: frozenset[str] | None = None,
+        edit_blacklist: frozenset[str] | None = None,
+        ignore_dirs: frozenset[str] | None = None,
+        max_read_chars: int = 100_000,
+        summarizer: "ReadSummarizer | None" = None,
     ) -> None:
+        super().__init__(max_read_chars=max_read_chars, summarizer=summarizer)
         if password is None and key_filename is None:
             raise ValueError(
                 "Either 'password' or 'key_filename' must be provided for SSH authentication."
+            )
+
+        if edit_whitelist is not None and edit_blacklist is not None:
+            raise ValueError(
+                "edit_whitelist and edit_blacklist are mutually exclusive. "
+                "Provide at most one of them."
             )
 
         self._host = host
@@ -111,6 +134,9 @@ class SshBackend(BackendProtocol):
         self._connect_timeout = connect_timeout
         self._execute_timeout = execute_timeout
         self._max_output_bytes = max_output_bytes
+        self._edit_whitelist = edit_whitelist or frozenset()
+        self._edit_blacklist = edit_blacklist or frozenset()
+        self._ignore_dirs = ignore_dirs or frozenset()
 
         self._client: paramiko.SSHClient | None = None
         self._sftp: paramiko.SFTPClient | None = None
@@ -330,7 +356,7 @@ class SshBackend(BackendProtocol):
     # Core: read
     # ------------------------------------------------------------------
 
-    def read(
+    def read_raw(
         self,
         file_path: str,
         offset: int = 0,
@@ -420,6 +446,13 @@ class SshBackend(BackendProtocol):
     def write(
         self, file_path: str, content: str, overwrite: bool = False,
     ) -> WriteResult:
+        if not self._check_edit_allowed(file_path):
+            return WriteResult(
+                error=(
+                    f"Path '{file_path}' is not allowed for write. "
+                    "Check edit_whitelist / edit_blacklist."
+                ),
+            )
         remote = self._resolve(file_path)
 
         # Check existence
@@ -479,6 +512,13 @@ class SshBackend(BackendProtocol):
         escaping issues.  This requires ``python3`` to be installed on
         the remote server.
         """
+        if not self._check_edit_allowed(file_path):
+            return EditResult(
+                error=(
+                    f"Path '{file_path}' is not allowed for edit. "
+                    "Check edit_whitelist / edit_blacklist."
+                ),
+            )
         remote = self._resolve(file_path)
 
         # Check file exists
@@ -669,6 +709,12 @@ class SshBackend(BackendProtocol):
         # If the path doesn't start with remote_root, return as-is
         return physical_path
 
+    def _check_edit_allowed(self, path: str) -> bool:
+        """Check whether *path* is allowed for edit/write/delete."""
+        whitelist = self._edit_whitelist or None
+        blacklist = self._edit_blacklist or None
+        return check_path_allowed(path, whitelist=whitelist, blacklist=blacklist)
+
     # ------------------------------------------------------------------
     # Core: glob
     # ------------------------------------------------------------------
@@ -728,6 +774,12 @@ class SshBackend(BackendProtocol):
         remote = self._resolve(path)
         remote_escaped = shlex.quote(remote)
 
+        # Map virtual ignore_dirs → relative paths expected in find output
+        # Virtual path like "/node_modules" → relative "node_modules"
+        ignore_rel_paths: frozenset[str] = frozenset(
+            p.lstrip("/") for p in self._ignore_dirs
+        )
+
         # Use find to list dirs + files with sizes, respecting max depth
         cmd = (
             f"find {remote_escaped} -maxdepth {depth} -not -path '*/.*' "
@@ -762,34 +814,99 @@ class SshBackend(BackendProtocol):
                 name = PurePosixPath(rel_path).name
                 file_entries.append((parent, name, size))
 
-        # Build tree entries list: (display_name, depth)
-        # We build it from the dirs and files parsed from find output
-        entries: list[tuple[str, int]] = []
-
-        # Add path root itself
-        pp = PurePosixPath(path)
-        root_name = pp.name or remote.split("/")[-1] or "/"
-        entries.append((root_name + "/", 0))
-
         # Build depth from relative paths
         def _path_depth(rel: str) -> int:
             if rel == "." or not rel:
                 return 1
             return rel.count("/") + 1
 
-        # Sort dirs by depth then name
-        sorted_dirs = sorted(dirs, key=lambda d: (_path_depth(d), d))
-        for d in sorted_dirs:
-            if _path_depth(d) > depth:
+        # Filter out children of ignored dirs AND the ignored dirs themselves
+        # (we'll add ignored dirs back later with the ignore marker)
+        filtered_dirs: set[str] = set()
+        for d in dirs:
+            if any(
+                d == ign or d.startswith(ign + "/")
+                for ign in ignore_rel_paths
+            ):
                 continue
-            entries.append((PurePosixPath(d).name + "/", _path_depth(d)))
+            filtered_dirs.add(d)
+
+        filtered_files: list[tuple[str, str, int]] = []
+        for parent, name, size in file_entries:
+            # Build full relative path for checking
+            full_rel = f"{parent}/{name}" if parent != "." else name
+            if any(
+                full_rel == ign or full_rel.startswith(ign + "/")
+                for ign in ignore_rel_paths
+            ):
+                continue
+            filtered_files.append((parent, name, size))
+
+        # Build TreeEntry list
+        entries: list[TreeEntry] = []
+
+        # Add path root itself
+        pp = PurePosixPath(path)
+        root_name = pp.name or remote.split("/")[-1] or "/"
+        entries.append(TreeEntry(name=root_name + "/", depth=0))
+
+        # Sort dirs by depth then name
+        sorted_dirs = sorted(filtered_dirs, key=lambda d: (_path_depth(d), d))
+        for d in sorted_dirs:
+            d_depth = _path_depth(d)
+            if d_depth > depth:
+                continue
+
+            # Determine marker
+            marker: Literal["", "empty", "ignore", "depth_exceeded"] = ""
+
+            if d_depth == depth:
+                # At depth limit — check via SFTP if this dir has children
+                dir_remote_path = f"{remote}/{d}"
+                try:
+                    dir_attrs = self._sftp.listdir_attr(dir_remote_path)
+                    has_children = len(dir_attrs) > 0
+                except (FileNotFoundError, OSError):
+                    has_children = False
+                marker = "depth_exceeded" if has_children else "empty"
+            else:
+                # Check emptiness from parsed data
+                has_children = any(
+                    fp == d for fp, _n, _s in filtered_files
+                ) or any(
+                    sub != d and sub.startswith(d + "/")
+                    for sub in filtered_dirs
+                )
+                if not has_children:
+                    marker = "empty"
+
+            entries.append(TreeEntry(
+                name=PurePosixPath(d).name + "/",
+                depth=d_depth,
+                marker=marker,
+            ))
+
+        # Add ignored dirs (show but with ignore marker, no children)
+        for ign in sorted(ignore_rel_paths):
+            if ign in dirs:  # only if it actually exists
+                entries.append(TreeEntry(
+                    name=ign.split("/")[-1] + "/",
+                    depth=ign.count("/") + 1,
+                    marker="ignore",
+                ))
 
         # Sort files by depth then name
-        for parent, name, size in sorted(file_entries, key=lambda f: (f[0].count("/"), f[0], f[1])):
+        for parent, name, size in sorted(
+            filtered_files,
+            key=lambda f: (f[0].count("/"), f[0], f[1]),
+        ):
             d = parent.count("/") + 1 if parent != "." else 1
             if d > depth:
                 continue
-            entries.append((f"{name} ({human_size(size)})", d))
+            entries.append(TreeEntry(
+                name=f"{name} ({human_size(size)})",
+                depth=d,
+            ))
 
         return format_tree_entries(entries)
 
@@ -803,6 +920,11 @@ class SshBackend(BackendProtocol):
         Uses ``rm -rf`` on the remote side.  Refuses to delete the
         remote root directory.
         """
+        if not self._check_edit_allowed(path):
+            return (
+                f"Error: Path '{path}' is not allowed for delete. "
+                "Check edit_whitelist / edit_blacklist."
+            )
         remote = self._resolve(path)
 
         # Safety: refuse to delete the root dir

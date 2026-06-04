@@ -354,6 +354,36 @@ backend = TempWorkspaceBackend(
 | 网络依赖 | ❌ | ❌ | ✅ | 可选 |
 | 适用场景 | 测试/原型 | 本地开发 | 远程部署 | 生产环境 |
 
+### 5.7 ReadSummarizer — 大文件读取摘要
+
+`BackendProtocol` 内置 `max_read_chars`（默认 100,000 字符）上限控制。超限时，用摘要替换原文而非简单截断。
+用户可注入自定义 `ReadSummarizer` 回调，按文件类型生成**指导性摘要**，帮助 AI 导航到大文件的正确位置。
+
+Mambo 提供了 `read_summarizers` 子包，含 9 种文件类型的预置摘要器：
+
+| 摘要器 | 覆盖文件 | 解析方式 |
+|--------|---------|---------|
+| `python_summarizer()` | `.py` | `ast`（标准库） |
+| `javascript_summarizer()` | `.js` / `.ts` / `.tsx` | tree-sitter |
+| `java_summarizer()` | `.java` | tree-sitter |
+| `c_summarizer()` | `.c` / `.h` | tree-sitter |
+| `cpp_summarizer()` | `.cpp` / `.hpp` / `.cc` / `.hxx` | tree-sitter |
+| `go_summarizer()` | `.go` | tree-sitter |
+| `rust_summarizer()` | `.rs` | tree-sitter |
+| `markdown_summarizer()` | `.md` / `.mdx` | 正则 |
+| `json_summarizer()` | `.json` | `json`（标准库） |
+
+每个摘要器会提取文件的结构大纲和**精确行号**，例如 Python 的类/函数、Markdown 的标题层级、JSON 的顶层键结构。
+
+```python
+from mambo_agents.read_summarizers import python_summarizer
+from mambo_agents.backends.local import LocalBackend
+
+backend = LocalBackend(summarizer=python_summarizer())
+```
+
+摘要器**不会默认注入** — 用户按需选择。未匹配后缀的文件回退到默认行为（提示分段读取）。
+
 ---
 
 ## 6. 中间件详解

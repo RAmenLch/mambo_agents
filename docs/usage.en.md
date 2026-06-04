@@ -354,6 +354,40 @@ backend = TempWorkspaceBackend(
 | Network Dependency | ❌ | ❌ | ✅ | Optional |
 | Best For | Testing / Prototyping | Local Development | Remote Deployment | Production |
 
+### 5.7 ReadSummarizer — Large File Read Summaries
+
+`BackendProtocol` enforces a `max_read_chars` (default 100,000 chars) upper limit.
+When exceeded, content is replaced with a summary rather than simply being truncated.
+Users can inject a custom `ReadSummarizer` callback that generates **file-type-aware instructive summaries**,
+helping the AI navigate to the right section of a large file.
+
+Mambo ships the `read_summarizers` sub-package with 9 pre-built summarizers:
+
+| Summarizer | Covers | Parser |
+|------------|--------|--------|
+| `python_summarizer()` | `.py` | `ast` (stdlib) |
+| `javascript_summarizer()` | `.js` / `.ts` / `.tsx` | tree-sitter |
+| `java_summarizer()` | `.java` | tree-sitter |
+| `c_summarizer()` | `.c` / `.h` | tree-sitter |
+| `cpp_summarizer()` | `.cpp` / `.hpp` / `.cc` / `.hxx` | tree-sitter |
+| `go_summarizer()` | `.go` | tree-sitter |
+| `rust_summarizer()` | `.rs` | tree-sitter |
+| `markdown_summarizer()` | `.md` / `.mdx` | regex |
+| `json_summarizer()` | `.json` | `json` (stdlib) |
+
+Each summarizer extracts a structural outline with **accurate line numbers** — e.g.
+Python classes/functions, Markdown heading hierarchy, JSON top-level key structure.
+
+```python
+from mambo_agents.read_summarizers import python_summarizer
+from mambo_agents.backends.local import LocalBackend
+
+backend = LocalBackend(summarizer=python_summarizer())
+```
+
+Summarizers are **never injected by default** — users opt in per use case. Files with
+unmatched suffixes fall back to the default behaviour (prompting to re-read with offset + limit).
+
 ---
 
 ## 6. Middleware Reference

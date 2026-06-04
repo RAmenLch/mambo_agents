@@ -26,6 +26,7 @@ from mambo_agents.backends.protocol import (
     GrepResult,
     LsResult,
     ReadResult,
+    ReadSummarizer,
     UploadFileResult,
     WriteResult,
 )
@@ -63,9 +64,13 @@ class TempWorkspaceBackend(BackendProtocol):
         backend: BackendProtocol,
         workspace_prefix: str = DEFAULT_WORKSPACE_PREFIX,
         custom_description: str | None = None,
+        *,
+        max_read_chars: int = 100_000,
+        summarizer: "ReadSummarizer | None" = None,
     ) -> None:
+        super().__init__(max_read_chars=max_read_chars, summarizer=summarizer)
         self._backend = backend
-        self._state = StateBackend()
+        self._state = StateBackend(max_read_chars=max_read_chars, summarizer=summarizer)
         self._prefix = workspace_prefix.rstrip("/") + "/"
         self._custom_description = custom_description
 
@@ -128,9 +133,21 @@ class TempWorkspaceBackend(BackendProtocol):
         offset: int = 0,
         limit: int = 2000,
         include_line_numbers: bool = False,
+        *,
+        _apply_max_chars: bool = True,
     ) -> ReadResult:
         target, p = self._route(file_path)
-        return target.read(p, offset, limit, include_line_numbers)
+        return target.read(p, offset, limit, include_line_numbers, _apply_max_chars=_apply_max_chars)
+
+    def read_raw(
+        self,
+        file_path: str,
+        offset: int = 0,
+        limit: int = 2000,
+        include_line_numbers: bool = False,
+    ) -> ReadResult:
+        target, p = self._route(file_path)
+        return target.read_raw(p, offset, limit, include_line_numbers)
 
     def write(
         self, file_path: str, content: str, overwrite: bool = False,

@@ -4,6 +4,8 @@ import pytest
 
 from mambo_agents.backends.protocol import EditResult
 from mambo_agents.backends.utils import (
+    TreeEntry,
+    check_path_allowed,
     detect_trailing_newline_mismatch,
     format_tree_entries,
     format_with_line_numbers,
@@ -92,16 +94,16 @@ class TestFormatTreeEntries:
         assert format_tree_entries([]) == "(empty)"
 
     def test_single_root(self):
-        entries = [("root", 0)]
+        entries = [TreeEntry(name="root", depth=0)]
         result = format_tree_entries(entries)
         assert result == "root"
 
     def test_nested(self):
         entries = [
-            ("root", 0),
-            ("child1", 1),
-            ("child2", 1),
-            ("grandchild", 2),
+            TreeEntry(name="root", depth=0),
+            TreeEntry(name="child1", depth=1),
+            TreeEntry(name="child2", depth=1),
+            TreeEntry(name="grandchild", depth=2),
         ]
         result = format_tree_entries(entries)
         lines = result.split("\n")
@@ -113,9 +115,9 @@ class TestFormatTreeEntries:
     def test_connectors_are_correct(self):
         """Verify tree connectors are correct (├── for siblings, └── for last)."""
         entries = [
-            ("a.py", 1),
-            ("b.py", 1),
-            ("c.py", 1),
+            TreeEntry(name="a.py", depth=1),
+            TreeEntry(name="b.py", depth=1),
+            TreeEntry(name="c.py", depth=1),
         ]
         result = format_tree_entries(entries)
         lines = result.split("\n")
@@ -124,6 +126,76 @@ class TestFormatTreeEntries:
         assert "├── b.py" in lines[1]
         # Last item → └──
         assert "└── c.py" in lines[2]
+
+    # ------------------------------------------------------------------
+    # Marker tests
+    # ------------------------------------------------------------------
+
+    def test_empty_marker(self):
+        entries = [TreeEntry(name="emptydir/", depth=1, marker="empty")]
+        result = format_tree_entries(entries)
+        assert "emptydir/(empty)" in result
+
+    def test_ignore_marker(self):
+        entries = [TreeEntry(name="node_modules/", depth=1, marker="ignore")]
+        result = format_tree_entries(entries)
+        assert "node_modules/(ignore)" in result
+
+    def test_depth_exceeded_marker(self):
+        entries = [TreeEntry(name="deepdir/", depth=3, marker="depth_exceeded")]
+        result = format_tree_entries(entries)
+        assert "deepdir/(...)" in result
+
+    def test_mixed_markers(self):
+        entries = [
+            TreeEntry(name="root/", depth=0),
+            TreeEntry(name="emptydir/", depth=1, marker="empty"),
+            TreeEntry(name="normal/", depth=1),
+            TreeEntry(name="bigfile.txt (1 MB)", depth=2),
+            TreeEntry(name="ignored/", depth=1, marker="ignore"),
+            TreeEntry(name="deep/", depth=1, marker="depth_exceeded"),
+        ]
+        result = format_tree_entries(entries)
+        assert "emptydir/(empty)" in result
+        assert "ignored/(ignore)" in result
+        assert "deep/(...)" in result
+        assert "bigfile.txt" in result
+        assert "normal/" in result
+
+
+# ============================================================================
+# check_path_allowed
+# ============================================================================
+
+
+class TestCheckPathAllowed:
+    def test_no_restrictions(self):
+        assert check_path_allowed("/any/path.py") is True
+
+    def test_whitelist_exact_match(self):
+        assert check_path_allowed("/src/main.py", whitelist=frozenset({"/src/main.py"})) is True
+
+    def test_whitelist_prefix_match(self):
+        assert check_path_allowed("/src/sub/file.py", whitelist=frozenset({"/src"})) is True
+
+    def test_whitelist_block(self):
+        assert check_path_allowed("/build/output.o", whitelist=frozenset({"/src"})) is False
+
+    def test_whitelist_root_match(self):
+        assert check_path_allowed("/src", whitelist=frozenset({"/src"})) is True
+
+    def test_blacklist_exact_match(self):
+        assert check_path_allowed("/build/output.o", blacklist=frozenset({"/build/output.o"})) is False
+
+    def test_blacklist_prefix_match(self):
+        assert check_path_allowed("/build/output.o", blacklist=frozenset({"/build"})) is False
+
+    def test_blacklist_allow(self):
+        assert check_path_allowed("/src/main.py", blacklist=frozenset({"/build"})) is True
+
+    def test_blacklist_partial_name_no_match(self):
+        """Partial name match should NOT trigger (prefix-based)."""
+        assert check_path_allowed("/build_scripts/run.sh", blacklist=frozenset({"/build"})) is True
 
 
 # ============================================================================

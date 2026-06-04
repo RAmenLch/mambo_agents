@@ -17,6 +17,7 @@ import subprocess
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import Literal
 
 from langchain_core.tools import StructuredTool
 from pydantic import Field, create_model
@@ -31,12 +32,15 @@ from mambo_agents.backends.protocol import (
     GrepResult,
     LsResult,
     ReadResult,
+    ReadSummarizer,
     UploadFileResult,
     WriteResult,
     _get_file_type,
     _get_mime_type,
 )
 from mambo_agents.backends.utils import (
+    TreeEntry,
+    check_path_allowed,
     detect_trailing_newline_mismatch,
     format_tree_entries,
     format_with_line_numbers,
@@ -85,6 +89,15 @@ class LocalBackend(BackendProtocol):
             Default ``False``. Set to ``True`` to enable shell execution.
         max_file_size_mb: Maximum file size in MB for ``grep`` search.
             Files exceeding this limit are skipped.  Default 10 MB.
+        edit_whitelist: Virtual path prefixes allowed for edit/write/delete.
+            Mutually exclusive with *edit_blacklist*.  When set, any
+            path not matching a prefix is rejected.
+        edit_blacklist: Virtual path prefixes forbidden for edit/write/delete.
+            Mutually exclusive with *edit_whitelist*.  When set, any
+            path matching a prefix is rejected.
+        ignore_dirs: Virtual directory paths whose children are hidden
+            in ``tree()`` output.  The directory itself is shown with
+            an ``/(ignore)`` marker but its content is not expanded.
     """
 
     def __init__(
@@ -97,16 +110,31 @@ class LocalBackend(BackendProtocol):
         inherit_env: bool = False,
         enable_execute: bool = False,
         max_file_size_mb: int = _DEFAULT_MAX_FILE_SIZE_MB,
+        edit_whitelist: frozenset[str] | None = None,
+        edit_blacklist: frozenset[str] | None = None,
+        ignore_dirs: frozenset[str] | None = None,
+        max_read_chars: int = 100_000,
+        summarizer: "ReadSummarizer | None" = None,
     ) -> None:
+        super().__init__(max_read_chars=max_read_chars, summarizer=summarizer)
         if timeout <= 0:
             msg = f"timeout must be positive, got {timeout}"
             raise ValueError(msg)
+
+        if edit_whitelist is not None and edit_blacklist is not None:
+            raise ValueError(
+                "edit_whitelist and edit_blacklist are mutually exclusive. "
+                "Provide at most one of them."
+            )
 
         self._cwd = Path(root_dir).resolve() if root_dir else Path.cwd()
         self._default_timeout = timeout
         self._max_output_bytes = max_output_bytes
         self._enable_execute = enable_execute
         self._max_file_size_bytes = max_file_size_mb * 1024 * 1024
+        self._edit_whitelist = edit_whitelist or frozenset()
+        self._edit_blacklist = edit_blacklist or frozenset()
+        self._ignore_dirs = ignore_dirs or frozenset()
 
         # Build environment
         if inherit_env:
@@ -210,6 +238,16 @@ class LocalBackend(BackendProtocol):
 
         return (self._cwd.joinpath(*relative_parts)).resolve()
 
+    def _check_edit_allowed(self, path: str) -> bool:
+        """Check whether *path* is allowed for edit/write/delete.
+
+        Delegates to :func:`~mambo_agents.backends.utils.check_path_allowed`
+        with this backend's whitelist / blacklist.
+        """
+        whitelist = self._edit_whitelist or None
+        blacklist = self._edit_blacklist or None
+        return check_path_allowed(path, whitelist=whitelist, blacklist=blacklist)
+
     def ls(self, path: str) -> LsResult:
         resolved = self._resolve(path)
         try:
@@ -250,7 +288,7 @@ class LocalBackend(BackendProtocol):
         error_msg = "\n".join(errors) if errors else None
         return LsResult(error=error_msg, entries=infos)
 
-    def read(
+    def read_raw(
         self,
         file_path: str,
         offset: int = 0,
@@ -331,6 +369,13 @@ class LocalBackend(BackendProtocol):
     def write(
         self, file_path: str, content: str, overwrite: bool = False,
     ) -> WriteResult:
+        if not self._check_edit_allowed(file_path):
+            return WriteResult(
+                error=(
+                    f"Path '{file_path}' is not allowed for write. "
+                    "Check edit_whitelist / edit_blacklist."
+                ),
+            )
         resolved = self._resolve(file_path)
         if resolved.exists() and not overwrite:
             return WriteResult(
@@ -361,6 +406,13 @@ class LocalBackend(BackendProtocol):
         *,
         replace_all: bool = False,
     ) -> EditResult:
+        if not self._check_edit_allowed(file_path):
+            return EditResult(
+                error=(
+                    f"Path '{file_path}' is not allowed for edit. "
+                    "Check edit_whitelist / edit_blacklist."
+                ),
+            )
         resolved = self._resolve(file_path)
         try:
             if not resolved.exists():
@@ -616,7 +668,12 @@ class LocalBackend(BackendProtocol):
         if not resolved.is_dir():
             return f"Path '{path}' is not a directory."
 
-        entries = _walk_tree(resolved, depth)
+        entries = _walk_tree(
+            resolved,
+            depth,
+            cwd=self._cwd,
+            ignore_dirs=self._ignore_dirs,
+        )
         return format_tree_entries(entries)
 
     def delete(self, path: str) -> str:
@@ -630,6 +687,11 @@ class LocalBackend(BackendProtocol):
         Returns:
             Success or error message.
         """
+        if not self._check_edit_allowed(path):
+            return (
+                f"Error: Path '{path}' is not allowed for delete. "
+                "Check edit_whitelist / edit_blacklist."
+            )
         resolved = self._resolve(path)
 
         # Safety: refuse to delete the root_dir itself
@@ -835,19 +897,21 @@ def _walk_tree(
     root: Path,
     max_depth: int,
     *,
+    cwd: Path | None = None,
     current_depth: int = 0,
-) -> list[tuple[str, int]]:
+    ignore_dirs: frozenset[str] = frozenset(),
+) -> list[TreeEntry]:
     """Recursively walk a directory tree.
 
     Returns:
-        List of ``(display_name, depth)`` tuples in DFS order
-        (directories first with their name-only and depth, then children,
-         then files with size embedded in the name).
+        List of ``TreeEntry`` in DFS order (directories first, then files).
+        Directories may carry a ``marker``: ``"empty"``, ``"ignore"``, or
+        ``"depth_exceeded"``.
     """
     if current_depth >= max_depth:
         return []
 
-    entries: list[tuple[str, int]] = []
+    entries: list[TreeEntry] = []
     try:
         children = sorted(root.iterdir(), key=lambda c: (not c.is_dir(), c.name))
     except OSError:
@@ -855,9 +919,60 @@ def _walk_tree(
 
     # Directories first
     for child in children:
-        if child.is_dir():
-            entries.append((child.name + "/", current_depth))
-            sub = _walk_tree(child, max_depth, current_depth=current_depth + 1)
+        if not child.is_dir():
+            continue
+
+        virt = _virtual_path(child, cwd) if cwd else ""
+
+        # Ignored directory: show it but skip children
+        if virt and virt in ignore_dirs:
+            entries.append(TreeEntry(
+                name=child.name + "/",
+                depth=current_depth,
+                marker="ignore",
+            ))
+            continue
+
+        # At depth limit: check if the directory has children
+        if current_depth + 1 >= max_depth:
+            try:
+                has_children = any(True for _ in child.iterdir())
+            except OSError:
+                has_children = False
+            marker: Literal["", "empty", "ignore", "depth_exceeded"] = (
+                "depth_exceeded" if has_children else "empty"
+            )
+            entries.append(TreeEntry(
+                name=child.name + "/",
+                depth=current_depth,
+                marker=marker,
+            ))
+            continue
+
+        # Non-limit, non-ignored: check emptiness first
+        try:
+            sub_children = list(child.iterdir())
+        except OSError:
+            sub_children = []
+
+        if not sub_children:
+            entries.append(TreeEntry(
+                name=child.name + "/",
+                depth=current_depth,
+                marker="empty",
+            ))
+        else:
+            entries.append(TreeEntry(
+                name=child.name + "/",
+                depth=current_depth,
+            ))
+            sub = _walk_tree(
+                child,
+                max_depth,
+                cwd=cwd,
+                current_depth=current_depth + 1,
+                ignore_dirs=ignore_dirs,
+            )
             entries.extend(sub)
 
     # Then files
@@ -867,6 +982,17 @@ def _walk_tree(
                 size = child.stat().st_size
             except OSError:
                 size = 0
-            entries.append((f"{child.name} ({human_size(size)})", current_depth))
+            entries.append(TreeEntry(
+                name=f"{child.name} ({human_size(size)})",
+                depth=current_depth,
+            ))
 
     return entries
+
+
+def _virtual_path(child: Path, cwd: Path) -> str:
+    """Convert a child Path to a virtual absolute path (POSIX separators)."""
+    try:
+        return "/" + str(child.relative_to(cwd)).replace("\\", "/")
+    except ValueError:
+        return ""

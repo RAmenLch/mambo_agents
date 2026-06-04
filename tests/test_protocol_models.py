@@ -274,7 +274,7 @@ class TestBackendProtocol:
             def ls(self, path):
                 return LsResult(entries=[])
 
-            def read(self, file_path, offset=0, limit=2000, include_line_numbers=False):
+            def read_raw(self, file_path, offset=0, limit=2000, include_line_numbers=False):
                 return ReadResult(content="mock")
 
             def write(self, file_path, content, overwrite=False):
@@ -304,7 +304,7 @@ class TestBackendProtocol:
             def ls(self, path):
                 return LsResult(entries=[])
 
-            def read(self, file_path, offset=0, limit=2000, include_line_numbers=False):
+            def read_raw(self, file_path, offset=0, limit=2000, include_line_numbers=False):
                 return ReadResult(content="")
 
             def write(self, file_path, content, overwrite=False):

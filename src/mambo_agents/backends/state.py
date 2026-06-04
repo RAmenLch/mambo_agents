@@ -30,6 +30,7 @@ from mambo_agents.backends.protocol import (
     GrepResult,
     LsResult,
     ReadResult,
+    ReadSummarizer,
     UploadFileResult,
     WriteResult,
     _get_file_type,
@@ -69,7 +70,14 @@ class StateBackend(BackendProtocol):
             genuinely new paths are injected.
     """
 
-    def __init__(self, initial_files: dict[str, str] | None = None) -> None:
+    def __init__(
+        self,
+        initial_files: dict[str, str] | None = None,
+        *,
+        max_read_chars: int = 100_000,
+        summarizer: "ReadSummarizer | None" = None,
+    ) -> None:
+        super().__init__(max_read_chars=max_read_chars, summarizer=summarizer)
         self._lock = threading.RLock()
 
         # --- Per-thread channel mirrors (full-replaced on every _read_files) ---
@@ -343,7 +351,7 @@ class StateBackend(BackendProtocol):
         infos.sort(key=lambda fi: fi.path)
         return LsResult(entries=infos)
 
-    def read(
+    def read_raw(
         self,
         file_path: str,
         offset: int = 0,

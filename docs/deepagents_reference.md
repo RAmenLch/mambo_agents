@@ -43,6 +43,7 @@
 | **多模型兼容** | ❌ 无工具消息重排序 | ✅ `ReorderToolMessagesMiddleware` | 某些多模态模型对工具消息顺序敏感，Mambo 显式处理 |
 | **工具扩展性** | `FilesystemMiddleware`（六核心工具 + 后端额外工具 + 多模态 read） | ✅ `BackendToolsMiddleware`（六核心工具 + 后端额外工具自动注入）<br>• `include_line_numbers` 参数：Mambo 的 `read` 默认不返回行号，模型可自行决定在需要定位行号时传 `True`（deepagents 总是无条件加行号，不可关闭）<br>• `build_tool_descriptions()` 提取所有工具描述映射，供 `AutoSecurityReviewMiddleware` 安全审查时理解工具用途 | 基础工具层面的差异化：`include_line_numbers` 的可控性减少了无关噪音；`build_tool_descriptions()` 使工具描述可被其他中间件消费 |
 | **大结果驱逐** | ✅ `FilesystemMiddleware` 内置驱逐（保存到 `/large_tool_results/`）<br>• 驱逐时机：`wrap_model_call`（预模型调用时批量处理消息历史） | ✅ `BackendToolsMiddleware` 驱逐（保存到 `/.mambo/large_tool_results/`）<br>• 驱逐时机：`wrap_tool_call`（工具返回结果后即时拦截，而非等到下一轮模型调用） | 双端均实现大结果驱逐（包括多模态块保留和 Command 多消息场景），核心差异仅在于驱逐时机：Mambo 在工具返回后立即生效，deepagents 在模型调用前批量处理 |
+| **大文件读取限制与摘要** | ✅ `read_file` 内置 `_truncate()`：超过字符阈值后附加静态 `READ_FILE_TRUNCATION_MSG`（固定模板消息，无文件类型区分能力） | ✅ `BackendProtocol` 内置 `max_read_chars` + 可插拔 `ReadSummarizer` 回调<br>• 回调签名 `(file_path, content, max_chars) -> str`，可基于文件后缀（`.py`/`.json`/`.yaml` 等）生成差异化指导摘要<br>• 默认摘要器引导模型用 `offset`+`limit` 分段读取；用户注入自定义回调即可按文件类型定制策略<br>• 二进制/多模态文件永不截断<br>• 附赠 `read_summarizers` 子包，含 9 种预置摘要器（Python / JS / TS / Java / C / C++ / Go / Rust / Markdown / JSON），提取结构大纲 + 精确行号 | 两方均有字符级读取上限和截断提示；Mambo 的核心差异在于**可插拔回调**体系 — 将大文件内容替换为按文件类型定制的"指导性摘要"，帮助模型做出更正确的下一步决策，而非仅给出固定截断警告 |
 | **记忆系统** | ✅ `MemoryMiddleware`（AGENTS.md） | ❌ 未实现 | 当前阶段的"技能系统"已覆盖知识注入需求，未来评估是否独立 |
 | **Profile 系统** | ✅ `ProviderProfile` + `HarnessProfile`（模型/提供商调优） | ❌ 未实现 | Mambo 暂不聚焦模型级细粒度调优，由用户自行配置 |
 | **Anthropic 缓存** | ✅ `AnthropicPromptCachingMiddleware` | ❌ 未实现 | Mambo 暂不绑定特定提供商优化 |
@@ -79,6 +80,7 @@
 | 功能 | deepagents | Mambo Agents |
 |------|------------|--------------|
 | 文件工具注入 | `FilesystemMiddleware`（六核心 + 额外工具 + 大结果驱逐 + 多模态 read） | `BackendToolsMiddleware`（六核心 + 额外工具 + 大结果驱逐 + 多模态 read；`include_line_numbers` 可选、`build_tool_descriptions()` 外部消费） |
+| 大文件读取限制与摘要 | `read_file` 静态截断消息（固定模板，无法按文件类型区分） | ✅ `max_read_chars` + `ReadSummarizer`（可插拔回调，按文件后缀生成差异化指导摘要） |
 | 技能披露 | `SkillsMiddleware` | `SkillsMiddleware`（重构） |
 | 同步子代理 | `SubAgentMiddleware` | `SubAgentMiddleware`（重构；`subagent_event` 流式事件、三级粒度、状态透传） |
 | 异步子代理 | `AsyncSubAgentMiddleware` | `AsyncSubAgentMiddleware`（重构） |

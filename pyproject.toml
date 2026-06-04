@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "mambo-agents"
-version = "0.1.0"
+version = "0.1.1"
 description = "Add your description here"
 requires-python = ">=3.11"
 dependencies = [
@@ -13,7 +13,15 @@ dependencies = [
     "deepagents", # 仅用于代码参考 后续删除
     "paramiko>=3.0",
     "wcmatch>=8.0",
-    "langchain_openai"
+    "langchain_openai",
+    "tree-sitter>=0.25",
+    "tree-sitter-javascript>=0.25",
+    "tree-sitter-typescript>=0.23",
+    "tree-sitter-java>=0.23.5",
+    "tree-sitter-c>=0.24.2",
+    "tree-sitter-cpp>=0.23.4",
+    "tree-sitter-go>=0.25.0",
+    "tree-sitter-rust>=0.24.2",
 ]
 
 [tool.hatch.build.targets.wheel]
@@ -21,6 +29,11 @@ packages = ["src/mambo_agents"]
 
 [project.scripts]
 mambo-chat = "mambo_agents.cli.chat:main"
+
+[tool.pytest.ini_options]
+markers = [
+    "integration: marks tests that call real LLM APIs (deselect with '-m \"not integration\"')"
+]
 
 [dependency-groups]
 dev = [

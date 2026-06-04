@@ -24,6 +24,7 @@ class _FakeBackend(BackendProtocol):
     """In-memory stub with a controllable tools list."""
 
     def __init__(self, extra_tools: list[StructuredTool] | None = None):
+        super().__init__()
         self._files: dict[str, str] = {}
         self._extra_tools = extra_tools or []
 
@@ -50,7 +51,7 @@ class _FakeBackend(BackendProtocol):
         infos.sort(key=lambda fi: fi.path)
         return LsResult(entries=infos)
 
-    def read(self, file_path: str, offset=0, limit=2000, include_line_numbers=False):
+    def read_raw(self, file_path: str, offset=0, limit=2000, include_line_numbers=False):
         from mambo_agents.backends.protocol import ReadResult
 
         c = self._files.get(file_path)

@@ -10,7 +10,7 @@ import asyncio
 import base64
 import mimetypes
 from pathlib import PurePosixPath
-from typing import Literal
+from typing import Callable, Literal
 
 from langchain_core.tools import StructuredTool
 from pydantic import BaseModel, ConfigDict
@@ -77,6 +77,24 @@ def _get_mime_type(path: str) -> str:
         mimetypes.guess_type("file" + PurePosixPath(path).suffix)[0]
         or "application/octet-stream"
     )
+
+
+# ============================================================================
+# Callback types
+# ============================================================================
+
+
+ReadSummarizer = Callable[[str, str, int], str]
+"""Callback that summarizes oversized text content.
+
+Args:
+    file_path: The virtual path of the file being read.
+    content: The full text content that exceeded the character limit.
+    max_chars: The configured character limit (``max_read_chars``).
+
+Returns:
+    A short summary string to replace the oversized content.
+"""
 
 
 # ============================================================================
@@ -260,8 +278,10 @@ class BackendProtocol(abc.ABC):
 
     Each concrete backend:
 
-    - Implements the six core operations (``ls``, ``read``, ``write``,
-      ``edit``, ``grep``, ``glob``).
+    - Implements the six core operations (``ls``, ``read_raw``, ``write``,
+      ``edit``, ``grep``, ``glob``).  ``read()`` is a concrete template
+      method that delegates to :meth:`read_raw` and then applies
+      ``max_read_chars`` safety limits.
     - Provides a ``tools`` property returning the ``StructuredTool``
       list exposed to the agent.  Extra tools (``delete``, ``execute``,
       ``sandbox_run``, …) are freely added per backend.
@@ -289,6 +309,9 @@ class BackendProtocol(abc.ABC):
         **not** included here.  Return only backend-specific extras
         (e.g. ``tree``, ``delete``, ``execute``).  Return an empty
         list if the backend has no extras.
+
+        Note: ``read`` is a concrete template method; subclasses
+        implement :meth:`read_raw` instead.
         """
         ...
 
@@ -315,7 +338,47 @@ class BackendProtocol(abc.ABC):
         )
 
     # ------------------------------------------------------------------
-    # Core file operations (abstract — every backend MUST implement)
+    # Construction & read-limit configuration
+    # ------------------------------------------------------------------
+
+    def __init__(
+        self,
+        *,
+        max_read_chars: int = 100_000,
+        summarizer: ReadSummarizer | None = None,
+    ) -> None:
+        self._max_read_chars = max_read_chars
+        self._summarizer: ReadSummarizer = summarizer or self._default_summarizer
+
+    @staticmethod
+    def _default_summarizer(file_path: str, content: str, max_chars: int) -> str:
+        """Default summarizer: prompt the caller to specify offset + limit."""
+        total_lines = content.count("\n") + 1
+        return (
+            f"[返回结果过大（{len(content):,} 字符，{total_lines:,} 行），"
+            f"超过读取上限 {max_chars:,} 字符。"
+            f"请重新指定 offset + limit 参数后读取。"
+            f"示例: read(file_path='{file_path}', offset=0, limit=500)]"
+        )
+
+    def _apply_read_limit(self, result: ReadResult, file_path: str) -> ReadResult:
+        """Apply character-limit to a text ``ReadResult``.
+
+        Binary / multimodal files are never truncated.  When the text
+        content exceeds ``_max_read_chars``, the ``summarizer`` callback
+        replaces the content with a short prompt.
+        """
+        if result.error or result.encoding == "base64" or result.file_type != "text":
+            return result
+        if result.content and len(result.content) > self._max_read_chars:
+            result = result.model_copy(update={
+                "content": self._summarizer(file_path, result.content, self._max_read_chars),
+            })
+        return result
+
+    # ------------------------------------------------------------------
+    # Core file operations (abstract — every backend MUST implement
+    # read_raw instead of read; read is a concrete template method)
     # ------------------------------------------------------------------
 
     @abc.abstractmethod
@@ -323,13 +386,14 @@ class BackendProtocol(abc.ABC):
         """List files and directories in *path* (non-recursive)."""
         ...
 
-    @abc.abstractmethod
     def read(
         self,
         file_path: str,
         offset: int = 0,
         limit: int = 2000,
         include_line_numbers: bool = False,
+        *,
+        _apply_max_chars: bool = True,
     ) -> ReadResult:
         """Read the contents of *file_path*.
 
@@ -337,6 +401,31 @@ class BackendProtocol(abc.ABC):
         default (no line numbers).  Set *include_line_numbers* to
         ``True`` to get ``cat -n``-style output where each line is
         prefixed with its 1-indexed line number.
+
+        Text files exceeding ``max_read_chars`` are summarized using
+        the configured ``summarizer`` callback.  Binary / multimodal
+        files are never truncated.  Pass ``_apply_max_chars=False`` to
+        bypass the limit (used internally by ``download_files``).
+        """
+        result = self.read_raw(file_path, offset, limit, include_line_numbers)
+        if _apply_max_chars:
+            result = self._apply_read_limit(result, file_path)
+        return result
+
+    @abc.abstractmethod
+    def read_raw(
+        self,
+        file_path: str,
+        offset: int = 0,
+        limit: int = 2000,
+        include_line_numbers: bool = False,
+    ) -> ReadResult:
+        """Read file contents **without** character-limit safety checks.
+
+        Subclasses must implement this method to perform the actual
+        file I/O.  The returned ``ReadResult`` is the raw, untruncated
+        result — the caller (typically :meth:`read`) is responsible for
+        applying ``max_read_chars`` limits.
         """
         ...
 
@@ -399,6 +488,8 @@ class BackendProtocol(abc.ABC):
         offset: int = 0,
         limit: int = 2000,
         include_line_numbers: bool = False,
+        *,
+        _apply_max_chars: bool = True,
     ) -> ReadResult:
         """Async: Read the contents of *file_path*.
 
@@ -406,6 +497,7 @@ class BackendProtocol(abc.ABC):
         """
         return await asyncio.to_thread(
             self.read, file_path, offset, limit, include_line_numbers,
+            _apply_max_chars=_apply_max_chars,
         )
 
     async def awrite(
@@ -479,7 +571,7 @@ class BackendProtocol(abc.ABC):
         """
         results: list[DownloadFileResult] = []
         for path in paths:
-            r = self.read(path)
+            r = self.read(path, _apply_max_chars=False)
             if r.error:
                 results.append(
                     DownloadFileResult(
