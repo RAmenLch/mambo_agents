@@ -11,6 +11,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import json
+import re
 import shlex
 from datetime import datetime, timezone
 from pathlib import PurePosixPath
@@ -33,6 +34,7 @@ from mambo_agents.backends.protocol import (
     ReadResult,
     ReadSummarizer,
     UploadFileResult,
+    WorkspacePathError,
     WriteResult,
     _get_file_type,
     _get_mime_type,
@@ -83,6 +85,10 @@ class SshBackend(BackendProtocol):
         key_filename: Path to a private key file for key-based auth.
         remote_root: Remote working directory.  ``"~"`` (default) is
             expanded to the user's home directory on connect.
+        workspace_root: Virtual path prefix acting as the workspace root
+            (default ``"/workspace"``).  All file paths must live under
+            this prefix — paths outside are rejected so the AI never
+            perceives the virtual filesystem as a real system root.
         connect_timeout: SSH connection timeout in seconds (default 30).
         execute_timeout: Default timeout for shell commands (default 120).
         max_output_bytes: Max bytes captured from command output.
@@ -104,6 +110,7 @@ class SshBackend(BackendProtocol):
         password: str | None = None,
         key_filename: str | None = None,
         remote_root: str = "~",
+        workspace_root: str = "/workspace",
         connect_timeout: int = _DEFAULT_SSH_CONNECT_TIMEOUT,
         execute_timeout: int = _DEFAULT_EXECUTE_TIMEOUT,
         max_output_bytes: int = _MAX_OUTPUT_BYTES,
@@ -125,6 +132,7 @@ class SshBackend(BackendProtocol):
                 "Provide at most one of them."
             )
 
+        self.workspace_root = workspace_root.rstrip("/")
         self._host = host
         self._username = username
         self._port = port
@@ -141,6 +149,7 @@ class SshBackend(BackendProtocol):
         self._client: paramiko.SSHClient | None = None
         self._sftp: paramiko.SFTPClient | None = None
         self._remote_root: str = ""  # resolved absolute path, set by _connect()
+        self._has_python3: bool = False  # detected in _connect()
 
         self._connect()
 
@@ -180,6 +189,15 @@ class SshBackend(BackendProtocol):
         # Normalise: strip trailing slash (except "/")
         self._remote_root = remote_root.rstrip("/") or "/"
 
+        # Detect whether python3 is available (needed by edit())
+        self._has_python3 = False
+        try:
+            _stdin, stdout, _stderr = client.exec_command("python3 --version", timeout=10)
+            if stdout.channel.recv_exit_status() == 0:
+                self._has_python3 = True
+        except Exception:
+            pass
+
     def close(self) -> None:
         """Close the SSH and SFTP connections."""
         if self._sftp is not None:
@@ -213,22 +231,29 @@ class SshBackend(BackendProtocol):
     def _resolve(self, path: str) -> str:
         """Map a virtual absolute path to a remote filesystem path.
 
-        Virtual paths use POSIX separators and ``"/"`` as the root of
-        the backing directory (*remote_root*).  Traversal beyond the
-        root via ``..`` is not explicitly prevented (same as
-        ``LocalBackend``).
+        Validates that *path* is under :attr:`workspace_root` and strips
+        the prefix before resolving against *remote_root*.  Raises
+        :class:`WorkspacePathError` for paths outside the workspace.
+
+        Virtual paths use POSIX separators and the workspace root as
+        the anchor for all file operations.
         """
         pp = PurePosixPath(path)
-        if pp.is_absolute():
-            relative_parts = pp.parts[1:]  # skip the root "/"
-        else:
-            relative_parts = pp.parts
+        path_str = str(pp)
+        wr = self.workspace_root
 
-        if not relative_parts:
+        # Must start with workspace root
+        if path_str != wr and not path_str.startswith(wr + "/"):
+            raise WorkspacePathError(
+                f"Path '{path}' is outside the workspace. "
+                f"All file paths must be under '{wr}'."
+            )
+
+        rel = path_str[len(wr):].lstrip("/")
+        if not rel:
             return self._remote_root
 
-        joined = "/".join(relative_parts)
-        return f"{self._remote_root}/{joined}"
+        return f"{self._remote_root}/{rel}"
 
     # ------------------------------------------------------------------
     # Remote command execution
@@ -255,6 +280,7 @@ class SshBackend(BackendProtocol):
 
     @property
     def tools(self) -> list[StructuredTool]:
+        wr = self.workspace_root
         return [
             StructuredTool(
                 name="tree",
@@ -264,7 +290,7 @@ class SshBackend(BackendProtocol):
                 ),
                 args_schema=create_model(
                     "TreeSchema",
-                    path=(str, Field(default="/", description="Root directory to display")),
+                    path=(str, Field(default=wr, description="Root directory to display")),
                     depth=(int, Field(default=3, description="Maximum recursion depth")),
                 ),
                 func=lambda **kwargs: self.tree(**kwargs),
@@ -301,21 +327,36 @@ class SshBackend(BackendProtocol):
 
     @property
     def description(self) -> str:
-        return (
-            f"Remote file system backend via SSH "
-            f"(host: {self._host}, working directory: {self._remote_root})"
+        wr = self.workspace_root
+        py3_note = (
+            "" if self._has_python3
+            else (
+                "\n⚠️  **python3 not detected** — grep/glob/tree may use GNU-only "
+                "fallback commands (``find -printf``, ``grep --include=``) "
+                "which can produce inaccurate results on non-GNU systems."
+            )
         )
-
-    # ------------------------------------------------------------------
-    # Core: ls
-    # ------------------------------------------------------------------
+        return (
+            f"**Environment:** Remote Linux server via SSH "
+            f"(host: {self._host}, working directory: {self._remote_root}).\n"
+            f"**Path mapping:** the workspace root `{wr}` maps to the remote "
+            f"directory `{self._remote_root}` — all file tools must use paths under "
+            f"`{wr}`. Paths outside `{wr}` (including `/`) are rejected.\n"
+            f"**execute tool:** shell commands run in `{self._remote_root}`.  "
+            f"Use real filesystem paths in commands, NOT `{wr}` paths "
+            f"— the virtual workspace path does not exist on the remote filesystem."
+            f"{py3_note}"
+        )
 
     def ls(self, path: str) -> LsResult:
         """List files and directories under *path* (non-recursive).
 
         Uses SFTP ``listdir_attr`` for structured, locale-independent output.
         """
-        remote = self._resolve(path)
+        try:
+            remote = self._resolve(path)
+        except WorkspacePathError as e:
+            return LsResult(error=str(e))
         try:
             attrs = self._sftp.listdir_attr(remote)
         except FileNotFoundError:
@@ -363,7 +404,10 @@ class SshBackend(BackendProtocol):
         limit: int = 2000,
         include_line_numbers: bool = False,
     ) -> ReadResult:
-        remote = self._resolve(file_path)
+        try:
+            remote = self._resolve(file_path)
+        except WorkspacePathError as e:
+            return ReadResult(error=str(e))
         try:
             is_dir = self._sftp.stat(remote).st_mode
             if self._attr_is_dir_maybe(is_dir):
@@ -391,10 +435,13 @@ class SshBackend(BackendProtocol):
                 mime_type=mime_type,
             )
 
-        # Text file: attempt UTF-8, fallback to base64
+        # Text file: attempt UTF-8, fallback to base64.
+        # NOTE: Paramiko's SFTPClient.open(…, "r") may return bytes on
+        # some server implementations.  Always open in binary mode and
+        # decode explicitly to avoid TypeError downstream.
         try:
-            with self._sftp.open(remote, "r") as f:
-                content = f.read()
+            with self._sftp.open(remote, "rb") as f:
+                content = f.read().decode("utf-8")
         except UnicodeDecodeError:
             # Re-read as binary and encode
             try:
@@ -416,7 +463,7 @@ class SshBackend(BackendProtocol):
         lines = content.splitlines(keepends=True)
         total = len(lines)
 
-        if offset >= total:
+        if total > 0 and offset >= total:
             return ReadResult(
                 error=f"Line offset {offset} exceeds file length ({total} lines)",
             )
@@ -453,7 +500,10 @@ class SshBackend(BackendProtocol):
                     "Check edit_whitelist / edit_blacklist."
                 ),
             )
-        remote = self._resolve(file_path)
+        try:
+            remote = self._resolve(file_path)
+        except WorkspacePathError as e:
+            return WriteResult(error=str(e))
 
         # Check existence
         try:
@@ -507,10 +557,10 @@ class SshBackend(BackendProtocol):
     ) -> EditResult:
         """Replace *old_str* with *new_str* in a remote file.
 
-        The edit is performed **on the remote machine** via a single
-        ``python3 -c`` call with base64-encoded strings to avoid shell
-        escaping issues.  This requires ``python3`` to be installed on
-        the remote server.
+        If ``python3`` is available on the remote server the edit is
+        performed remotely via a ``python3 -c`` one-liner (no SFTP
+        round-trips).  Otherwise falls back to SFTP: download → local
+        replace → upload.
         """
         if not self._check_edit_allowed(file_path):
             return EditResult(
@@ -519,7 +569,10 @@ class SshBackend(BackendProtocol):
                     "Check edit_whitelist / edit_blacklist."
                 ),
             )
-        remote = self._resolve(file_path)
+        try:
+            remote = self._resolve(file_path)
+        except WorkspacePathError as e:
+            return EditResult(error=str(e))
 
         # Check file exists
         try:
@@ -536,24 +589,47 @@ class SshBackend(BackendProtocol):
         old_str = old_str.replace("\r\n", "\n").replace("\r", "\n")
         new_str = new_str.replace("\r\n", "\n").replace("\r", "\n")
 
+        if self._has_python3:
+            return self._edit_remote(file_path, remote, old_str, new_str, replace_all)
+        else:
+            return self._edit_via_sftp(file_path, remote, old_str, new_str, replace_all)
+
+    def _edit_remote(
+        self,
+        file_path: str,
+        remote: str,
+        old_str: str,
+        new_str: str,
+        replace_all: bool,
+    ) -> EditResult:
+        """Execute the edit on the remote server via ``python3`` heredoc.
+
+        Uses a POSIX heredoc with a quoted delimiter (``<< 'PYEOF'``)
+        so the remote shell treats the entire script body verbatim — no
+        variable expansion, no backslash interpretation, no cross‑platform
+        quoting issues with ``shlex.quote``.
+        """
         old_b64 = base64.b64encode(old_str.encode()).decode()
         new_b64 = base64.b64encode(new_str.encode()).decode()
         replace_count = "-1" if replace_all else "1"
 
-        remote_escaped = shlex.quote(remote)
+        remote_repr = repr(remote)
 
         script = (
-            "import base64; "
-            f"old = base64.b64decode('{old_b64}').decode(); "
-            f"new = base64.b64decode('{new_b64}').decode(); "
-            f"c = open({remote_escaped}, 'r', encoding='utf-8').read(); "
-            "n = c.count(old); "
-            "print(n); "
-            f"if not (n > 1 and {replace_count} == '1'): "
-            f"    open({remote_escaped}, 'w', encoding='utf-8').write(c.replace(old, new, {replace_count}))"
+            f"import base64\n"
+            f"old = base64.b64decode({old_b64!r}).decode()\n"
+            f"new = base64.b64decode({new_b64!r}).decode()\n"
+            f"c = open({remote_repr}, 'r', encoding='utf-8').read()\n"
+            f"n = c.count(old)\n"
+            f"print(n)\n"
+            f"if not (n > 1 and not {replace_all}):\n"
+            f"    open({remote_repr}, 'w', encoding='utf-8').write(c.replace(old, new, {replace_count}))\n"
         )
 
-        out, err, exit_code = self._exec(f"python3 -c {shlex.quote(script)}")
+        # Quoted delimiter ('PYEOF') → no shell expansion inside the body
+        cmd = f"python3 << 'PYEOF'\n{script}PYEOF"
+
+        out, err, exit_code = self._exec(cmd)
 
         if exit_code != 0:
             return EditResult(error=f"Edit failed (exit {exit_code}): {err or out}")
@@ -582,6 +658,57 @@ class SshBackend(BackendProtocol):
 
         return EditResult(path=file_path, occurrences=occurrences)
 
+    def _edit_via_sftp(
+        self,
+        file_path: str,
+        remote: str,
+        old_str: str,
+        new_str: str,
+        replace_all: bool,
+    ) -> EditResult:
+        """Fallback edit: download file via SFTP, replace locally, upload."""
+        try:
+            with self._sftp.open(remote, "rb") as f:
+                content = f.read().decode("utf-8")
+        except UnicodeDecodeError:
+            return EditResult(
+                error=(
+                    f"Cannot edit '{file_path}': file is not valid UTF-8. "
+                    "Binary file edits require python3 on the remote server."
+                ),
+            )
+        except OSError as e:
+            return EditResult(error=f"Error reading '{file_path}' for edit: {e}")
+
+        occurrences = content.count(old_str)
+
+        if occurrences == 0:
+            return EditResult(
+                error=(
+                    f"Cannot edit '{file_path}': old_str not found in file. "
+                    "Read the file first to see its exact content."
+                ),
+            )
+
+        if occurrences > 1 and not replace_all:
+            return EditResult(
+                error=(
+                    f"Cannot edit '{file_path}': old_str appears {occurrences} times "
+                    f"in the file. Use replace_all=True to replace all occurrences, "
+                    f"or provide a more specific old_str with surrounding context."
+                ),
+            )
+
+        new_content = content.replace(old_str, new_str, -1 if replace_all else 1)
+
+        try:
+            with self._sftp.open(remote, "w") as f:
+                f.write(new_content)
+        except OSError as e:
+            return EditResult(error=f"Error writing '{file_path}' for edit: {e}")
+
+        return EditResult(path=file_path, occurrences=occurrences)
+
     # ------------------------------------------------------------------
     # Core: grep
     # ------------------------------------------------------------------
@@ -589,26 +716,43 @@ class SshBackend(BackendProtocol):
     def grep(
         self,
         pattern: str,
-        path: str = "/",
+        path: str = "/workspace",
         glob: str | None = None,
     ) -> GrepResult:
         """Search for a literal pattern in files under *path*.
 
-        Execution order: (1) try remote ``rg --json -F``, (2) fallback
-        to ``grep -rn --``.  Both run on the remote server in a single
-        command — no per-file SFTP round-trips.
+        Execution order:
+        1. ``rg --json -F`` (ripgrep, fastest)
+        2. ``grep -rnIsH`` (fast C fallback)
+        3. ``python3`` os.walk (portable last resort, used when
+           GNU grep fails e.g. BSD/macOS with ``--include`` glob)
         """
-        remote = self._resolve(path)
+        try:
+            remote = self._resolve(path)
+        except WorkspacePathError as e:
+            return GrepResult(error=str(e))
         remote_escaped = shlex.quote(remote)
         pattern_escaped = shlex.quote(pattern)
 
-        # 1) Try ripgrep on the remote
+        # 1) Try ripgrep on the remote (fastest)
         matches = self._rg_remote(pattern_escaped, remote, glob)
         if matches is not None:
             return GrepResult(matches=matches)
 
-        # 2) Fallback to GNU grep
-        return self._grep_remote(pattern_escaped, remote_escaped, glob)
+        # 2) GNU grep (fast C program, handles most cases)
+        result = self._grep_remote(pattern_escaped, remote_escaped, glob)
+        # If grep succeeded (even with no matches) we're done;
+        # only fall through to python3 on actual grep errors
+        # e.g. --include not supported on BSD/macOS grep.
+        if result.error is None:
+            return result
+
+        # 3) python3 last resort (portable but slower; used when GNU
+        #    grep fails e.g. on BSD/macOS with --include glob)
+        if self._has_python3:
+            return self._grep_python(pattern, remote, glob)
+
+        return result
 
     def _rg_remote(
         self,
@@ -624,9 +768,11 @@ class SshBackend(BackendProtocol):
 
         out, _err, exit_code = self._exec(cmd, timeout=60)
 
-        # rg returns exit 1 when no matches found; exit 2 on error
-        if exit_code == 2:
-            return None  # rg not available
+        # rg exit codes: 0 = matches found, 1 = no matches, anything else = error/unavailable
+        if exit_code == 1:
+            return []  # rg found no matches
+        if exit_code != 0:
+            return None  # rg not available or error → fall through to grep
         if not out.strip():
             return []
 
@@ -653,25 +799,120 @@ class SshBackend(BackendProtocol):
 
         return matches
 
+    def _grep_python(
+        self,
+        pattern: str,
+        remote: str,
+        glob: str | None,
+    ) -> GrepResult:
+        """Portable grep via remote ``python3`` using :func:`os.walk` +
+        :func:`fnmatch.fnmatch`.
+
+        Handles ``--include``-style filename filtering correctly
+        (unlike GNU ``grep --include=`` which may not be available).
+
+        Respects :attr:`_ignore_dirs` — directories listed there are
+        skipped entirely.  Files > 1 MB and known binary extensions
+        are also skipped to keep traversal fast.
+        """
+        import json as _json
+
+        pattern_b64 = base64.b64encode(pattern.encode()).decode()
+        glob_b64 = base64.b64encode((glob or "").encode()).decode()
+        remote_repr = repr(remote)
+
+        # Convert virtual ignore_dirs → relative names for remote os.walk
+        wr = self.workspace_root
+        ignore_names_b64 = base64.b64encode(
+            json.dumps([
+                p[len(wr):].lstrip("/").rsplit("/", 1)[-1]
+                for p in self._ignore_dirs
+            ]).encode()
+        ).decode()
+
+        script = (
+            f"import base64, os, fnmatch, json\n"
+            f"SKIP_DIRS = set(json.loads("
+            f"base64.b64decode({ignore_names_b64!r}).decode()))\n"
+            f"BINARY_EXTS = {{'.pyc', '.pyo', '.so', '.o', '.a', '.bin',\n"
+            f"                '.exe', '.dll', '.pyd', '.zip', '.tar', '.gz',\n"
+            f"                '.bz2', '.xz', '.7z', '.png', '.jpg', '.jpeg',\n"
+            f"                '.gif', '.ico', '.pdf', '.mp3', '.mp4', '.avi'}}\n"
+            f"MAX_SIZE = 1_048_576\n"  # 1 MB
+            f"pat = base64.b64decode({pattern_b64!r}).decode()\n"
+            f"gpat = base64.b64decode({glob_b64!r}).decode() or None\n"
+            f"d = {remote_repr}\n"
+            f"res = []\n"
+            f"for root, dirs, files in os.walk(d):\n"
+            f"    dirs[:] = [x for x in dirs\n"
+            f"               if not x.startswith('.') and x not in SKIP_DIRS]\n"
+            f"    for fname in files:\n"
+            f"        if fname.startswith('.'):\n"
+            f"            continue\n"
+            f"        if os.path.splitext(fname)[1].lower() in BINARY_EXTS:\n"
+            f"            continue\n"
+            f"        if gpat and not fnmatch.fnmatch(fname, gpat):\n"
+            f"            continue\n"
+            f"        fp = os.path.join(root, fname)\n"
+            f"        try:\n"
+            f"            if os.path.getsize(fp) > MAX_SIZE:\n"
+            f"                continue\n"
+            f"            with open(fp, 'r', encoding='utf-8', errors='ignore') as f:\n"
+            f"                for li, line in enumerate(f, 1):\n"
+            f"                    if pat in line:\n"
+            f"                        res.append({{'p': fp, 'l': li,"
+            f" 't': line.rstrip(chr(10))}})\n"
+            f"        except Exception:\n"
+            f"            pass\n"
+            f"print(json.dumps(res))\n"
+        )
+
+        cmd = f"python3 << 'PYEOF'\n{script}PYEOF"
+        out, err, exit_code = self._exec(cmd, timeout=60)
+
+        if exit_code != 0:
+            return GrepResult(error=f"grep error (exit {exit_code}): {err or out}")
+
+        try:
+            data = _json.loads(out.strip())
+        except _json.JSONDecodeError:
+            return GrepResult(error=f"grep: unexpected output: {out[:200]}")
+
+        matches: list[GrepMatch] = []
+        for item in data:
+            virt = self._physical_to_virtual(item["p"])
+            matches.append(GrepMatch(
+                path=virt,
+                line=item["l"],
+                text=item["t"],
+            ))
+
+        return GrepResult(matches=matches)
+
     def _grep_remote(
         self,
         pattern_escaped: str,
         remote_escaped: str,
         glob: str | None,
     ) -> GrepResult:
-        """Fallback grep using ``grep -rn`` on the remote."""
-        cmd = f"grep -rn -- {pattern_escaped} {remote_escaped}"
-        # --include for glob filtering
+        """Fallback grep using ``grep -rnIsH`` on the remote.
+
+        ``-r`` recursive, ``-n`` line numbers, ``-I`` skip binary files,
+        ``-s`` suppress error messages, ``-H`` always print filename
+        (needed for single-file searches where grep would otherwise omit it).
+        """
+        base_flags = "grep -rnIsH"
         if glob:
-            cmd = f"grep -rn --include={shlex.quote(glob)} -- {pattern_escaped} {remote_escaped}"
+            cmd = f"{base_flags} --include={shlex.quote(glob)} -- {pattern_escaped} {remote_escaped}"
+        else:
+            cmd = f"{base_flags} -- {pattern_escaped} {remote_escaped}"
 
         out, err, exit_code = self._exec(cmd, timeout=60)
 
-        # grep returns exit 1 if no matches
-        if exit_code > 1:
-            return GrepResult(error=f"grep error: {err}")
-
+        # grep exit codes: 0 = matches, 1 = no matches, >1 = errors in some files
         if not out.strip():
+            if exit_code > 1 and err.strip():
+                return GrepResult(error=f"grep error: {err.strip()}")
             return GrepResult(matches=[])
 
         matches: list[GrepMatch] = []
@@ -698,14 +939,16 @@ class SshBackend(BackendProtocol):
     def _physical_to_virtual(self, physical_path: str) -> str:
         """Convert a remote absolute path to the virtual path scheme.
 
-        Example: ``/home/user/project/src/main.py`` → ``/project/src/main.py``
-        (when *remote_root* is ``/home/user/project``).
+        Example: ``/home/user/project/src/main.py`` → ``/workspace/src/main.py``
+        (when *remote_root* is ``/home/user/project`` and workspace_root is ``/workspace``).
         """
         # Normalize separators
         physical_path = physical_path.replace("\\", "/")
+        wr = self.workspace_root
         if physical_path.startswith(self._remote_root):
             suffix = physical_path[len(self._remote_root):]
-            return suffix if suffix.startswith("/") else "/" + suffix
+            rel = suffix if suffix.startswith("/") else ("/" + suffix if suffix else "")
+            return f"{wr}{rel}"
         # If the path doesn't start with remote_root, return as-is
         return physical_path
 
@@ -719,17 +962,142 @@ class SshBackend(BackendProtocol):
     # Core: glob
     # ------------------------------------------------------------------
 
-    def glob(self, pattern: str, path: str = "/") -> GlobResult:
+    def glob(self, pattern: str, path: str = "/workspace") -> GlobResult:
         """Find files matching *pattern* under *path*.
 
-        Uses remote ``find`` — one command covers the entire subtree.
+        Uses remote ``python3`` with ``glob.glob(recursive=True)``
+        for full wildcard support (``*``, ``**``, ``?``, ``[...]``).
+        Falls back to ``find`` when python3 is unavailable.
         """
-        remote = self._resolve(path)
-        remote_escaped = shlex.quote(remote)
-        pattern_escaped = shlex.quote(pattern)
+        try:
+            remote = self._resolve(path)
+        except WorkspacePathError as e:
+            return GlobResult(error=str(e))
+
+        if self._has_python3:
+            return self._glob_python(pattern, remote)
+        else:
+            return self._glob_find(pattern, remote)
+
+    # ------------------------------------------------------------------
+    # Glob via remote Python (full ** / path-prefix support)
+    # ------------------------------------------------------------------
+
+    def _glob_python(self, pattern: str, remote: str) -> GlobResult:
+        """Glob via remote ``python3`` using :func:`glob.glob`.
+
+        Transmits *pattern* and *remote* safely via base64 encoding
+        inside a POSIX heredoc with quoted delimiter (``<< 'PYEOF'``),
+        avoiding any shell-level interpretation of special characters.
+
+        Validates that the resolved search path stays within the base
+        directory, preventing path-traversal attacks via ``..`` in the
+        pattern string.
+        """
+        import json as _json
+
+        pattern_b64 = base64.b64encode(pattern.encode()).decode()
+        remote_repr = repr(remote)
+
+        script = (
+            f"import base64, glob, os, json\n"
+            f"p = base64.b64decode({pattern_b64!r}).decode()\n"
+            f"d = {remote_repr}\n"
+            f"prefix = d.rstrip('/') + '/'\n"
+            f"full = os.path.normpath(os.path.join(d, p))\n"
+            f"if not (full == d.rstrip('/') or full.startswith(prefix)):\n"
+            f"    print(json.dumps({{'error': "
+            f"'Pattern resolves outside base directory'}}))\n"
+            f"else:\n"
+            f"    res = []\n"
+            f"    for f in glob.glob(full, recursive=True):\n"
+            f"        if os.path.isfile(f):\n"
+            f"            res.append({{'p': f, 's': os.path.getsize(f)}})\n"
+            f"    print(json.dumps(res))\n"
+        )
+
+        cmd = f"python3 << 'PYEOF'\n{script}PYEOF"
+        out, err, exit_code = self._exec(cmd, timeout=60)
+
+        if exit_code != 0:
+            return GlobResult(error=f"glob error (exit {exit_code}): {err or out}")
+
+        try:
+            data = _json.loads(out.strip())
+        except _json.JSONDecodeError:
+            return GlobResult(error=f"glob: unexpected output: {out[:200]}")
+
+        if isinstance(data, dict) and "error" in data:
+            return GlobResult(error=data["error"])
+
+        matches: list[FileInfo] = []
+        for item in data:
+            virt = self._physical_to_virtual(item["p"])
+            matches.append(FileInfo(
+                path=virt,
+                is_dir=False,
+                size=item.get("s", 0),
+            ))
+
+        return GlobResult(matches=matches)
+
+    def _glob_find(self, pattern: str, remote: str) -> GlobResult:
+        """Fallback glob: split pattern into directory prefix + filename glob.
+
+        Parses the *pattern* to extract a static directory prefix
+        (everything before the first glob metacharacter's parent ``/``)
+        and uses it as the ``find`` search root, with the remainder
+        passed to ``-name``.  ``**/`` segments are treated as a
+        recursive marker (default ``find`` behaviour).
+
+        Limitations (vs. the python3 path):
+        - ``**`` in the **middle** of a path (e.g. ``a/**/b/*.txt``)
+          cannot constrain intermediate directories — ``find`` has no
+          equivalent of ``**``.
+        - Patterns with no ``**`` use ``-maxdepth 1`` for single-level
+          matching, but ``find`` has no way to enforce exact depth
+          patterns like ``a/*/b/*.txt``.
+        """
+        # 1) Strip all **/ segments — find is already recursive,
+        #    and **/ carries no information that find can use.
+        clean = pattern
+        has_recursive = "**/" in clean
+        if has_recursive:
+            clean = clean.replace("**/", "")
+
+        # 2) Find the first glob metacharacter
+        m = re.search(r"[*?\[\]]", clean)
+        if m is None:
+            # No glob chars — treat as a literal filename
+            search_dir = remote
+            name_pat = clean
+            maxdepth = "1"
+        else:
+            idx = m.start()
+            prefix = clean[:idx]
+
+            # Find the last '/' before the first glob char
+            last_slash = prefix.rfind("/")
+            if last_slash >= 0:
+                dir_part = prefix[:last_slash]
+                file_part = prefix[last_slash + 1:] + clean[idx:]
+                search_dir = f"{remote}/{dir_part}" if dir_part else remote
+                name_pat = file_part
+            else:
+                search_dir = remote
+                name_pat = clean
+
+            # Non-recursive unless pattern contains **/
+            maxdepth = "" if (has_recursive or "**/" in pattern) else "1"
+
+        # 3) Build and run the find command
+        search_esc = shlex.quote(search_dir)
+        name_esc = shlex.quote(name_pat)
+        maxdepth_flag = f"-maxdepth {maxdepth} " if maxdepth else ""
 
         cmd = (
-            f"find {remote_escaped} -type f -name {pattern_escaped} "
+            f"find {search_esc} -type f {maxdepth_flag}"
+            f"-name {name_esc} "
             f"-printf '%s\\t%p\\n' 2>/dev/null"
         )
 
@@ -761,33 +1129,36 @@ class SshBackend(BackendProtocol):
     # Extra: tree
     # ------------------------------------------------------------------
 
-    def tree(self, path: str = "/", depth: int = 3) -> str:
-        """Render a directory tree using remote ``find``.
+    def tree(self, path: str = "/workspace", depth: int = 3) -> str:
+        """Render a directory tree.
+
+        Uses remote ``python3`` with :func:`os.walk` for portable
+        directory traversal (works on any Unix).  Falls back to
+        ``find -printf`` (GNU only) when python3 is unavailable.
 
         Args:
-            path: Root directory to display (default ``"/"``).
+            path: Root directory to display (default workspace root).
             depth: Maximum recursion depth (default 3).
 
         Returns:
             Formatted tree string.
         """
-        remote = self._resolve(path)
-        remote_escaped = shlex.quote(remote)
+        try:
+            remote = self._resolve(path)
+        except WorkspacePathError as e:
+            return str(e)
 
-        # Map virtual ignore_dirs → relative paths expected in find output
-        # Virtual path like "/node_modules" → relative "node_modules"
+        if self._has_python3:
+            out, err, exit_code = self._tree_python(remote, depth)
+        else:
+            out, err, exit_code = self._tree_find(remote, depth)
+
+        # Map virtual ignore_dirs → relative paths expected in output
+        wr = self.workspace_root
         ignore_rel_paths: frozenset[str] = frozenset(
-            p.lstrip("/") for p in self._ignore_dirs
+            p[len(wr):].lstrip("/") for p in self._ignore_dirs
         )
 
-        # Use find to list dirs + files with sizes, respecting max depth
-        cmd = (
-            f"find {remote_escaped} -maxdepth {depth} -not -path '*/.*' "
-            f"\\( -type d -printf 'd %P\\n' , -type f -printf 'f %P %s\\n' \\) "
-            f"2>/dev/null | sort"
-        )
-
-        out, _err, exit_code = self._exec(cmd, timeout=30)
         if exit_code > 1 or not out.strip():
             return f"(empty or inaccessible)"
 
@@ -911,6 +1282,66 @@ class SshBackend(BackendProtocol):
         return format_tree_entries(entries)
 
     # ------------------------------------------------------------------
+    # Tree via remote Python (portable, no GNU find dependencies)
+    # ------------------------------------------------------------------
+
+    def _tree_python(
+        self, remote: str, depth: int
+    ) -> tuple[str, str, int]:
+        """List directory tree via remote ``python3`` with :func:`os.walk`.
+
+        Output format is identical to the ``find`` fallback:
+        ``d <relative_path>`` for directories,
+        ``f <relative_path> <size>`` for files.
+        """
+        remote_repr = repr(remote)
+
+        script = (
+            f"import os\n"
+            f"d = {remote_repr}\n"
+            f"md = {depth}\n"
+            f"res = []\n"
+            f"for root, dirs, files in os.walk(d):\n"
+            f"    rd = root[len(d):].lstrip('/')\n"
+            f"    cur_d = (rd.count('/') + 1) if rd else 1\n"
+            f"    if cur_d > md:\n"
+            f"        dirs[:] = []\n"
+            f"        continue\n"
+            f"    dirs[:] = [x for x in dirs if not x.startswith('.')]\n"
+            f"    for name in dirs:\n"
+            f"        p = rd + '/' + name if rd else name\n"
+            f"        res.append(('d', p, 0))\n"
+            f"    for name in files:\n"
+            f"        if name.startswith('.'):\n"
+            f"            continue\n"
+            f"        p = rd + '/' + name if rd else name\n"
+            f"        fp = os.path.join(root, name)\n"
+            f"        try:\n"
+            f"            sz = os.path.getsize(fp)\n"
+            f"        except OSError:\n"
+            f"            sz = 0\n"
+            f"        res.append(('f', p, sz))\n"
+            f"res.sort()\n"
+            f"for t, p, sz in res:\n"
+            f"    print(f'{{t}} {{p}} {{sz}}' if t == 'f' else f'{{t}} {{p}}')\n"
+        )
+
+        cmd = f"python3 << 'PYEOF'\n{script}PYEOF"
+        return self._exec(cmd, timeout=30)
+
+    def _tree_find(
+        self, remote: str, depth: int
+    ) -> tuple[str, str, int]:
+        """Fallback tree via ``find -printf`` (GNU find only)."""
+        remote_escaped = shlex.quote(remote)
+        cmd = (
+            f"find {remote_escaped} -maxdepth {depth} -not -path '*/.*' "
+            f"\\( -type d -printf 'd %P\\n' , -type f -printf 'f %P %s\\n' \\) "
+            f"2>/dev/null | sort"
+        )
+        return self._exec(cmd, timeout=30)
+
+    # ------------------------------------------------------------------
     # Extra: delete
     # ------------------------------------------------------------------
 
@@ -925,7 +1356,10 @@ class SshBackend(BackendProtocol):
                 f"Error: Path '{path}' is not allowed for delete. "
                 "Check edit_whitelist / edit_blacklist."
             )
-        remote = self._resolve(path)
+        try:
+            remote = self._resolve(path)
+        except WorkspacePathError as e:
+            return str(e)
 
         # Safety: refuse to delete the root dir
         if remote.rstrip("/") == self._remote_root.rstrip("/"):

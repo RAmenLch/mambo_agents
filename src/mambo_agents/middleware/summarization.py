@@ -1034,7 +1034,10 @@ class MamboSummarizationMiddleware(AgentMiddleware[SummarizationState, ContextT,
                 else:
                     prompt = self._summary_prompt.format(messages=truncated_buffer)
 
-        response = self._lc_helper.model.invoke([HumanMessage(content=prompt)])
+        response = self._lc_helper.model.invoke(
+            [HumanMessage(content=prompt)],
+            config={"metadata": {"lc_source": "summarization"}},
+        )
         content = response.content
         if isinstance(content, list):
             return str(content[0]) if content else ""
@@ -1074,7 +1077,10 @@ class MamboSummarizationMiddleware(AgentMiddleware[SummarizationState, ContextT,
                 else:
                     prompt = self._summary_prompt.format(messages=truncated_buffer)
 
-        response = await self._lc_helper.model.ainvoke([HumanMessage(content=prompt)])
+        response = await self._lc_helper.model.ainvoke(
+            [HumanMessage(content=prompt)],
+            config={"metadata": {"lc_source": "summarization"}},
+        )
         content = response.content
         if isinstance(content, list):
             return str(content[0]) if content else ""

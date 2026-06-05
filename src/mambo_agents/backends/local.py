@@ -34,6 +34,7 @@ from mambo_agents.backends.protocol import (
     ReadResult,
     ReadSummarizer,
     UploadFileResult,
+    WorkspacePathError,
     WriteResult,
     _get_file_type,
     _get_mime_type,
@@ -79,6 +80,10 @@ class LocalBackend(BackendProtocol):
     Parameters:
         root_dir: Working directory for both file ops and shell commands.
             Defaults to ``os.getcwd()``.
+        workspace_root: Virtual path prefix acting as the workspace root
+            (default ``"/workspace"``).  All file paths must live under
+            this prefix — paths outside are rejected so the AI never
+            perceives the virtual filesystem as a real system root.
         timeout: Default timeout in seconds for shell execution (default 120).
         max_output_bytes: Max bytes to capture from command output.
         env: Environment variables for shell commands.
@@ -104,6 +109,7 @@ class LocalBackend(BackendProtocol):
         self,
         root_dir: str | Path | None = None,
         *,
+        workspace_root: str = "/workspace",
         timeout: int = _DEFAULT_EXECUTE_TIMEOUT,
         max_output_bytes: int = _MAX_OUTPUT_BYTES,
         env: dict[str, str] | None = None,
@@ -127,6 +133,7 @@ class LocalBackend(BackendProtocol):
                 "Provide at most one of them."
             )
 
+        self.workspace_root = workspace_root.rstrip("/")
         self._cwd = Path(root_dir).resolve() if root_dir else Path.cwd()
         self._default_timeout = timeout
         self._max_output_bytes = max_output_bytes
@@ -150,6 +157,7 @@ class LocalBackend(BackendProtocol):
 
     @property
     def tools(self) -> list[StructuredTool]:
+        wr = self.workspace_root
         tools: list[StructuredTool] = [
             StructuredTool(
                 name="tree",
@@ -159,7 +167,7 @@ class LocalBackend(BackendProtocol):
                 ),
                 args_schema=create_model(
                     "TreeSchema",
-                    path=(str, Field(default="/", description="Root directory to display")),
+                    path=(str, Field(default=wr, description="Root directory to display")),
                     depth=(int, Field(default=3, description="Maximum recursion depth")),
                 ),
                 func=lambda **kwargs: self.tree(**kwargs),
@@ -204,11 +212,23 @@ class LocalBackend(BackendProtocol):
 
     @property
     def description(self) -> str:
+        wr = self.workspace_root
+        os_label = {"win32": "Windows", "darwin": "macOS"}.get(sys.platform, "Unix")
+        shell = "cmd /c" if sys.platform == "win32" else "sh -c"
         desc = (
-            "Local file system backend with shell command execution support "
-            f"(working directory: {self._cwd})"
+            f"**Environment:** Local {os_label} filesystem "
+            f"(working directory: {self._cwd}, shell: {shell}).\n"
+            f"**Path mapping:** the workspace root `{wr}` maps to the real "
+            f"directory `{self._cwd}` — all file tools must use paths under "
+            f"`{wr}`. Paths outside `{wr}` (including `/`) are rejected."
         )
-        if not self._enable_execute:
+        if self._enable_execute:
+            desc += (
+                f"\n**execute tool:** shell commands run in `{self._cwd}`.  "
+                f"Use real filesystem paths in commands, NOT `{wr}` paths "
+                f"— the virtual workspace path does not exist on the real filesystem."
+            )
+        else:
             desc += " [shell execution disabled]"
         return desc
 
@@ -219,24 +239,43 @@ class LocalBackend(BackendProtocol):
     def _resolve(self, path: str) -> Path:
         """Resolve a virtual absolute path to a real filesystem path under ``_cwd``.
 
+        Validates that *path* is under :attr:`workspace_root` and strips
+        the prefix before resolving against ``_cwd``.  Raises
+        :class:`WorkspacePathError` for paths outside the workspace.
+
         Uses ``PurePosixPath`` to parse the virtual path consistently
         across platforms (Windows, Linux, macOS).  The virtual path
-        scheme uses ``"/"`` separators and treats ``"/"`` as the root
-        of *backing* directory (``_cwd``).
+        scheme uses ``"/"`` separators and treats the workspace root as
+        the anchor for all file operations.
         """
         from pathlib import PurePosixPath
 
         pp = PurePosixPath(path)
-        if pp.is_absolute():
-            # "/foo/bar" → parts = ("/", "foo", "bar") → skip root → ("foo", "bar")
-            relative_parts = pp.parts[1:]
-        else:
-            relative_parts = pp.parts
+        path_str = str(pp)
+        wr = self.workspace_root
 
-        if not relative_parts:
+        # Must start with workspace root
+        if path_str != wr and not path_str.startswith(wr + "/"):
+            raise WorkspacePathError(
+                f"Path '{path}' is outside the workspace. "
+                f"All file paths must be under '{wr}'."
+            )
+
+        rel = path_str[len(wr):].lstrip("/")
+        if not rel:
             return self._cwd
 
-        return (self._cwd.joinpath(*relative_parts)).resolve()
+        resolved = (self._cwd / rel).resolve()
+
+        # Prevent symlink escape from _cwd
+        try:
+            resolved.relative_to(self._cwd)
+        except ValueError:
+            raise WorkspacePathError(
+                f"Path '{path}' resolves outside the working directory via symlink."
+            ) from None
+
+        return resolved
 
     def _check_edit_allowed(self, path: str) -> bool:
         """Check whether *path* is allowed for edit/write/delete.
@@ -249,13 +288,17 @@ class LocalBackend(BackendProtocol):
         return check_path_allowed(path, whitelist=whitelist, blacklist=blacklist)
 
     def ls(self, path: str) -> LsResult:
-        resolved = self._resolve(path)
+        try:
+            resolved = self._resolve(path)
+        except WorkspacePathError as e:
+            return LsResult(error=str(e))
         try:
             if not resolved.exists() or not resolved.is_dir():
                 return LsResult(error=f"Directory '{path}' not found")
         except OSError as e:
             return LsResult(error=f"Cannot access '{path}': {e}")
 
+        wr = self.workspace_root
         infos: list[FileInfo] = []
         errors: list[str] = []
         try:
@@ -266,16 +309,17 @@ class LocalBackend(BackendProtocol):
                     ts = getattr(st, "st_mtime", 0)
                     if ts:
                         modified_at = datetime.fromtimestamp(ts, tz=timezone.utc).isoformat()
+                    rel = str(child.relative_to(self._cwd)).replace("\\", "/")
                     if child.is_dir():
                         infos.append(FileInfo(
-                            path="/" + str(child.relative_to(self._cwd)).replace("\\", "/") + "/",
+                            path=f"{wr}/{rel}/",
                             is_dir=True,
                             size=0,
                             modified_at=modified_at,
                         ))
                     else:
                         infos.append(FileInfo(
-                            path="/" + str(child.relative_to(self._cwd)).replace("\\", "/"),
+                            path=f"{wr}/{rel}",
                             is_dir=False,
                             size=st.st_size,
                             modified_at=modified_at,
@@ -295,7 +339,10 @@ class LocalBackend(BackendProtocol):
         limit: int = 2000,
         include_line_numbers: bool = False,
     ) -> ReadResult:
-        resolved = self._resolve(file_path)
+        try:
+            resolved = self._resolve(file_path)
+        except WorkspacePathError as e:
+            return ReadResult(error=str(e))
         try:
             if not resolved.exists():
                 return ReadResult(error=f"File '{file_path}' not found")
@@ -348,7 +395,7 @@ class LocalBackend(BackendProtocol):
         lines = content.splitlines(keepends=True)
         total = len(lines)
 
-        if offset >= total:
+        if total > 0 and offset >= total:
             return ReadResult(
                 error=f"Line offset {offset} exceeds file length ({total} lines)",
             )
@@ -376,7 +423,10 @@ class LocalBackend(BackendProtocol):
                     "Check edit_whitelist / edit_blacklist."
                 ),
             )
-        resolved = self._resolve(file_path)
+        try:
+            resolved = self._resolve(file_path)
+        except WorkspacePathError as e:
+            return WriteResult(error=str(e))
         if resolved.exists() and not overwrite:
             return WriteResult(
                 error=(
@@ -413,7 +463,10 @@ class LocalBackend(BackendProtocol):
                     "Check edit_whitelist / edit_blacklist."
                 ),
             )
-        resolved = self._resolve(file_path)
+        try:
+            resolved = self._resolve(file_path)
+        except WorkspacePathError as e:
+            return EditResult(error=str(e))
         try:
             if not resolved.exists():
                 return EditResult(
@@ -480,10 +533,13 @@ class LocalBackend(BackendProtocol):
     def grep(
         self,
         pattern: str,
-        path: str = "/",
+        path: str = "/workspace",
         glob: str | None = None,
     ) -> GrepResult:
-        resolved = self._resolve(path)
+        try:
+            resolved = self._resolve(path)
+        except WorkspacePathError as e:
+            return GrepResult(error=str(e))
         try:
             if not resolved.exists():
                 return GrepResult(error=f"Path '{path}' not found")
@@ -491,6 +547,7 @@ class LocalBackend(BackendProtocol):
             return GrepResult(error=f"Error accessing '{path}': {e}")
 
         search_dir = resolved if resolved.is_dir() else resolved.parent
+        wr = self.workspace_root
 
         # 1) Try ripgrep (orders of magnitude faster on large trees)
         results = self._ripgrep_grep(pattern, search_dir, glob)
@@ -499,7 +556,8 @@ class LocalBackend(BackendProtocol):
             matches: list[GrepMatch] = []
             for fpath, items in results.items():
                 try:
-                    virt = "/" + str(Path(fpath).relative_to(self._cwd)).replace("\\", "/")
+                    rel = str(Path(fpath).relative_to(self._cwd)).replace("\\", "/")
+                    virt = f"{wr}/{rel}"
                 except ValueError:
                     continue
                 for li, text in items:
@@ -541,7 +599,8 @@ class LocalBackend(BackendProtocol):
 
                 for li, line in enumerate(lines, start=1):
                     if regex.search(line):
-                        virt_path = "/" + str(fp.relative_to(self._cwd)).replace("\\", "/")
+                        rel = str(fp.relative_to(self._cwd)).replace("\\", "/")
+                        virt_path = f"{wr}/{rel}"
                         matches.append(GrepMatch(path=virt_path, line=li, text=line))
         except OSError as e:
             return GrepResult(
@@ -613,8 +672,11 @@ class LocalBackend(BackendProtocol):
 
         return results
 
-    def glob(self, pattern: str, path: str = "/") -> GlobResult:
-        resolved = self._resolve(path)
+    def glob(self, pattern: str, path: str = "/workspace") -> GlobResult:
+        try:
+            resolved = self._resolve(path)
+        except WorkspacePathError as e:
+            return GlobResult(error=str(e))
 
         try:
             if not resolved.exists() or not resolved.is_dir():
@@ -622,6 +684,7 @@ class LocalBackend(BackendProtocol):
         except OSError as e:
             return GlobResult(error=f"Error accessing '{path}': {e}")
 
+        wr = self.workspace_root
         matches: list[FileInfo] = []
         errors: list[str] = []
         try:
@@ -632,7 +695,8 @@ class LocalBackend(BackendProtocol):
                 except OSError:
                     continue
                 try:
-                    virt_path = "/" + str(fp.relative_to(self._cwd)).replace("\\", "/")
+                    rel = str(fp.relative_to(self._cwd)).replace("\\", "/")
+                    virt_path = f"{wr}/{rel}"
                     st = fp.stat()
                 except OSError as e:
                     errors.append(f"Cannot stat '{fp}': {e}")
@@ -652,17 +716,20 @@ class LocalBackend(BackendProtocol):
     # Extra operations: tree, delete, execute
     # ------------------------------------------------------------------
 
-    def tree(self, path: str = "/", depth: int = 3) -> str:
+    def tree(self, path: str = "/workspace", depth: int = 3) -> str:
         """Render a directory tree.
 
         Args:
-            path: Root directory to display (virtual path, default ``"/"``).
+            path: Root directory to display (virtual path, default to workspace root).
             depth: Maximum recursion depth (default 3).
 
         Returns:
             Formatted tree string.
         """
-        resolved = self._resolve(path)
+        try:
+            resolved = self._resolve(path)
+        except WorkspacePathError as e:
+            return str(e)
         if not resolved.exists():
             return f"Path '{path}' not found."
         if not resolved.is_dir():
@@ -673,6 +740,7 @@ class LocalBackend(BackendProtocol):
             depth,
             cwd=self._cwd,
             ignore_dirs=self._ignore_dirs,
+            workspace_root=self.workspace_root,
         )
         return format_tree_entries(entries)
 
@@ -692,7 +760,10 @@ class LocalBackend(BackendProtocol):
                 f"Error: Path '{path}' is not allowed for delete. "
                 "Check edit_whitelist / edit_blacklist."
             )
-        resolved = self._resolve(path)
+        try:
+            resolved = self._resolve(path)
+        except WorkspacePathError as e:
+            return str(e)
 
         # Safety: refuse to delete the root_dir itself
         if resolved == self._cwd:
@@ -900,6 +971,7 @@ def _walk_tree(
     cwd: Path | None = None,
     current_depth: int = 0,
     ignore_dirs: frozenset[str] = frozenset(),
+    workspace_root: str = "/workspace",
 ) -> list[TreeEntry]:
     """Recursively walk a directory tree.
 
@@ -922,7 +994,7 @@ def _walk_tree(
         if not child.is_dir():
             continue
 
-        virt = _virtual_path(child, cwd) if cwd else ""
+        virt = _virtual_path(child, cwd, workspace_root) if cwd else ""
 
         # Ignored directory: show it but skip children
         if virt and virt in ignore_dirs:
@@ -972,6 +1044,7 @@ def _walk_tree(
                 cwd=cwd,
                 current_depth=current_depth + 1,
                 ignore_dirs=ignore_dirs,
+                workspace_root=workspace_root,
             )
             entries.extend(sub)
 
@@ -990,9 +1063,9 @@ def _walk_tree(
     return entries
 
 
-def _virtual_path(child: Path, cwd: Path) -> str:
+def _virtual_path(child: Path, cwd: Path, workspace_root: str = "/workspace") -> str:
     """Convert a child Path to a virtual absolute path (POSIX separators)."""
     try:
-        return "/" + str(child.relative_to(cwd)).replace("\\", "/")
+        return f"{workspace_root}/{str(child.relative_to(cwd)).replace(chr(92), '/')}"
     except ValueError:
         return ""

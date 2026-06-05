@@ -11,6 +11,7 @@ from langgraph.checkpoint.memory import MemorySaver
 
 from mambo_agents import create_mambo_agent
 from mambo_agents.backends.local import LocalBackend
+from mambo_agents.backends.protocol import WorkspacePathError
 from mambo_agents.backends.state import StateBackend
 
 
@@ -55,6 +56,9 @@ def _strip_numbers(content: str) -> str:
     return "\n".join(clean)
 
 
+_W = "/workspace"
+
+
 # ===================================================================
 # Unit tests: LocalBackend
 # ===================================================================
@@ -65,30 +69,30 @@ class TestLocalBackend:
 
     def test_write_and_read(self, tmp_root):
         backend = LocalBackend(root_dir=str(tmp_root))
-        r = backend.write("/hello.txt", "Hello World")
+        r = backend.write(f"{_W}/hello.txt", "Hello World")
         assert r.error is None
-        assert r.path == "/hello.txt"
+        assert r.path == f"{_W}/hello.txt"
 
-        r2 = backend.read("/hello.txt")
+        r2 = backend.read(f"{_W}/hello.txt")
         assert r2.error is None
         assert "Hello World" in (r2.content or "")
 
     def test_write_fails_if_exists(self, tmp_root):
         """Write fails if file already exists — use edit instead."""
         backend = LocalBackend(root_dir=str(tmp_root))
-        backend.write("/a.txt", "original")
-        r = backend.write("/a.txt", "modified")
+        backend.write(f"{_W}/a.txt", "original")
+        r = backend.write(f"{_W}/a.txt", "modified")
         assert r.error is not None
         assert "already exists" in (r.error or "")
 
     def test_edit_replaces_text(self, tmp_root):
         backend = LocalBackend(root_dir=str(tmp_root))
-        backend.write("/code.py", "x = 1\ny = 2\nz = 3")
-        r = backend.edit("/code.py", "x = 1", "999")
+        backend.write(f"{_W}/code.py", "x = 1\ny = 2\nz = 3")
+        r = backend.edit(f"{_W}/code.py", "x = 1", "999")
         assert r.error is None
         assert r.occurrences == 1
 
-        result = backend.read("/code.py")
+        result = backend.read(f"{_W}/code.py")
         raw = _strip_numbers(result.content or "")
         assert "999" in raw
         assert "x = 1" not in raw
@@ -96,52 +100,52 @@ class TestLocalBackend:
 
     def test_edit_old_str_not_found(self, tmp_root):
         backend = LocalBackend(root_dir=str(tmp_root))
-        backend.write("/code.py", "hello")
-        r = backend.edit("/code.py", "not there", "x")
+        backend.write(f"{_W}/code.py", "hello")
+        r = backend.edit(f"{_W}/code.py", "not there", "x")
         assert r.error is not None
         assert "old_str not found" in (r.error or "")
 
     def test_edit_file_not_found(self, tmp_root):
         backend = LocalBackend(root_dir=str(tmp_root))
-        r = backend.edit("/ghost.py", "something", "x")
+        r = backend.edit(f"{_W}/ghost.py", "something", "x")
         assert r.error is not None
         assert "file not found" in (r.error or "")
 
     def test_ls(self, tmp_root):
         backend = LocalBackend(root_dir=str(tmp_root))
-        backend.write("/a.py", "1")
-        backend.write("/b.txt", "2")
+        backend.write(f"{_W}/a.py", "1")
+        backend.write(f"{_W}/b.txt", "2")
         (tmp_root / "subdir").mkdir()
 
-        result = backend.ls("/")
+        result = backend.ls(f"{_W}/")
         assert result.entries is not None
         paths = [fi.path for fi in result.entries]
-        assert "/a.py" in paths
-        assert "/b.txt" in paths
+        assert f"{_W}/a.py" in paths
+        assert f"{_W}/b.txt" in paths
         assert any("subdir" in p and p.endswith("/") for p in paths)
 
     def test_read_not_found(self, tmp_root):
         backend = LocalBackend(root_dir=str(tmp_root))
-        r = backend.read("/nope.txt")
+        r = backend.read(f"{_W}/nope.txt")
         assert r.error is not None
         assert "not found" in r.error
 
     def test_grep(self, tmp_root):
         backend = LocalBackend(root_dir=str(tmp_root))
-        backend.write("/a.py", "def foo():\n    pass")
-        backend.write("/b.py", "def bar():\n    pass")
+        backend.write(f"{_W}/a.py", "def foo():\n    pass")
+        backend.write(f"{_W}/b.py", "def bar():\n    pass")
 
-        r = backend.grep("foo", path="/")
+        r = backend.grep("foo", path=f"{_W}/")
         assert r.matches is not None
         assert any("foo" in m.text for m in r.matches)
 
     def test_glob(self, tmp_root):
         backend = LocalBackend(root_dir=str(tmp_root))
-        backend.write("/src/main.py", "code")
-        backend.write("/src/util.py", "code")
-        backend.write("/README.md", "readme")
+        backend.write(f"{_W}/src/main.py", "code")
+        backend.write(f"{_W}/src/util.py", "code")
+        backend.write(f"{_W}/README.md", "readme")
 
-        r = backend.glob("*.py", path="/src")
+        r = backend.glob("*.py", path=f"{_W}/src")
         assert r.matches is not None
         paths = [fi.path for fi in r.matches]
         assert len(paths) == 2
@@ -149,13 +153,27 @@ class TestLocalBackend:
     def test_tree_output_is_str(self, tmp_root):
         """tree() returns a plain string."""
         backend = LocalBackend(root_dir=str(tmp_root))
-        backend.write("/a.txt", "a")
+        backend.write(f"{_W}/a.txt", "a")
         (tmp_root / "sub").mkdir()
-        backend.write("/sub/b.txt", "b")
+        backend.write(f"{_W}/sub/b.txt", "b")
 
-        r = backend.tree("/", depth=2)
+        r = backend.tree(f"{_W}/", depth=2)
         assert isinstance(r, str)
         assert len(r) > 0
+
+    def test_path_outside_workspace_rejected(self, tmp_root):
+        """Any path not under /workspace is rejected with WorkspacePathError."""
+        backend = LocalBackend(root_dir=str(tmp_root))
+        r = backend.ls("/")
+        assert r.error is not None
+        assert "outside the workspace" in (r.error or "")
+
+    def test_path_outside_workspace_write_rejected(self, tmp_root):
+        """write to /etc/passwd-like path is rejected."""
+        backend = LocalBackend(root_dir=str(tmp_root))
+        r = backend.write("/etc/passwd", "evil")
+        assert r.error is not None
+        assert "outside the workspace" in (r.error or "")
 
     # ------------------------------------------------------------------
     # Delete tool
@@ -163,10 +181,10 @@ class TestLocalBackend:
 
     def test_delete_file(self, tmp_root):
         backend = LocalBackend(root_dir=str(tmp_root))
-        backend.write("/deleteme.txt", "bye")
+        backend.write(f"{_W}/deleteme.txt", "bye")
         assert (tmp_root / "deleteme.txt").exists()
 
-        r = backend.delete("/deleteme.txt")
+        r = backend.delete(f"{_W}/deleteme.txt")
         assert r is not None
         assert "Deleted:" in r
         assert not (tmp_root / "deleteme.txt").exists()
@@ -176,13 +194,13 @@ class TestLocalBackend:
         backend = LocalBackend(root_dir=str(tmp_root))
         (tmp_root / "fulldir").mkdir()
         (tmp_root / "fulldir" / "file.txt").write_text("hi")
-        r = backend.delete("/fulldir")
+        r = backend.delete(f"{_W}/fulldir")
         assert "Deleted:" in r
         assert not (tmp_root / "fulldir").exists()
 
     def test_delete_not_found(self, tmp_root):
         backend = LocalBackend(root_dir=str(tmp_root))
-        r = backend.delete("/nope.txt")
+        r = backend.delete(f"{_W}/nope.txt")
         assert "does not exist" in r
 
     def test_delete_tool_registered(self, tmp_root):
@@ -236,17 +254,17 @@ class TestLocalBackend:
         with pytest.raises(ValueError, match="mutually exclusive"):
             LocalBackend(
                 root_dir=str(tmp_root),
-                edit_whitelist=frozenset({"/src"}),
-                edit_blacklist=frozenset({"/build"}),
+                edit_whitelist=frozenset({f"{_W}/src"}),
+                edit_blacklist=frozenset({f"{_W}/build"}),
             )
 
     def test_edit_whitelist_blocks_write(self, tmp_root):
         """write to a non-whitelisted path is rejected."""
         backend = LocalBackend(
             root_dir=str(tmp_root),
-            edit_whitelist=frozenset({"/src"}),
+            edit_whitelist=frozenset({f"{_W}/src"}),
         )
-        r = backend.write("/outside.txt", "hello")
+        r = backend.write(f"{_W}/outside.txt", "hello")
         assert r.error is not None
         assert "not allowed" in (r.error or "")
 
@@ -254,19 +272,19 @@ class TestLocalBackend:
         """write to a whitelisted path is allowed."""
         backend = LocalBackend(
             root_dir=str(tmp_root),
-            edit_whitelist=frozenset({"/src"}),
+            edit_whitelist=frozenset({f"{_W}/src"}),
         )
-        r = backend.write("/src/hello.txt", "hello")
+        r = backend.write(f"{_W}/src/hello.txt", "hello")
         assert r.error is None
-        assert r.path == "/src/hello.txt"
+        assert r.path == f"{_W}/src/hello.txt"
 
     def test_edit_blacklist_blocks_edit(self, tmp_root):
         """edit on a blacklisted path is rejected."""
         backend = LocalBackend(
             root_dir=str(tmp_root),
-            edit_blacklist=frozenset({"/build"}),
+            edit_blacklist=frozenset({f"{_W}/build"}),
         )
-        r = backend.edit("/build/output.o", "a", "b")
+        r = backend.edit(f"{_W}/build/output.o", "a", "b")
         assert r.error is not None
         assert "not allowed" in (r.error or "")
 
@@ -274,10 +292,10 @@ class TestLocalBackend:
         """edit on a non-blacklisted path works normally."""
         backend = LocalBackend(
             root_dir=str(tmp_root),
-            edit_blacklist=frozenset({"/build"}),
+            edit_blacklist=frozenset({f"{_W}/build"}),
         )
-        backend.write("/src/code.py", "x = 1")
-        r = backend.edit("/src/code.py", "x = 1", "x = 2")
+        backend.write(f"{_W}/src/code.py", "x = 1")
+        r = backend.edit(f"{_W}/src/code.py", "x = 1", "x = 2")
         assert r.error is None
         assert r.occurrences == 1
 
@@ -285,19 +303,19 @@ class TestLocalBackend:
         """delete on a non-whitelisted path is rejected."""
         backend = LocalBackend(
             root_dir=str(tmp_root),
-            edit_whitelist=frozenset({"/src"}),
+            edit_whitelist=frozenset({f"{_W}/src"}),
         )
-        r = backend.delete("/outside/secret.txt")
+        r = backend.delete(f"{_W}/outside/secret.txt")
         assert "not allowed" in r
 
     def test_blacklist_blocks_delete(self, tmp_root):
         """delete on a blacklisted path is rejected."""
         backend = LocalBackend(
             root_dir=str(tmp_root),
-            edit_blacklist=frozenset({"/important"}),
+            edit_blacklist=frozenset({f"{_W}/important"}),
         )
         (tmp_root / "important").mkdir()
-        r = backend.delete("/important")
+        r = backend.delete(f"{_W}/important")
         assert "not allowed" in r
 
     # ------------------------------------------------------------------
@@ -308,16 +326,16 @@ class TestLocalBackend:
         """ignore_dirs hides children of marked directories but still shows the dir."""
         backend = LocalBackend(
             root_dir=str(tmp_root),
-            ignore_dirs=frozenset({"/node_modules"}),
+            ignore_dirs=frozenset({f"{_W}/node_modules"}),
         )
         (tmp_root / "src").mkdir()
-        backend.write("/src/main.py", "code")
+        backend.write(f"{_W}/src/main.py", "code")
         nm = tmp_root / "node_modules"
         nm.mkdir()
         (nm / "package.json").write_text("{}")
         (nm / "lodash").mkdir()
 
-        result = backend.tree("/", depth=3)
+        result = backend.tree(f"{_W}/", depth=3)
         assert "node_modules/(ignore)" in result
         # Children of node_modules should not appear
         assert "package.json" not in result
@@ -331,9 +349,9 @@ class TestLocalBackend:
         backend = LocalBackend(root_dir=str(tmp_root))
         (tmp_root / "empty_dir").mkdir()
         (tmp_root / "non_empty").mkdir()
-        backend.write("/non_empty/file.txt", "data")
+        backend.write(f"{_W}/non_empty/file.txt", "data")
 
-        result = backend.tree("/", depth=2)
+        result = backend.tree(f"{_W}/", depth=2)
         assert "empty_dir/(empty)" in result
         assert "non_empty/" in result
         assert "file.txt" in result
@@ -346,11 +364,7 @@ class TestLocalBackend:
         (deep / "child").mkdir()
         (deep / "child" / "grandchild").mkdir()
 
-        result = backend.tree("/", depth=2)
-        # deep/ is at depth 0 (root's child), child/ is at depth 1
-        # At depth=2, "deep/child/" would be reached, which has grandchild
-        # With max_depth=2, _walk_tree at current_depth=1 for child:
-        #   current_depth+1=2 >= max_depth=2 → check if child has children → yes → depth_exceeded
+        result = backend.tree(f"{_W}/", depth=2)
         assert "child/(...)" in result
         # grandchild should not appear (past depth limit)
         assert "grandchild" not in result
@@ -382,7 +396,7 @@ class TestCreateAgentLocal:
                 "messages": [
                     HumanMessage(
                         content=(
-                            "Create a file /greeting.txt with the content "
+                            f"Create a file {_W}/greeting.txt with the content "
                             "'Hello from Mambo Agents LocalBackend'. Reply with exactly 'DONE'."
                         )
                     )
@@ -454,15 +468,13 @@ class TestInterruptOn:
 
         config = {"configurable": {"thread_id": "test-interrupt"}}
 
-        # Invoke without streaming – the agent will attempt to delete,
-        # and the HumanInTheLoop middleware will interrupt.
         result = agent.invoke(
             {
                 "messages": [
                     HumanMessage(
                         content=(
-                            "Read the file /precious.txt to see its content, "
-                            "then delete /precious.txt. Reply 'DONE' when completed."
+                            f"Read the file {_W}/precious.txt to see its content, "
+                            f"then delete {_W}/precious.txt. Reply 'DONE' when completed."
                         )
                     )
                 ]
@@ -470,5 +482,4 @@ class TestInterruptOn:
             config=config,
         )
 
-        # After the interrupt, the agent should have produced some output.
         assert result is not None

@@ -15,6 +15,9 @@ from mambo_agents.backends.temp_workspace import TempWorkspaceBackend
 from tests.test_state_backend import _simulate_graph
 
 
+_W = "/workspace"
+
+
 # ============================================================================
 # Helpers
 # ============================================================================
@@ -140,8 +143,8 @@ class TestPathRouting:
 
     def test_is_workspace_misses_others(self, temp_ws: TempWorkspaceBackend):
         assert not temp_ws._is_workspace("/")
-        assert not temp_ws._is_workspace("/project/")
-        assert not temp_ws._is_workspace("/tmp/file.txt")
+        assert not temp_ws._is_workspace(f"{_W}/project/")
+        assert not temp_ws._is_workspace(f"{_W}/tmp/file.txt")
         assert not temp_ws._is_workspace("/conversation_history/x.md")
 
     def test_route_workspace_returns_state(self, temp_ws: TempWorkspaceBackend):
@@ -150,9 +153,9 @@ class TestPathRouting:
         assert path == "/.mambo/workspace/f.txt"
 
     def test_route_non_workspace_returns_backend(self, temp_ws: TempWorkspaceBackend):
-        target, path = temp_ws._route("/project/main.py")
+        target, path = temp_ws._route(f"{_W}/project/main.py")
         assert target is temp_ws._backend
-        assert path == "/project/main.py"
+        assert path == f"{_W}/project/main.py"
 
 
 # ============================================================================
@@ -164,7 +167,7 @@ class TestCoreOpsRouting:
     """Write to both sides and verify they are isolated."""
 
     WORKSPACE_FILE = "/.mambo/workspace/scratch.txt"
-    PROJECT_FILE = "/project/hello.txt"
+    PROJECT_FILE = f"{_W}/project/hello.txt"
 
     def _write_workspace(self, temp_ws: TempWorkspaceBackend, content: str):
         """Write a file under the workspace prefix via graph simulation."""
@@ -228,13 +231,13 @@ class TestCoreOpsRouting:
         assert "/.mambo/workspace/other.txt" in paths
 
     def test_ls_project(self, temp_ws: TempWorkspaceBackend):
-        temp_ws.write("/project/a.py", "1")
-        temp_ws.write("/project/b.py", "2")
-        r = temp_ws.ls("/project/")
+        temp_ws.write(f"{_W}/project/a.py", "1")
+        temp_ws.write(f"{_W}/project/b.py", "2")
+        r = temp_ws.ls(f"{_W}/project/")
         assert r.entries is not None
         paths = [fi.path for fi in r.entries]
-        assert "/project/a.py" in paths
-        assert "/project/b.py" in paths
+        assert f"{_W}/project/a.py" in paths
+        assert f"{_W}/project/b.py" in paths
 
     def test_grep_workspace(self, temp_ws: TempWorkspaceBackend):
         self._write_workspace(temp_ws, "needle in a haystack")
@@ -244,8 +247,8 @@ class TestCoreOpsRouting:
         assert any("needle" in m.text for m in r.matches)
 
     def test_grep_project(self, temp_ws: TempWorkspaceBackend):
-        temp_ws.write("/project/f.py", "def needle(): pass")
-        r = temp_ws.grep("needle", path="/project/")
+        temp_ws.write(f"{_W}/project/f.py", "def needle(): pass")
+        r = temp_ws.grep("needle", path=f"{_W}/project/")
         assert r.matches is not None
         assert any("needle" in m.text for m in r.matches)
 
@@ -260,13 +263,13 @@ class TestCoreOpsRouting:
         assert "/.mambo/workspace/b.md" not in paths  # .md not matched
 
     def test_glob_project(self, temp_ws: TempWorkspaceBackend):
-        temp_ws.write("/project/x.py", "1")
-        temp_ws.write("/project/y.txt", "2")
-        r = temp_ws.glob("*.py", path="/project/")
+        temp_ws.write(f"{_W}/project/x.py", "1")
+        temp_ws.write(f"{_W}/project/y.txt", "2")
+        r = temp_ws.glob("*.py", path=f"{_W}/project/")
         assert r.matches is not None
         paths = [fi.path for fi in r.matches]
         assert len(paths) == 1
-        assert "/project/x.py" in paths
+        assert f"{_W}/project/x.py" in paths
 
     def test_read_not_found_workspace(self, temp_ws: TempWorkspaceBackend):
         with _simulate_graph(temp_ws._state):
@@ -274,7 +277,7 @@ class TestCoreOpsRouting:
         assert r.error is not None
 
     def test_read_not_found_project(self, temp_ws: TempWorkspaceBackend):
-        r = temp_ws.read("/project/nope.txt")
+        r = temp_ws.read(f"{_W}/project/nope.txt")
         assert r.error is not None
 
 
@@ -291,7 +294,7 @@ def _make_dummy_tree_tool() -> StructuredTool:
         description="Show tree",
         args_schema=create_model(
             "DummyTreeSchema",
-            path=(str, Field(default="/")),
+            path=(str, Field(default=_W)),
             depth=(int, Field(default=3)),
         ),
         func=lambda **kw: "tree output",
@@ -357,9 +360,9 @@ class TestUploadDownload:
 
         files: list[tuple[str, bytes]] = [
             ("/.mambo/workspace/a.txt", b"workspace a"),
-            ("/project/b.txt", b"project b"),
+            (f"{_W}/project/b.txt", b"project b"),
             ("/.mambo/workspace/c.txt", b"workspace c"),
-            ("/project/d.txt", b"project d"),
+            (f"{_W}/project/d.txt", b"project d"),
         ]
 
         with _simulate_graph(tws._state):
@@ -376,8 +379,8 @@ class TestUploadDownload:
         assert "workspace c" in (r3.content or "")
 
         # Verify project files in delegate
-        r2 = tws.read("/project/b.txt")
-        r4 = tws.read("/project/d.txt")
+        r2 = tws.read(f"{_W}/project/b.txt")
+        r4 = tws.read(f"{_W}/project/d.txt")
         assert "project b" in (r2.content or "")
         assert "project d" in (r4.content or "")
 
@@ -387,12 +390,12 @@ class TestUploadDownload:
         # Pre-populate both sides
         with _simulate_graph(tws._state):
             tws.write("/.mambo/workspace/x.txt", "state file", overwrite=True)
-        tws.write("/project/y.txt", "backend file", overwrite=True)
+        tws.write(f"{_W}/project/y.txt", "backend file", overwrite=True)
 
         with _simulate_graph(tws._state):
             results = tws.download_files([
                 "/.mambo/workspace/x.txt",
-                "/project/y.txt",
+                f"{_W}/project/y.txt",
             ])
 
         assert len(results) == 2

@@ -5,7 +5,9 @@ from __future__ import annotations
 import base64
 
 import pytest
-from langchain_core.messages import ToolMessage
+from langchain.tools import ToolRuntime
+from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
+from langgraph.prebuilt.tool_node import ToolNode
 
 from mambo_agents.backends.protocol import (
     ReadResult,
@@ -467,3 +469,148 @@ class TestEvictionMultimodalPreservation:
         assert isinstance(result.content, list)
         audio_block = next(b for b in result.content if b["type"] == "audio")
         assert audio_block["base64"] == "BBB="
+
+
+# ============================================================================
+# Phase 5: ToolRuntime injection for multimodal read (regression coverage)
+# ============================================================================
+
+
+class TestReadToolRuntimeInjection:
+    """Verify ``runtime`` is correctly recognized as an injected arg.
+
+    Without the fix (removing ``from __future__ import annotations``),
+    ``StructuredTool._injected_args_keys`` would fail to detect ``runtime``
+    because PEP 563 turns the type annotation into a string that
+    ``_is_injected_arg_type`` cannot interpret.  This caused ``tool_call_id``
+    to be empty in multimodal ToolMessage results.
+    """
+
+    def test_injected_args_keys_includes_runtime(self):
+        """``_injected_args_keys`` must contain ``"runtime"`` for the read tool."""
+        backend = StateBackend()
+        tools = build_core_tools(backend)
+        read_tool = next(t for t in tools if t.name == "read")
+
+        injected_keys = read_tool._injected_args_keys
+        assert "runtime" in injected_keys, (
+            "read tool's _injected_args_keys must contain 'runtime'; "
+            "otherwise ToolNode-injected ToolRuntime will be dropped by "
+            "_parse_input() and sync_read receives runtime=None, "
+            "causing tool_call_id to be empty."
+        )
+
+    def test_toolnode_call_multimodal_gives_valid_tool_call_id(self):
+        """Multimodal read via ToolNode produces ToolMessage with correct tool_call_id."""
+        b64 = base64.b64encode(b"\x89PNG\r\n").decode("ascii")
+        backend = StateBackend(initial_files={"/photo.png": b64})
+        tools = build_core_tools(backend)
+        read_tool = next(t for t in tools if t.name == "read")
+
+        # Simulate a ToolNode flow: the model calls the read tool with a tool_call
+        tool_call = {
+            "name": "read",
+            "args": {"file_path": "/photo.png"},
+            "id": "call_multimodal_001",
+            "type": "tool_call",
+        }
+        ai_msg = AIMessage(content="read the photo", tool_calls=[tool_call])
+
+        tool_node = ToolNode(tools=tools)
+        with _simulate_graph(backend):
+            result = tool_node._func(
+                {"messages": [HumanMessage("read photo"), ai_msg]},
+                config={},
+                runtime=_FakeRuntime(),
+            )
+
+        # Extract the single ToolMessage from the result
+        assert isinstance(result, dict)
+        msgs = result.get("messages", [])
+        assert len(msgs) == 1
+        tm = msgs[0]
+        assert isinstance(tm, ToolMessage)
+        assert tm.tool_call_id == "call_multimodal_001", (
+            "ToolMessage.tool_call_id should match the original tool call id, "
+            "not be empty. If empty, the runtime injection was lost."
+        )
+        # Multimodal content blocks should be present
+        assert tm.content_blocks is not None
+
+    @pytest.mark.asyncio
+    async def test_toolnode_async_call_multimodal_tool_call_id(self):
+        """Async multimodal read via ToolNode produces correct tool_call_id."""
+        b64 = base64.b64encode(b"\x89PNG\r\n").decode("ascii")
+        backend = StateBackend(initial_files={"/photo.png": b64})
+        tools = build_core_tools(backend)
+        read_tool = next(t for t in tools if t.name == "read")
+
+        tool_call = {
+            "name": "read",
+            "args": {"file_path": "/photo.png"},
+            "id": "call_async_multimodal_002",
+            "type": "tool_call",
+        }
+        ai_msg = AIMessage(content="read the photo", tool_calls=[tool_call])
+
+        tool_node = ToolNode(tools=tools)
+        with _simulate_graph(backend):
+            result = await tool_node._afunc(
+                {"messages": [HumanMessage("read photo"), ai_msg]},
+                config={},
+                runtime=_FakeRuntime(),
+            )
+
+        assert isinstance(result, dict)
+        msgs = result.get("messages", [])
+        assert len(msgs) == 1
+        tm = msgs[0]
+        assert isinstance(tm, ToolMessage)
+        assert tm.tool_call_id == "call_async_multimodal_002"
+
+    def test_direct_invoke_with_runtime_injection(self):
+        """Direct invoke of read tool with runtime arg produces correct tool_call_id.
+
+        This simulates what ToolNode._inject_tool_args does: it merges the
+        ToolRuntime instance into the tool call args before calling tool.invoke().
+        """
+        b64 = base64.b64encode(b"\x89PNG\r\n").decode("ascii")
+        backend = StateBackend(initial_files={"/photo.png": b64})
+        tools = build_core_tools(backend)
+        read_tool = next(t for t in tools if t.name == "read")
+
+        # Simulate ToolNode's injected call format: args + runtime injected
+        fake_runtime = ToolRuntime(
+            state={},
+            context=None,
+            config={},
+            stream_writer=None,
+            tool_call_id="call_injected_003",
+            store=None,
+            tools=list(tools),
+        )
+        call_args = {
+            "name": "read",
+            "args": {"file_path": "/photo.png", "runtime": fake_runtime},
+            "id": "call_injected_003",
+            "type": "tool_call",
+        }
+
+        with _simulate_graph(backend):
+            result = read_tool.invoke(call_args)
+
+        assert isinstance(result, ToolMessage)
+        assert result.tool_call_id == "call_injected_003", (
+            f"Expected tool_call_id='call_injected_003', got {result.tool_call_id!r}. "
+            "The runtime arg may have been dropped by _parse_input() due to "
+            "_injected_args_keys not recognizing it."
+        )
+
+
+class _FakeRuntime:
+    """Minimal fake of langgraph Runtime for ToolNode execution without a real graph."""
+    context = None
+    store = None
+    stream_writer = None
+    execution_info = None
+    server_info = None

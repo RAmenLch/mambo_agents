@@ -11,7 +11,12 @@ The AI is told via the system prompt that ``/.mambo/`` is a scratchpad for:
 - Agent-internal scratch files
 - Subagent communication files
 
-Only core file tools + ``tree`` are exposed — ``execute`` / ``delete`` are stripped.
+The system prompt explicitly lists the core tools (``ls``, ``read``, ``write``,
+``edit``, ``grep``, ``glob``) as the **only** tools that can operate on
+``/.mambo/`` paths.  When ``execute`` is enabled on the delegate backend,
+the prompt also explains the virtual-to-real path mapping — ``/`` maps
+to the delegate's working directory, and ``execute`` commands must use
+real filesystem paths, never ``/.mambo/`` paths.
 """
 
 from __future__ import annotations
@@ -88,14 +93,26 @@ class TempWorkspaceBackend(BackendProtocol):
 
     @property
     def description(self) -> str:
+        core_tools = (
+            "`ls`, `read`, `write`, `edit`, `grep`, `glob`"
+        )
         base = (
             f"A virtual temporary workspace is available at **{self._prefix}**.  "
-            "Use it for intermediate files, chat history dumps, large "
-            "tool-result evictions, and subagent communication.  "
-            "This workspace is isolated from the real filesystem — files here "
-            "do not persist across sessions.  "
-            "Only file operations are available; shell execution is disabled."
+            f"Use it for intermediate files, chat history dumps, large "
+            f"tool-result evictions, and subagent communication.  "
+            f"This workspace is isolated from the real filesystem — files here "
+            f"do not persist across sessions.  "
+            f"Only the following core file tools work on **{self._prefix}** paths: "
+            f"{core_tools}.  "
+            f"Other tools (tree, delete, execute, etc.) must NOT target "
+            f"**{self._prefix}** paths."
         )
+
+        # Delegate backend's own description (path mapping, etc.)
+        delegate_desc = self._backend.description
+        if delegate_desc:
+            base += f"\n\n{delegate_desc}"
+
         if self._custom_description:
             base = self._custom_description + "\n\n" + base
         return base

@@ -10,8 +10,6 @@ filesystem (``/.mambo/large_tool_results/<tool_call_id>``), replacing
 it with a truncated preview to prevent context-window saturation.
 """
 
-from __future__ import annotations
-
 import re
 from collections.abc import Awaitable, Callable, Sequence
 from typing import Annotated
@@ -237,7 +235,7 @@ _CORE_TOOLS = [
         "method": "grep",
         "fields": {
             "pattern": (str, Field(description="Literal substring to find")),
-            "path": (str, Field(default="/", description="Base directory to search")),
+            "path": (str, Field(description="Base directory to search")),
             "glob": (str | None, Field(default=None, description="Optional glob to filter filenames")),
         },
     },
@@ -250,7 +248,7 @@ _CORE_TOOLS = [
         "method": "glob",
         "fields": {
             "pattern": (str, Field(description="Glob pattern to match")),
-            "path": (str, Field(default="/", description="Base directory to search")),
+            "path": (str, Field(description="Base directory to search")),
         },
     },
 ]
@@ -312,13 +310,13 @@ def _build_sync_read_tool(backend: BackendProtocol) -> StructuredTool:
                 ),
             ),
         ] = False,
-        runtime: Annotated[ToolRuntime | None, "Injected by LangChain ToolNode"] = None,
+        runtime: ToolRuntime = None,
     ) -> ToolMessage | str:
         result: ReadResult = backend.read(
             file_path, offset, limit, include_line_numbers,
         )
         if result.is_multimodal and result.content is not None:
-            tool_call_id = getattr(runtime, "tool_call_id", "") or ""
+            tool_call_id = (runtime.tool_call_id or "") if runtime is not None else ""
             return ToolMessage(
                 content_blocks=[
                     {
@@ -352,13 +350,13 @@ def _build_sync_read_tool(backend: BackendProtocol) -> StructuredTool:
                 ),
             ),
         ] = False,
-        runtime: Annotated[ToolRuntime | None, "Injected by LangChain ToolNode"] = None,
+        runtime: ToolRuntime = None,
     ) -> ToolMessage | str:
         result: ReadResult = await backend.aread(
             file_path, offset, limit, include_line_numbers,
         )
         if result.is_multimodal and result.content is not None:
-            tool_call_id = getattr(runtime, "tool_call_id", "") or ""
+            tool_call_id = (runtime.tool_call_id or "") if runtime is not None else ""
             return ToolMessage(
                 content_blocks=[
                     {
@@ -402,6 +400,10 @@ def build_core_tools(backend: BackendProtocol) -> list[StructuredTool]:
     when the result has a non-text ``file_type``, it returns a ``ToolMessage``
     with ``content_blocks`` (LangChain multimodal format) instead of a plain
     string, and correctly propagates ``tool_call_id`` from the ``ToolRuntime``.
+
+    The ``grep`` and ``glob`` tools default their ``path`` argument to
+    ``backend.workspace_root`` (e.g. ``"/workspace"``), ensuring the AI
+    never perceives the virtual filesystem as a real system root.
     """
 
     def _make_func(method_name: str):
@@ -421,11 +423,18 @@ def build_core_tools(backend: BackendProtocol) -> list[StructuredTool]:
         return tool_coro
 
     tools: list[StructuredTool] = [_build_sync_read_tool(backend)]
+    wr = backend.workspace_root
 
     for spec in _CORE_TOOLS:
         if spec["name"] == "read":
             continue  # already added above
         from pydantic import create_model
+
+        # Inject workspace_root as default for grep/glob path fields
+        fields = dict(spec["fields"])
+        if spec["name"] in ("grep", "glob") and "path" in fields:
+            _, original_field = fields["path"]
+            fields["path"] = (str, Field(default=wr, description=original_field.description))
 
         tools.append(
             StructuredTool(
@@ -433,7 +442,7 @@ def build_core_tools(backend: BackendProtocol) -> list[StructuredTool]:
                 description=spec["description"],
                 args_schema=create_model(
                     f"{spec['name'].title()}Schema",
-                    **spec["fields"],
+                    **fields,
                 ),
                 func=_make_func(spec["method"]),
                 coroutine=_make_coro(spec["method"]),

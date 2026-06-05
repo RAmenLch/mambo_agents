@@ -269,6 +269,21 @@ class DownloadFileResult(BaseModel):
 
 
 # ============================================================================
+# Workspace path error
+# ============================================================================
+
+
+class WorkspacePathError(ValueError):
+    """Raised when a virtual path falls outside the workspace root.
+
+    Each backend defines a ``workspace_root`` (default ``"/workspace"``)
+    that serves as the only valid anchor for file operations.  Any path
+    outside this prefix is rejected so the AI never perceives the virtual
+    filesystem as a real system root.
+    """
+
+
+# ============================================================================
 # Protocol
 # ============================================================================
 
@@ -292,7 +307,21 @@ class BackendProtocol(abc.ABC):
     and ``download_files()`` that delegate to the core operations —
     subclasses may override these for better performance.
 
-    All paths are absolute and start with ``"/"``.
+    All paths are absolute and start with the :attr:`workspace_root`
+    (default ``"/workspace"``).  Paths outside this prefix are rejected.
+    """
+
+    # ------------------------------------------------------------------
+    # Workspace root
+    # ------------------------------------------------------------------
+
+    workspace_root: str = "/workspace"
+    """The virtual path prefix that serves as the root of the workspace.
+
+    All file operations must target paths under this prefix (e.g.
+    ``"/workspace/src/main.py"``).  Paths outside are rejected with
+    :class:`WorkspacePathError` so the AI never treats the virtual
+    filesystem as a real system root.
     """
 
     # ------------------------------------------------------------------
@@ -463,14 +492,14 @@ class BackendProtocol(abc.ABC):
     def grep(
         self,
         pattern: str,
-        path: str = "/",
+        path: str = "/workspace",
         glob: str | None = None,
     ) -> GrepResult:
         """Search for a literal substring in files under *path*."""
         ...
 
     @abc.abstractmethod
-    def glob(self, pattern: str, path: str = "/") -> GlobResult:
+    def glob(self, pattern: str, path: str = "/workspace") -> GlobResult:
         """Find files matching a glob pattern under *path*."""
         ...
 
@@ -522,13 +551,13 @@ class BackendProtocol(abc.ABC):
     async def agrep(
         self,
         pattern: str,
-        path: str = "/",
+        path: str = "/workspace",
         glob: str | None = None,
     ) -> GrepResult:
         """Async: Search for a literal substring in files under *path*."""
         return await asyncio.to_thread(self.grep, pattern, path, glob)
 
-    async def aglob(self, pattern: str, path: str = "/") -> GlobResult:
+    async def aglob(self, pattern: str, path: str = "/workspace") -> GlobResult:
         """Async: Find files matching a glob pattern under *path*."""
         return await asyncio.to_thread(self.glob, pattern, path)
 
