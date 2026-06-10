@@ -6,7 +6,7 @@
 
 ## 核心特性
 
-- **多后端文件系统** — `StateBackend`(内存)、`LocalBackend`(本地磁盘)、`SshBackend`(远程SSH)、`TempWorkspaceBackend`(混合路由)，统一通过 `BackendProtocol` 抽象
+- **多后端文件系统** — `StateBackend`(内存)、`LocalBackend`(本地磁盘)、`SshBackend`(远程SSH)、`HybridWorkspaceBackend`(混合路由)，统一通过 `BackendProtocol` 抽象
 - **子代理系统** — 同步/异步子代理，支持并行调度、流式事件、隔离上下文窗口
 - **对话摘要** — 自动压缩长对话历史，防止上下文窗口溢出，支持链式摘要与后端持久化
 - **任务规划** — `MamboPlanMiddleware` 提供结构化 TODO 列表，与摘要系统深度集成

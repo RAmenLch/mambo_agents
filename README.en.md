@@ -6,7 +6,7 @@
 
 ## Key Features
 
-- **Multi-backend Filesystem** — `StateBackend` (in-memory), `LocalBackend` (local disk), `SshBackend` (remote SSH), `TempWorkspaceBackend` (hybrid routing), unified through `BackendProtocol`
+- **Multi-backend Filesystem** — `StateBackend` (in-memory), `LocalBackend` (local disk), `SshBackend` (remote SSH), `HybridWorkspaceBackend` (hybrid routing), unified through `BackendProtocol`
 - **Sub-agent System** — sync/async sub-agents with parallel scheduling, streaming events, and isolated context windows
 - **Conversation Summarization** — automatic long-history compaction with chained summaries and optional backend persistence
 - **Task Planning** — `MamboPlanMiddleware` provides structured TODO lists, deeply integrated with the summarization system

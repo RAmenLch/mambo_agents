@@ -324,27 +324,53 @@ backend = SshBackend(
 
 **Performance strategy:** Batch operations (`grep`, `glob`, `edit`, `tree`) execute remotely to avoid per-file SFTP round-trips. `edit` completes find-and-replace in a single `python3 -c` invocation on the remote side.
 
-### 5.5 TempWorkspaceBackend — Dual-backend Routing
+### 5.5 HybridWorkspaceBackend — Multi-backend Routing
 
-Routes `/.mambo/` paths to a `StateBackend` (virtual in-memory), and everything else to the delegate backend.
+One real backend + N virtual workspaces, all routed under `/.mambo/`.
+Each virtual workspace is backed by an independent `StateBackend` and only supports core protocol tools.
 
 ```python
-from mambo_agents.backends.temp_workspace import TempWorkspaceBackend
+from mambo_agents.backends.hybrid_workspace import HybridWorkspaceBackend
 from mambo_agents.backends.local import LocalBackend
+from mambo_agents import StateBackend
 
-backend = TempWorkspaceBackend(
-    backend=LocalBackend(root_dir="/tmp/project"),
+# Simplest: auto-create /.mambo/ default StateBackend
+backend = HybridWorkspaceBackend(
+    real_backend=LocalBackend(root_dir="/tmp/project"),
+)
+
+# Multiple virtual workspaces
+backend = HybridWorkspaceBackend(
+    real_backend=LocalBackend(root_dir="/tmp/project"),
+    virtual_workspaces={
+        "skills": StateBackend(initial_files={"/python.md": "..."}),
+        "cache": StateBackend(),
+    },
+)
+
+# Override default /.mambo/
+backend = HybridWorkspaceBackend(
+    real_backend=LocalBackend(root_dir="/tmp/project"),
+    virtual_workspaces={
+        ".": StateBackend(initial_files={"/config.yml": "..."}),
+    },
 )
 ```
+
+**Path routing rules:**
+- `/.mambo/skills/xxx` → "skills" virtual workspace (prefix stripped, passes `/xxx`)
+- `/.mambo/xxx` → default StateBackend (prefix stripped, passes `/xxx`)
+- Everything else → real backend
 
 **Use cases:**
 - Middleware internal storage (large result eviction, conversation history dumps)
 - Agent scratch files
 - Sub-agent communication files
+- Independent isolated spaces for multiple skills/modules
 
 ### 5.6 Backend Comparison
 
-| Feature | StateBackend | LocalBackend | SshBackend | TempWorkspaceBackend |
+| Feature | StateBackend | LocalBackend | SshBackend | HybridWorkspaceBackend |
 |---------|:---:|:---:|:---:|:---:|
 | Storage Location | Memory | Local Disk | Remote Server | Hybrid |
 | Checkpoint Support | Automatic | Manual | Manual | Automatic (/.mambo/) |
@@ -824,7 +850,7 @@ from mambo_agents import (
     # Backend
     BackendProtocol,
     StateBackend,
-    TempWorkspaceBackend,
+    HybridWorkspaceBackend,
     FileData,
     FilesystemState,
 

@@ -310,7 +310,6 @@ class BackendProtocol(abc.ABC):
     All paths are absolute and start with the :attr:`workspace_root`
     (default ``"/workspace"``).  Paths outside this prefix are rejected.
     """
-
     # ------------------------------------------------------------------
     # Workspace root
     # ------------------------------------------------------------------
@@ -628,4 +627,63 @@ class BackendProtocol(abc.ABC):
         return await asyncio.to_thread(self.download_files, paths)
 
 
+# ============================================================================
+# ThreadAwareWorkspace — thread/session-aware backends
+# ============================================================================
+
+
+class ThreadAwareWorkspace(BackendProtocol, abc.ABC):
+    """Protocol for backends aware of LangGraph thread/session context.
+
+    Backends implementing this protocol need access to a *thread_id* for
+    ``upload_files()`` and ``download_files()`` so they can correctly
+    isolate state across concurrent sessions (e.g. multiple graph
+    execution threads).
+
+    Concrete implementors:
+
+    - :class:`~mambo_agents.backends.state.StateBackend` — files live in
+      per-thread Pregel state channels.
+    - :class:`~mambo_agents.backends.hybrid_workspace.HybridWorkspaceBackend`
+      — routes bulk operations to backends that may be thread-aware.
+
+    Router backends (like ``HybridWorkspaceBackend``) can check
+    ``isinstance(target, ThreadAwareWorkspace)`` to decide whether
+    ``thread_id`` should be forwarded, without coupling to a concrete
+    implementation.
+    """
+
+    @abc.abstractmethod
+    def upload_files(
+        self,
+        files: list[tuple[str, bytes]],
+        *,
+        thread_id: str | None = None,
+    ) -> list[UploadFileResult]:
+        """Upload multiple files with optional thread/session context.
+
+        Parameters:
+            files: List of ``(path, raw_bytes)`` tuples.
+            thread_id: Thread/session identifier.  Required by backends
+                that isolate state per thread (e.g. StateBackend outside
+                graph context); optional for simple backends.
+        """
+        ...
+
+    @abc.abstractmethod
+    def download_files(
+        self,
+        paths: list[str],
+        *,
+        thread_id: str | None = None,
+    ) -> list[DownloadFileResult]:
+        """Download multiple files with optional thread/session context.
+
+        Parameters:
+            paths: List of absolute file paths to download.
+            thread_id: Thread/session identifier.  Required by backends
+                that isolate state per thread (e.g. StateBackend outside
+                graph context); optional for simple backends.
+        """
+        ...
 

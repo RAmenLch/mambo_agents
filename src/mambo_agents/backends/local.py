@@ -293,8 +293,10 @@ class LocalBackend(BackendProtocol):
         except WorkspacePathError as e:
             return LsResult(error=str(e))
         try:
-            if not resolved.exists() or not resolved.is_dir():
-                return LsResult(error=f"Directory '{path}' not found")
+            if not resolved.exists():
+                return LsResult(error=f"Path '{path}' not found")
+            if not resolved.is_dir():
+                return LsResult(error=f"'{path}' is a file, not a directory")
         except OSError as e:
             return LsResult(error=f"Cannot access '{path}': {e}")
 
@@ -427,6 +429,13 @@ class LocalBackend(BackendProtocol):
             resolved = self._resolve(file_path)
         except WorkspacePathError as e:
             return WriteResult(error=str(e))
+        try:
+            if resolved.is_dir():
+                return WriteResult(
+                    error=f"'{file_path}' is a directory, cannot write to it"
+                )
+        except OSError as e:
+            return WriteResult(error=f"Error accessing '{file_path}': {e}")
         if resolved.exists() and not overwrite:
             return WriteResult(
                 error=(
@@ -474,6 +483,10 @@ class LocalBackend(BackendProtocol):
                         f"Cannot edit '{file_path}': file not found. "
                         "To create a new file, use write()."
                     ),
+                )
+            if resolved.is_dir():
+                return EditResult(
+                    error=f"'{file_path}' is a directory, cannot edit it"
                 )
         except OSError as e:
             return EditResult(error=f"Error accessing '{file_path}': {e}")
@@ -546,11 +559,12 @@ class LocalBackend(BackendProtocol):
         except OSError as e:
             return GrepResult(error=f"Error accessing '{path}': {e}")
 
-        search_dir = resolved if resolved.is_dir() else resolved.parent
+        is_dir = resolved.is_dir()
         wr = self.workspace_root
 
-        # 1) Try ripgrep (orders of magnitude faster on large trees)
-        results = self._ripgrep_grep(pattern, search_dir, glob)
+        # 1) Try ripgrep (handles files and dirs equally; skip glob filter for files)
+        rg_glob = glob if is_dir else None
+        results = self._ripgrep_grep(pattern, resolved, rg_glob)
         if results is not None:
             # ripgrep paths are physical → convert to virtual
             matches: list[GrepMatch] = []
@@ -571,6 +585,20 @@ class LocalBackend(BackendProtocol):
         skipped: int = 0
         regex = re.compile(re.escape(pattern))
 
+        if not is_dir:
+            # Single-file search
+            try:
+                lines = resolved.read_text(encoding="utf-8").split("\n")
+            except (UnicodeDecodeError, OSError):
+                return GrepResult(matches=[])
+            for li, line in enumerate(lines, start=1):
+                if regex.search(line):
+                    rel = str(resolved.relative_to(self._cwd)).replace("\\", "/")
+                    virt_path = f"{wr}/{rel}"
+                    matches.append(GrepMatch(path=virt_path, line=li, text=line))
+            return GrepResult(matches=matches)
+
+        search_dir = resolved
         try:
             for fp in search_dir.rglob("*"):
                 try:
@@ -679,8 +707,10 @@ class LocalBackend(BackendProtocol):
             return GlobResult(error=str(e))
 
         try:
-            if not resolved.exists() or not resolved.is_dir():
+            if not resolved.exists():
                 return GlobResult(error=f"Path '{path}' not found")
+            if not resolved.is_dir():
+                return GlobResult(error=f"'{path}' is a file, not a directory")
         except OSError as e:
             return GlobResult(error=f"Error accessing '{path}': {e}")
 

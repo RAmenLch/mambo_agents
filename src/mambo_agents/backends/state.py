@@ -21,7 +21,6 @@ from langgraph.config import get_config
 from pydantic import Field, create_model
 
 from mambo_agents.backends.protocol import (
-    BackendProtocol,
     DownloadFileResult,
     EditResult,
     FileInfo,
@@ -31,6 +30,7 @@ from mambo_agents.backends.protocol import (
     LsResult,
     ReadResult,
     ReadSummarizer,
+    ThreadAwareWorkspace,
     UploadFileResult,
     WriteResult,
     _get_file_type,
@@ -50,7 +50,7 @@ from mambo_agents.backends.utils import (
 # ---------------------------------------------------------------------------
 
 
-class StateBackend(BackendProtocol):
+class StateBackend(ThreadAwareWorkspace):
     """File storage backed by a LangGraph Pregel state channel.
 
     Files live in the ``files`` field of ``FilesystemState``, which is
@@ -329,10 +329,14 @@ class StateBackend(BackendProtocol):
 
     def ls(self, path: str) -> LsResult:
         normalized = path.rstrip("/") + "/" if path != "/" else "/"
-        infos: list[FileInfo] = []
-        subdirs: set[str] = set()
 
         files = self._read_files()
+        # Check if path itself is a file, not a directory
+        if path.rstrip("/") in files:
+            return LsResult(error=f"'{path}' is a file, not a directory")
+
+        infos: list[FileInfo] = []
+        subdirs: set[str] = set()
         for fpath, fd in files.items():
             if not fpath.startswith(normalized):
                 continue
@@ -398,6 +402,13 @@ class StateBackend(BackendProtocol):
         self, file_path: str, content: str, overwrite: bool = False,
     ) -> WriteResult:
         files = self._read_files()
+        # Check if file_path is a "directory" (contains child files)
+        prefix = file_path.rstrip("/") + "/"
+        for fpath in files:
+            if fpath.startswith(prefix):
+                return WriteResult(
+                    error=f"'{file_path}' is a directory, cannot write to it"
+                )
         if file_path in files and not overwrite:
             return WriteResult(
                 error=(
@@ -420,6 +431,13 @@ class StateBackend(BackendProtocol):
         replace_all: bool = False,
     ) -> EditResult:
         files = self._read_files()
+        # Check if file_path is a "directory" (contains child files)
+        prefix = file_path.rstrip("/") + "/"
+        for fpath in files:
+            if fpath.startswith(prefix):
+                return EditResult(
+                    error=f"'{file_path}' is a directory, cannot edit it"
+                )
         existing_fd = files.get(file_path)
         if existing_fd is None:
             return EditResult(

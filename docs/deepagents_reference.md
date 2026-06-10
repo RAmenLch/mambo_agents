@@ -23,7 +23,7 @@
 
 ## 2. 优化方向与取舍
 
-以下差异不代表 deepagents 的设计是"错误"的，而是两个项目在**不同场景和目标**下的取舍。deepagents 面向通用 Agent 开发，追求广泛的模型兼容性和生态整合；Mambo Agents 则更侧重多后端透明操作、安全审查和实用化的工具链。
+以下差异不代表 deepagents 的设计是"错误"的，而是两个项目在**不同场景和目标**下的取舍。
 
 ### 2.1 多后端与命令执行
 
@@ -44,19 +44,17 @@
 | **工具扩展性** | `FilesystemMiddleware`（六核心工具 + 后端额外工具 + 多模态 read） | ✅ `BackendToolsMiddleware`（六核心工具 + 后端额外工具自动注入）<br>• `include_line_numbers` 参数：Mambo 的 `read` 默认不返回行号，模型可自行决定在需要定位行号时传 `True`（deepagents 总是无条件加行号，不可关闭）<br>• `build_tool_descriptions()` 提取所有工具描述映射，供 `AutoSecurityReviewMiddleware` 安全审查时理解工具用途 | 基础工具层面的差异化：`include_line_numbers` 的可控性减少了无关噪音；`build_tool_descriptions()` 使工具描述可被其他中间件消费 |
 | **大结果驱逐** | ✅ `FilesystemMiddleware` 内置驱逐（保存到 `/large_tool_results/`）<br>• 驱逐时机：`wrap_model_call`（预模型调用时批量处理消息历史） | ✅ `BackendToolsMiddleware` 驱逐（保存到 `/.mambo/large_tool_results/`）<br>• 驱逐时机：`wrap_tool_call`（工具返回结果后即时拦截，而非等到下一轮模型调用） | 双端均实现大结果驱逐（包括多模态块保留和 Command 多消息场景），核心差异仅在于驱逐时机：Mambo 在工具返回后立即生效，deepagents 在模型调用前批量处理 |
 | **大文件读取限制与摘要** | ✅ `read_file` 内置 `_truncate()`：超过字符阈值后附加静态 `READ_FILE_TRUNCATION_MSG`（固定模板消息，无文件类型区分能力） | ✅ `BackendProtocol` 内置 `max_read_chars` + 可插拔 `ReadSummarizer` 回调<br>• 回调签名 `(file_path, content, max_chars) -> str`，可基于文件后缀（`.py`/`.json`/`.yaml` 等）生成差异化指导摘要<br>• 默认摘要器引导模型用 `offset`+`limit` 分段读取；用户注入自定义回调即可按文件类型定制策略<br>• 二进制/多模态文件永不截断<br>• 附赠 `read_summarizers` 子包，含 9 种预置摘要器（Python / JS / TS / Java / C / C++ / Go / Rust / Markdown / JSON），提取结构大纲 + 精确行号 | 两方均有字符级读取上限和截断提示；Mambo 的核心差异在于**可插拔回调**体系 — 将大文件内容替换为按文件类型定制的"指导性摘要"，帮助模型做出更正确的下一步决策，而非仅给出固定截断警告 |
-| **记忆系统** | ✅ `MemoryMiddleware`（AGENTS.md） | ❌ 未实现 | 当前阶段的"技能系统"已覆盖知识注入需求，未来评估是否独立 |
+| **记忆系统** | ✅ `MemoryMiddleware`（AGENTS.md） | ✅ `MamboMemoryMiddleware`（AGENTS.md） | Mambo 独立实现了记忆中间件：`before_agent` 通过 `backend.download_files` 加载 AGENTS.md 到 state，`wrap_model_call` 注入 `<agent_memory>` 系统提示；支持多 sources 合并加载，可选自定义 `format_prompt` 格式化回调 |
 | **Profile 系统** | ✅ `ProviderProfile` + `HarnessProfile`（模型/提供商调优） | ❌ 未实现 | Mambo 暂不聚焦模型级细粒度调优，由用户自行配置 |
 | **Anthropic 缓存** | ✅ `AnthropicPromptCachingMiddleware` | ❌ 未实现 | Mambo 暂不绑定特定提供商优化 |
 | **子代理对话透出** | 子代理结果通过 `ToolMessage` 返回 | ✅ 子代理通过 `Command` 返回<br>• `_return_command_with_state_update()` 将子代理的非排除状态键（如文件系统状态）透明传递回父代理<br>• 三级流式事件粒度（`messages`/`updates`/`values`），通过 `subagent_event` 自定义事件推送子代理内部执行过程<br>• 并行子代理通过 `tool_call_id` 区分各自的事件流 | 子代理不仅返回结果，还将其对话上下文中的状态信息抛回父代理，使父代理可以了解子代理执行期间创建/修改了哪些文件等上下文 |
 
 ### 2.3 架构设计取舍
 
-| 对比维度 | deepagents | Mambo Agents | 取舍说明 |
-|----------|------------|--------------|----------|
-| **类型安全** | 部分使用 TypedDict | ✅ 全链路 Pydantic 类型（无 Dict/Any 鸭子类型） | 严格类型控制是 Mambo 的核心编码规范 |
-| **临时工作区** | ❌ 无 | ✅ `TempWorkspaceBackend`（`/.mambo/` 路由到内存） | 为中间件内部文件存储和子代理通信提供隔离空间 |
-| **后端架构** | `CompositeBackend`（按路径前缀灵活路由到不同后端）<br>• 可实现 `/memories/` → `StoreBackend`、`/workspace/` → `FilesystemBackend` 等多后端混合<br>• 隐患：当 `execute()` 可用时，AI 可能直接 `cat /memories/...` 绕过路由层，导致行为与预期不一致 | ✅ `TempWorkspaceBackend`（简化双路由）<br>• 放弃了灵活的路径路由，仅保留 `/.mambo/` → `StateBackend`、其余 → delegate 的简洁模型<br>• System prompt 明确告知 AI `/.mambo/` 的语义（scratchpad、隔离文件、中间件内部文件），降低路径路由相关的幻觉<br>• 不存在路由层干扰，后端工具参数直接透传，灵活性更高 | deepagents 用灵活路由覆盖多后端混用场景；Mambo 选择用简洁路由 + 显式约定换取 AI 的可预测性 |
-| **插件发现** | ✅ `importlib.metadata` entry points（Profile 系统） | ❌ 未实现插件机制 | 当前版本聚焦核心功能，插件系统留待后续 |
+| 对比维度 | deepagents | Mambo Agents                                                                                                                                                                                                                                                                   | 取舍说明                                                                                                                                                                  |
+|----------|------------|--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|-----------------------------------------------------------------------------------------------------------------------------------------------------------------------|
+| **类型安全** | 部分使用 TypedDict | ✅ 全链路 Pydantic 类型（无 Dict/Any 鸭子类型）                                                                                                                                                                                                                                             | 严格类型控制是 Mambo 的核心编码规范                                                                                                                                                 |
+| **路由后端** | `CompositeBackend`（default + routes 字典，任意前缀 → 任意后端）<br>• 路由完全自由：`/memories/` → StoreBackend、`/cache/` → StateBackend 等任意组合<br>• `ls("/")` 透明聚合所有路由后端<br>• `execute()` 始终委托 default 后端，通过 `SandboxBackendProtocol` 类型判定 | `HybridWorkspaceBackend`（1 真实 + N 虚拟，统一 `/.mambo/` 前缀）<br><br>**硬性约束：**<br>• 虚拟 workspace 前缀固定 `/.mambo/`，不可自定义为其他路由路径<br>• 虚拟 workspace 仅开放 6 核心文件工具 <br>• System prompt 显式告知 AI 以上约束<br><br>**放宽之处：**<br>• 内置 `copy` 工具，支持跨后端（虚拟 ↔ 真实）的单文件搬运<br>• 支持真实后端灵活的提供工具,而不仅限于execute | `CompositeBackend` 的任意前缀路由提供了最大灵活度，但 AI 可能会做出 `execute`（如 `cat /memories/...`）绕过路由层的决定,导致比较严重的幻觉；`HybridWorkspaceBackend` 用固定前缀 + 显式工具白名单的提示词限制AI操作，并且放宽对真实后端的tools限制 |
 
 ---
 
@@ -72,7 +70,7 @@
 | 内存存储 | `StateBackend` | `StateBackend`（reconstructed） |
 | 本地 execute | `LocalShellBackend`（`FilesystemBackend` + `SandboxBackendProtocol`，two layers of parent classes） | `LocalBackend`（single class with built-in `execute()`，`tree`，`delete`） |
 | 远程 execute | `LangSmithSandbox`（cloud container service，all file operation are delegated to `execute()`） | `SshBackend`（native SSH，`execute()` via SSH channel，file operation has native implementations） |
-| 路径路由 | `CompositeBackend`（灵活多后端路由，任意前缀 → 任意后端；`execute()` 可能绕过路由层） | `TempWorkspaceBackend`（简化双路由：`/.mambo/` → 内存，其余 → delegate；System prompt 显式告知 AI workspace 语义） |
+| 路径路由 | `CompositeBackend`（灵活多后端路由，任意前缀 → 任意后端；`execute()` 可能绕过路由层） | `HybridWorkspaceBackend`（1 真实 + N 虚拟路由：`/.mambo/<name>/` → 内存，其余 → 真实后端；System prompt 显式告知 AI workspace 语义） |
 | 跨会话存储 | `StoreBackend` | ❌ |
 
 ### 3.2 中间件（Middleware）
@@ -89,7 +87,7 @@
 | 工具消息重排序 | ❌ | ✅ `ReorderToolMessagesMiddleware` |
 | 安全审查 | `HumanInTheLoopMiddleware` | ✅ `AutoSecurityReviewMiddleware`（AI 预审 + 人工审批） |
 | 任务规划 | `TodoListMiddleware` | ✅ `MamboPlanMiddleware`（结构化 + 摘要集成） |
-| 记忆加载 | `MemoryMiddleware` | ❌ |
+| 记忆加载 | `MemoryMiddleware` | ✅ `MamboMemoryMiddleware` |
 | 工具排除 | `_ToolExclusionMiddleware` | ❌ |
 | Anthropic 缓存 | `AnthropicPromptCachingMiddleware` | ❌ |
 

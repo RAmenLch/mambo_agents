@@ -146,6 +146,7 @@ def create_mambo_agent(
     middleware: Sequence[AgentMiddleware] | None = None,
     summarization: SummarizationConfig | None = None,
     skills: Sequence[SkillSource] | None = None,
+    memory_sources: list[str] | None = None,
     tools: Sequence[BaseTool] | None = None,
     interrupt_on: dict[str, bool | InterruptOnConfig] | None = None,
     security_review: SecurityReviewConfig | None = None,
@@ -173,6 +174,7 @@ def create_mambo_agent(
 | `include_general_purpose` | `bool` | `False` | 是否添加通用子代理 |
 | `async_subagents` | `list` | `None` | 异步子代理列表 |
 | `skills` | `list` | `None` | 技能来源路径 |
+| `memory_sources` | `list` | `None` | 记忆文件路径（AGENTS.md 列表）|
 | `tools` | `list` | `None` | 额外工具 |
 | `interrupt_on` | `dict` | `None` | 工具审批配置 |
 | `security_review` | `SecurityReviewConfig` | `None` | AI 安全预审配置 |
@@ -324,27 +326,53 @@ backend = SshBackend(
 
 **性能策略：** 批量操作（`grep`、`glob`、`edit`、`tree`）在远程执行，避免逐文件 SFTP 往返。`edit` 通过远程 `python3 -c` 一次性完成查找替换。
 
-### 5.5 TempWorkspaceBackend — 双后端路由
+### 5.5 HybridWorkspaceBackend — 多后端路由
 
-将 `/.mambo/` 路径路由到 `StateBackend`（虚拟机内），其余路径路由到真实后端。
+真实后端 + N 个虚拟 workspace，统一在 `/.mambo/` 下路由。
+每个虚拟 workspace 由独立的 `StateBackend` 驱动，只支持核心 protocol 工具。
 
 ```python
-from mambo_agents.backends.temp_workspace import TempWorkspaceBackend
+from mambo_agents.backends.hybrid_workspace import HybridWorkspaceBackend
 from mambo_agents.backends.local import LocalBackend
+from mambo_agents import StateBackend
 
-backend = TempWorkspaceBackend(
-    backend=LocalBackend(root_dir="/tmp/project"),
+# 最简用法：自动创建 /.mambo/ 默认 StateBackend
+backend = HybridWorkspaceBackend(
+    real_backend=LocalBackend(root_dir="/tmp/project"),
+)
+
+# 多虚拟 workspace
+backend = HybridWorkspaceBackend(
+    real_backend=LocalBackend(root_dir="/tmp/project"),
+    virtual_workspaces={
+        "skills": StateBackend(initial_files={"/python.md": "..."}),
+        "cache": StateBackend(),
+    },
+)
+
+# 覆盖默认 /.mambo/
+backend = HybridWorkspaceBackend(
+    real_backend=LocalBackend(root_dir="/tmp/project"),
+    virtual_workspaces={
+        ".": StateBackend(initial_files={"/config.yml": "..."}),
+    },
 )
 ```
+
+**路径路由规则：**
+- `/.mambo/skills/xxx` → "skills" 虚拟 workspace（strip 前缀后传 `/xxx`）
+- `/.mambo/xxx` → 默认 StateBackend（strip 前缀后传 `/xxx`）
+- 其他路径 → 真实后端
 
 **用途：**
 - 中间件内部存储（大结果驱逐、对话历史转储）
 - Agent 草稿文件
 - 子代理通信文件
+- 多技能/多模块的独立隔离空间
 
 ### 5.6 后端对比
 
-| 特性 | StateBackend | LocalBackend | SshBackend | TempWorkspaceBackend |
+| 特性 | StateBackend | LocalBackend | SshBackend | HybridWorkspaceBackend |
 |------|:---:|:---:|:---:|:---:|
 | 存储位置 | 内存 | 本地磁盘 | 远程服务器 | 混合 |
 | 检查点支持 | 自动 | 手动 | 手动 | 自动(/.mambo/) |
@@ -395,13 +423,14 @@ backend = LocalBackend(summarizer=python_summarizer())
 ```
 1. BackendToolsMiddleware     ← 注册文件系统工具（始终启用）
 2. [SkillsMiddleware]         ← 技能加载（skills 非 None 时）
-3. [MamboSummarizationMiddleware]  ← 对话摘要（summarization 非 None 时）
-4. [用户自定义 middleware]      ← 通过 middleware 参数传入
-5. [SubAgentMiddleware]        ← 同步子代理
-6. [AsyncSubAgentMiddleware]   ← 异步子代理
-7. [AutoSecurityReviewMiddleware | HumanInTheLoopMiddleware]  ← 安全审查
-8. PatchToolCallsMiddleware    ← 修复悬空工具调用（始终启用）
-9. ReorderToolMessagesMiddleware ← 重排工具消息（始终启用）
+3. [MamboMemoryMiddleware]    ← 记忆加载（memory_sources 非 None 时）
+4. [MamboSummarizationMiddleware]  ← 对话摘要（summarization 非 None 时）
+5. [用户自定义 middleware]      ← 通过 middleware 参数传入
+6. [SubAgentMiddleware]        ← 同步子代理
+7. [AsyncSubAgentMiddleware]   ← 异步子代理
+8. [AutoSecurityReviewMiddleware | HumanInTheLoopMiddleware]  ← 安全审查
+9. PatchToolCallsMiddleware    ← 修复悬空工具调用（始终启用）
+10. ReorderToolMessagesMiddleware ← 重排工具消息（始终启用）
 ```
 
 ### 6.2 BackendToolsMiddleware
@@ -515,7 +544,66 @@ license: MIT
 
 多来源加载：后加载的技能覆盖同名的先前技能（后胜出）。
 
-### 6.6 AutoSecurityReviewMiddleware
+### 6.6 MamboMemoryMiddleware
+
+**功能：** 记忆系统 — 从 AGENTS.md 文件加载持久上下文，并指导 AI 在交互中**学习回写**新知识。与技能（按需加载）不同，记忆始终加载到系统提示词中，提供跨轮次的持久上下文。
+
+```python
+agent = create_mambo_agent(
+    "gpt-4o",
+    memory_sources=["/.mambo/memory/AGENTS.md"],
+)
+```
+
+**工作流程：**
+
+```
+before_agent → backend.download_files(sources) → memory_contents
+                                                    ↓
+wrap_model_call → modify_request → 注入 <agent_memory> 到系统提示
+```
+
+**记忆内容格式（AGENTS.md）：**
+
+AGENTS.md 是标准 Markdown 文件，无必须结构。常见内容：
+- 项目概述与架构说明
+- 构建/测试命令
+- 代码风格指南
+- 用户偏好与约定
+
+**AI 自主学习：**
+
+记忆提示词会指导 AI 在以下情况下用 `edit`/`write` 回写 AGENTS.md：
+- 用户明确要求记住某事
+- 用户提供可复用的上下文（编码风格、约定、工作流）
+- 用户对 AI 工作提出了反馈和纠正
+- **不**记录：临时信息、一次性任务、闲聊、凭据
+
+**自定义格式化：**
+
+```python
+from mambo_agents.middleware.memory import MamboMemoryMiddleware, MemoryFormatHook
+
+def my_formatter(contents: dict[str, str]) -> str:
+    # 自定义记忆内容如何注入系统提示
+    parts = []
+    for path, text in contents.items():
+        parts.append(f"## Source: {path}\n{text}")
+    return "\n---\n".join(parts)
+
+agent = create_mambo_agent(
+    "gpt-4o",
+    middleware=[
+        MamboMemoryMiddleware(
+            backend=StateBackend(),
+            sources=["/.mambo/memory/AGENTS.md"],
+            format_prompt=my_formatter,
+        ),
+    ],
+)
+```
+
+### 6.7 AutoSecurityReviewMiddleware
 
 **功能：** 在实际执行工具（或暂停人工审批）之前，用廉价模型审查工具调用的安全性。
 
@@ -554,7 +642,7 @@ agent = create_mambo_agent(
                         → 高风险：暂停 → 人工审批
 ```
 
-### 6.7 PatchToolCallsMiddleware & ReorderToolMessagesMiddleware
+### 6.8 PatchToolCallsMiddleware & ReorderToolMessagesMiddleware
 
 这两个中间件始终启用（无需配置）：
 
@@ -820,7 +908,7 @@ from mambo_agents import (
     # 后端
     BackendProtocol,
     StateBackend,
-    TempWorkspaceBackend,
+    HybridWorkspaceBackend,
     FileData,
     FilesystemState,
 
@@ -849,6 +937,10 @@ from mambo_agents import (
     SkillsMiddleware,
     SkillMetadata,
     SkillSource,
+
+    # 记忆
+    MamboMemoryMiddleware,
+    MemoryFormatHook,
 )
 ```
 

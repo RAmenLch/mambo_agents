@@ -150,6 +150,7 @@ class SshBackend(BackendProtocol):
         self._sftp: paramiko.SFTPClient | None = None
         self._remote_root: str = ""  # resolved absolute path, set by _connect()
         self._has_python3: bool = False  # detected in _connect()
+        self._async_lock: asyncio.Lock = asyncio.Lock()
 
         self._connect()
 
@@ -358,9 +359,12 @@ class SshBackend(BackendProtocol):
         except WorkspacePathError as e:
             return LsResult(error=str(e))
         try:
+            st_mode = self._sftp.stat(remote).st_mode
+            if not self._attr_is_dir_maybe(st_mode):
+                return LsResult(error=f"'{path}' is a file, not a directory")
             attrs = self._sftp.listdir_attr(remote)
         except FileNotFoundError:
-            return LsResult(error=f"Directory '{path}' not found")
+            return LsResult(error=f"Path '{path}' not found")
         except OSError as e:
             return LsResult(error=f"Cannot access '{path}': {e}")
 
@@ -505,6 +509,16 @@ class SshBackend(BackendProtocol):
         except WorkspacePathError as e:
             return WriteResult(error=str(e))
 
+        # Check if it's a directory
+        try:
+            st_mode = self._sftp.stat(remote).st_mode
+            if self._attr_is_dir_maybe(st_mode):
+                return WriteResult(
+                    error=f"'{file_path}' is a directory, cannot write to it"
+                )
+        except FileNotFoundError:
+            pass  # Doesn't exist yet – fine for write
+
         # Check existence
         try:
             self._sftp.stat(remote)
@@ -574,9 +588,13 @@ class SshBackend(BackendProtocol):
         except WorkspacePathError as e:
             return EditResult(error=str(e))
 
-        # Check file exists
+        # Check if path exists and is not a directory
         try:
-            self._sftp.stat(remote)
+            st_mode = self._sftp.stat(remote).st_mode
+            if self._attr_is_dir_maybe(st_mode):
+                return EditResult(
+                    error=f"'{file_path}' is a directory, cannot edit it"
+                )
         except FileNotFoundError:
             return EditResult(
                 error=(
@@ -973,6 +991,14 @@ class SshBackend(BackendProtocol):
             remote = self._resolve(path)
         except WorkspacePathError as e:
             return GlobResult(error=str(e))
+
+        # Check that path is a directory
+        try:
+            st_mode = self._sftp.stat(remote).st_mode
+            if not self._attr_is_dir_maybe(st_mode):
+                return GlobResult(error=f"'{path}' is a file, not a directory")
+        except FileNotFoundError:
+            return GlobResult(error=f"Path '{path}' not found")
 
         if self._has_python3:
             return self._glob_python(pattern, remote)
@@ -1429,14 +1455,68 @@ class SshBackend(BackendProtocol):
         return output
 
     # ------------------------------------------------------------------
-    # Async variants
+    # Async variants — all serialized via _async_lock to prevent
+    # paramiko Transport deadlocks when ToolNode runs tools in parallel.
     # ------------------------------------------------------------------
 
+    async def als(self, path: str) -> LsResult:
+        async with self._async_lock:
+            return await asyncio.to_thread(self.ls, path)
+
+    async def aread(
+        self,
+        file_path: str,
+        offset: int = 0,
+        limit: int = 2000,
+        include_line_numbers: bool = False,
+        *,
+        _apply_max_chars: bool = True,
+    ) -> ReadResult:
+        async with self._async_lock:
+            return await asyncio.to_thread(
+                self.read, file_path, offset, limit, include_line_numbers,
+                _apply_max_chars=_apply_max_chars,
+            )
+
+    async def awrite(
+        self, file_path: str, content: str, overwrite: bool = False,
+    ) -> WriteResult:
+        async with self._async_lock:
+            return await asyncio.to_thread(self.write, file_path, content, overwrite)
+
+    async def aedit(
+        self,
+        file_path: str,
+        old_str: str,
+        new_str: str,
+        *,
+        replace_all: bool = False,
+    ) -> EditResult:
+        async with self._async_lock:
+            return await asyncio.to_thread(
+                self.edit, file_path, old_str, new_str, replace_all=replace_all,
+            )
+
+    async def agrep(
+        self,
+        pattern: str,
+        path: str = "/workspace",
+        glob: str | None = None,
+    ) -> GrepResult:
+        async with self._async_lock:
+            return await asyncio.to_thread(self.grep, pattern, path, glob)
+
+    async def aglob(self, pattern: str, path: str = "/workspace") -> GlobResult:
+        async with self._async_lock:
+            return await asyncio.to_thread(self.glob, pattern, path)
+
     async def atree(self, path: str = "/", depth: int = 3) -> str:
-        return await asyncio.to_thread(self.tree, path, depth)
+        async with self._async_lock:
+            return await asyncio.to_thread(self.tree, path, depth)
 
     async def adelete(self, path: str) -> str:
-        return await asyncio.to_thread(self.delete, path)
+        async with self._async_lock:
+            return await asyncio.to_thread(self.delete, path)
 
     async def aexecute(
         self,
@@ -1444,7 +1524,8 @@ class SshBackend(BackendProtocol):
         *,
         timeout: int | None = None,
     ) -> str:
-        return await asyncio.to_thread(self.execute, command, timeout=timeout)
+        async with self._async_lock:
+            return await asyncio.to_thread(self.execute, command, timeout=timeout)
 
     # ------------------------------------------------------------------
     # Developer API — bulk upload / download

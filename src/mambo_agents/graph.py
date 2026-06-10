@@ -29,6 +29,7 @@ from mambo_agents.middleware.backend_tools import (
     BackendToolsMiddleware,
     build_tool_descriptions,
 )
+from mambo_agents.middleware.memory import MamboMemoryMiddleware
 from mambo_agents.middleware.patch_tool_calls import PatchToolCallsMiddleware
 from mambo_agents.middleware.reorder_tool_messages import ReorderToolMessagesMiddleware
 from mambo_agents.middleware.security_review import (
@@ -86,6 +87,7 @@ def create_mambo_agent(
     middleware: Sequence[AgentMiddleware] | None = None,
     summarization: SummarizationConfig | None = None,
     skills: Sequence[SkillSource] | None = None,
+    memory_sources: list[str] | None = None,
     tools: Sequence[BaseTool] | None = None,
     interrupt_on: dict[str, bool | InterruptOnConfig] | None = None,
     security_review: SecurityReviewConfig | None = None,
@@ -147,6 +149,21 @@ def create_mambo_agent(
                 ]
 
             Default: ``None`` (skills disabled).
+        memory_sources: Optional list of AGENTS.md file paths to load
+            as agent memory.  When provided, a ``MamboMemoryMiddleware``
+            is added that loads persistent context from these files and
+            injects it into the system prompt.  The agent is also
+            instructed to **write back** new learnings using the ``edit``
+            / ``write`` tools.
+
+            Unlike skills (on-demand), memory is always loaded and
+            provides persistent, evolving context.
+
+            **Example**::
+
+                memory_sources=["/.mambo/memory/AGENTS.md"]
+
+            Default: ``None`` (memory disabled).
         tools: Additional (non-file-system) tools.
         interrupt_on: Mapping of ``tool_name → bool or InterruptOnConfig``.
             When set, adds human-in-the-loop so that calls to the specified
@@ -274,6 +291,15 @@ def create_mambo_agent(
             SkillsMiddleware(
                 backend=backend,
                 sources=skills,
+            )
+        )
+
+    # ---- Memory (opt-in) ---------------------------------------------------
+    if memory_sources is not None:
+        mw.append(
+            MamboMemoryMiddleware(
+                backend=backend,
+                sources=memory_sources,
             )
         )
 
