@@ -797,7 +797,6 @@ source = { editable = "." }
 dependencies = [
     { name = "deepagents" },
     { name = "langchain" },
-    { name = "langchain-openai" },
     { name = "langgraph" },
     { name = "paramiko" },
     { name = "tree-sitter" },
@@ -813,6 +812,7 @@ dependencies = [
 
 [package.dev-dependencies]
 dev = [
+    { name = "langchain-openai" },
     { name = "pytest" },
     { name = "pytest-asyncio" },
     { name = "pytest-xdist" },
@@ -820,10 +820,9 @@ dev = [
 
 [package.metadata]
 requires-dist = [
-    { name = "deepagents" },
-    { name = "langchain" },
-    { name = "langchain-openai" },
-    { name = "langgraph" },
+    { name = "deepagents", specifier = ">=0.5.7" },
+    { name = "langchain", specifier = ">=1.2" },
+    { name = "langgraph", specifier = ">=1.1" },
     { name = "paramiko", specifier = ">=3.0" },
     { name = "tree-sitter", specifier = ">=0.25" },
     { name = "tree-sitter-c", specifier = ">=0.24.2" },
@@ -838,6 +837,7 @@ requires-dist = [
 
 [package.metadata.requires-dev]
 dev = [
+    { name = "langchain-openai", specifier = ">=1.2" },
     { name = "pytest", specifier = ">=8.0" },
     { name = "pytest-asyncio", specifier = ">=0.24" },
     { name = "pytest-xdist", specifier = ">=3.8" },
