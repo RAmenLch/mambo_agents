@@ -2,22 +2,24 @@
 
 # Mambo Agents
 
-**AI Agent framework built on LangChain/LangGraph** — multi-backend filesystem, sub-agent parallel scheduling, conversation summarization, security review, skills system, and more, out of the box.  
-**基于 LangChain/LangGraph 的 AI Agent 框架** — 提供多后端文件系统、子代理并行调度、对话摘要、安全审查、技能系统等开箱即用的能力。  
-> 📖 **English** | [中文](README.cn.md)
+**基于 LangChain/LangGraph 的 AI Agent 框架** — 提供多后端文件系统、子代理并行调度、对话摘要、安全审查、技能系统等开箱即用的能力。
 
-> This project draws architectural inspiration from [deepagents](https://github.com/langchain-ai/deepagents), with independent refactoring and extensions. See [comparison with deepagents](docs/deepagents_reference.md).
+> 📖 [English](README.md) | **中文**
 
-## Key Features
+> 本项目参考了 [deepagents](https://github.com/langchain-ai/deepagents) 的架构设计，在其基础上进行了独立重构与扩展。详见 [与 deepagents 的对比](docs/deepagents_reference.cn.md)。
 
-- **Multi-backend Filesystem** — `StateBackend` (in-memory), `LocalBackend` (local disk), `SshBackend` (remote SSH), `HybridWorkspaceBackend` (hybrid routing), unified through `BackendProtocol`
-- **Sub-agent System** — sync/async sub-agents with parallel scheduling, streaming events, and isolated context windows
-- **Conversation Summarization** — automatic long-history compaction with chained summaries and optional backend persistence
-- **Task Planning** — `MamboPlanMiddleware` provides structured TODO lists, deeply integrated with the summarization system
-- **AI Security Review** — pre-approve tool calls with a cheap model, escalating only high-risk operations to human review
-- **Skills System** — progressive disclosure of skills, with multi-source overlay support
-- **Memory System** — persistent context loaded from `AGENTS.md`, with AI self-learning write-back
-## Quick Start
+
+
+## 核心特性
+
+- **多后端文件系统** — `StateBackend`(内存)、`LocalBackend`(本地磁盘)、`SshBackend`(远程SSH)、`HybridWorkspaceBackend`(混合路由)，统一通过 `BackendProtocol` 抽象
+- **子代理系统** — 同步/异步子代理，支持并行调度、流式事件、隔离上下文窗口
+- **对话摘要** — 自动压缩长对话历史，防止上下文窗口溢出，支持链式摘要与后端持久化
+- **任务规划** — `MamboPlanMiddleware` 提供结构化 TODO 列表，与摘要系统深度集成
+- **AI 安全审查** — 工具调用前用廉价模型预审，高风险操作才升级到人工审核
+- **技能系统** — 渐进式披露的技能加载，支持多层来源覆盖
+- **记忆系统** — 从 `AGENTS.md` 加载持久上下文，支持 AI 自主学习和回写
+## 快速开始
 
 ```bash
 pip install mambo-agents
@@ -32,10 +34,10 @@ agent = create_mambo_agent(
     backend=StateBackend(),
     include_general_purpose=True,
 )
-result = agent.invoke({"messages": [HumanMessage("Create a hello.py file")]})
+result = agent.invoke({"messages": [HumanMessage("创建一个 hello.py 文件")]})
 ```
 
-## Architecture
+## 架构
 
 ```
 ┌──────────────────────────────────────────────────────────┐
@@ -62,15 +64,17 @@ result = agent.invoke({"messages": [HumanMessage("Create a hello.py file")]})
 └──────────────────────────────────────────────────────────┘
 ```
 
-## Docs
+## 文档
 
-- [Detailed Usage Guide](docs/usage.md) — API reference, configuration, advanced usage
-- [Comparison with deepagents](docs/deepagents_reference.md) — architectural differences, feature mapping, design trade-offs
+| 中文 | English |
+|------|---------|
+| [详细使用文档](docs/usage.cn.md) | [Usage Guide](docs/usage.md) |
+| [与 deepagents 的对比](docs/deepagents_reference.cn.md) | [Comparison with deepagents](docs/deepagents_reference.md) |
 
-## Related Projects
+## 相关项目
 
-- [MamboChat](https://github.com/RAmenLch/mambochat) — Full-featured Web UI built on Mambo Agents
+- [MamboChat](https://github.com/RAmenLch/mambochat) — 基于 Mambo Agents 的完善功能 WebUI 项目
 
-## License
+## 许可证
 
 MIT License

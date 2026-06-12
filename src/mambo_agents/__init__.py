@@ -9,6 +9,10 @@ from mambo_agents.middleware.async_subagents import (
     AsyncSubAgentMiddleware,
     AsyncTaskData,
 )
+from mambo_agents.middleware.memory import (
+    MamboMemoryMiddleware,
+    MemoryFormatHook,
+)
 from mambo_agents.middleware.planning import (
     MamboPlanMiddleware,
     Plan,
@@ -40,8 +44,10 @@ __all__ = [
     "EventGranularity",
     "FileData",
     "FilesystemState",
+    "MamboMemoryMiddleware",
     "MamboPlanMiddleware",
     "MamboSummarizationMiddleware",
+    "MemoryFormatHook",
     "Plan",
     "SkillMetadata",
     "SkillSource",
