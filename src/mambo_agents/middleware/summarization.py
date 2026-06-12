@@ -9,8 +9,12 @@ Provides a lightweight, configurable summarization middleware that:
 - **Preserves previous summaries** — when chained summarization occurs,
   prior summary messages are extracted and injected into the prompt as
   non-negotiable historical context that the LLM **must** retain.
-- Protects the most recent **user message** from being summarized away
-  (a gap in the langchain base implementation).
+- Performs **local boundary alignment** so the cutoff never slices
+  through a user message.  The summary prompt's
+  ``## LATEST USER INTENT`` section (injected only when the preserved
+  zone contains no user messages) instructs the LLM to extract the
+  current sub-task, replacing the old aggressive user-message
+  retention strategy (which could block summarization entirely).
 - Is **opt-in** — not automatically enabled.
 - **Optional backend offload** — evicted messages are persisted to the
   configured backend at ``/conversation_history/{thread_id}.md`` before
@@ -106,7 +110,7 @@ You should structure your summary using the following sections. Each section act
 ## SESSION INTENT
 What is the user's primary goal or request? What overall task are you trying to accomplish? This should be concise but complete enough to understand the purpose of the entire session.
 
-## SUMMARY
+{latest_user_intent_section}## SUMMARY
 Extract and record all of the most important context from the conversation history. Include important choices, conclusions, or strategies determined during this conversation. Include the reasoning behind key decisions. Document any rejected options and why they were not pursued.
 
 ## ARTIFACTS
@@ -156,7 +160,7 @@ You should structure your summary using the following sections. Each section act
 ## SESSION INTENT
 What is the user's primary goal or request? What overall task are you trying to accomplish? This should be concise but complete enough to understand the purpose of the entire session. **Must incorporate intent from previous summaries if present.**
 
-## SUMMARY
+{latest_user_intent_section}## SUMMARY
 Extract and record all of the most important context from the conversation history. Include important choices, conclusions, or strategies determined during this conversation. Include the reasoning behind key decisions. Document any rejected options and why they were not pursued. **Must preserve all key facts, decisions, and context from previous summaries.**
 
 ## ARTIFACTS
@@ -173,6 +177,29 @@ Respond ONLY with the extracted context. Do not include any additional informati
 Messages to summarize:
 {messages}
 </messages>"""  # noqa: E501
+
+
+# ---------------------------------------------------------------------------
+# Conditional summarization prompt injection
+# ---------------------------------------------------------------------------
+
+_LATEST_USER_INTENT_SECTION = """\
+## LATEST USER INTENT
+What is the user's most recent specific request or sub-task? This is the immediate
+action the user is asking you to take right now. No user messages remain in the
+conversation after summarization — this section is critical for continuing execution.
+
+- If the latest user message is short or vague (e.g. "continue", "fix it"),
+  infer the implied intent from the surrounding conversation context.
+- If it is long, distill the core demand — omit background noise and redundant
+  exposition.
+- The goal is to capture the actionable sub-goal so that execution can continue
+  seamlessly after the conversation is compacted.
+
+"""
+"""Inject into the summary prompt when the preserved zone contains no user
+messages.  Trailing double-newline ensures clean formatting when the section
+is omitted (empty string)."""
 
 
 # ---------------------------------------------------------------------------
@@ -501,8 +528,13 @@ class MamboSummarizationMiddleware(AgentMiddleware[SummarizationState, ContextT,
       next one starts from the right place.
     - Injects previous summaries as required context during chained
       summarization, preventing silent loss of earlier context.
-    - Protects the most recent user ``HumanMessage`` from being evicted
-      by the cutoff index (see :meth:`_adjust_cutoff_for_user_message`).
+    - Performs local boundary alignment to avoid slicing through a
+      user message at the cutoff edge.  The ``## LATEST USER INTENT``
+      section in the summary prompt replaces the former aggressive
+      user-message preservation strategy: when the preserved zone
+      contains no user messages, the summarization LLM is explicitly
+      instructed to extract the current sub-task intent
+      (see :meth:`_adjust_cutoff_for_user_message`).
     - Token estimation is model-agnostic and CJK-aware
       (no fragile model-name heuristics).
     - **Optional backend offload** — when a ``BackendProtocol`` is provided,
@@ -985,7 +1017,12 @@ class MamboSummarizationMiddleware(AgentMiddleware[SummarizationState, ContextT,
     # Chained summarization (preserves previous summaries)
     # ------------------------------------------------------------------
 
-    def _create_summary(self, messages_to_summarize: list[AnyMessage]) -> str:
+    def _create_summary(
+        self,
+        messages_to_summarize: list[AnyMessage],
+        *,
+        latest_user_intent_section: str = "",
+    ) -> str:
         """Generate a summary using the configured prompt.
 
         When ``messages_to_summarize`` contains previous summary
@@ -997,6 +1034,9 @@ class MamboSummarizationMiddleware(AgentMiddleware[SummarizationState, ContextT,
         Args:
             messages_to_summarize: Messages to be summarized (may include
                 previous summary messages).
+            latest_user_intent_section: The ``## LATEST USER INTENT``
+                section text, or ``""`` when the preserved zone already
+                contains a user message.
 
         Returns:
             The generated summary text.
@@ -1013,9 +1053,13 @@ class MamboSummarizationMiddleware(AgentMiddleware[SummarizationState, ContextT,
             prompt = self._chained_summary_prompt.format(
                 previous_summaries=prev_text,
                 messages=buffer,
+                latest_user_intent_section=latest_user_intent_section,
             )
         else:
-            prompt = self._summary_prompt.format(messages=buffer)
+            prompt = self._summary_prompt.format(
+                messages=buffer,
+                latest_user_intent_section=latest_user_intent_section,
+            )
 
         # Respect trim_tokens_to_summarize: cap the total prompt tokens.
         max_tokens = self._lc_helper.trim_tokens_to_summarize
@@ -1030,9 +1074,13 @@ class MamboSummarizationMiddleware(AgentMiddleware[SummarizationState, ContextT,
                     prompt = self._chained_summary_prompt.format(
                         previous_summaries=prev_text,
                         messages=truncated_buffer,
+                        latest_user_intent_section=latest_user_intent_section,
                     )
                 else:
-                    prompt = self._summary_prompt.format(messages=truncated_buffer)
+                    prompt = self._summary_prompt.format(
+                        messages=truncated_buffer,
+                        latest_user_intent_section=latest_user_intent_section,
+                    )
 
         response = self._lc_helper.model.invoke(
             [HumanMessage(content=prompt)],
@@ -1043,7 +1091,12 @@ class MamboSummarizationMiddleware(AgentMiddleware[SummarizationState, ContextT,
             return str(content[0]) if content else ""
         return str(content) if content else ""
 
-    async def _acreate_summary(self, messages_to_summarize: list[AnyMessage]) -> str:
+    async def _acreate_summary(
+        self,
+        messages_to_summarize: list[AnyMessage],
+        *,
+        latest_user_intent_section: str = "",
+    ) -> str:
         """Async variant of :meth:`_create_summary`."""
         prev_summaries = [msg for msg in messages_to_summarize if self._is_summary_message(msg)]
         non_summary = [msg for msg in messages_to_summarize if not self._is_summary_message(msg)]
@@ -1057,9 +1110,13 @@ class MamboSummarizationMiddleware(AgentMiddleware[SummarizationState, ContextT,
             prompt = self._chained_summary_prompt.format(
                 previous_summaries=prev_text,
                 messages=buffer,
+                latest_user_intent_section=latest_user_intent_section,
             )
         else:
-            prompt = self._summary_prompt.format(messages=buffer)
+            prompt = self._summary_prompt.format(
+                messages=buffer,
+                latest_user_intent_section=latest_user_intent_section,
+            )
 
         max_tokens = self._lc_helper.trim_tokens_to_summarize
         if max_tokens is not None:
@@ -1073,9 +1130,13 @@ class MamboSummarizationMiddleware(AgentMiddleware[SummarizationState, ContextT,
                     prompt = self._chained_summary_prompt.format(
                         previous_summaries=prev_text,
                         messages=truncated_buffer,
+                        latest_user_intent_section=latest_user_intent_section,
                     )
                 else:
-                    prompt = self._summary_prompt.format(messages=truncated_buffer)
+                    prompt = self._summary_prompt.format(
+                        messages=truncated_buffer,
+                        latest_user_intent_section=latest_user_intent_section,
+                    )
 
         response = await self._lc_helper.model.ainvoke(
             [HumanMessage(content=prompt)],
@@ -1128,8 +1189,8 @@ class MamboSummarizationMiddleware(AgentMiddleware[SummarizationState, ContextT,
            from the correct cursor).
         2. If the token budget is not exceeded, call *handler* directly.
         3. If the budget **is** exceeded:
-           a. Compute a safe cutoff index (protecting AI/Tool pairs **and**
-              the most recent user message).
+           a. Compute a safe cutoff index (protecting AI/Tool pairs with
+              local boundary alignment at user messages).
            b. Partition messages into *to-summarize* and *preserved* groups.
            c. Generate a summary (chain-aware — preserves prior summaries).
            d. Rebuild the request with ``[summary_msg, *preserved]``.
@@ -1182,11 +1243,11 @@ class MamboSummarizationMiddleware(AgentMiddleware[SummarizationState, ContextT,
         return self._lc_helper._should_summarize(messages, total_tokens)
 
     def _determine_cutoff_index(self, messages: list[AnyMessage]) -> int:
-        """Compute cutoff index with user-message protection.
+        """Compute cutoff index with local user-message boundary alignment.
 
         First delegates to the langchain helper (which protects AI/Tool
-        message pairs from being split), then adjusts the cutoff **upward**
-        if the most recent user message would otherwise be evicted.
+        message pairs from being split), then performs a local boundary
+        check to avoid slicing through a user message at the cutoff edge.
         """
         cutoff = self._lc_helper._determine_cutoff_index(messages)
         if cutoff <= 0:
@@ -1198,44 +1259,37 @@ class MamboSummarizationMiddleware(AgentMiddleware[SummarizationState, ContextT,
         messages: list[AnyMessage],
         cutoff_index: int,
     ) -> int:
-        """Ensure the most recent **genuine** user message is preserved.
+        """Ensure the cutoff boundary does not slice through a user message.
 
-        The langchain base implementation protects AI/Tool pairs but
-        ignores user ``HumanMessage`` objects.  This means a cutoff like
-        ``len(messages) - keep`` can land **after** the user's last
-        message, silently evicting it.
+        This only performs a local boundary check: if the message
+        immediately *before* the cutoff is a non-summary HumanMessage,
+        the cutoff is moved back by one to avoid splitting user context
+        mid-message.
 
-        Strategy:
-            1. Scan the *preserved* suffix (``>= cutoff_index``) for a
-               non-summary ``HumanMessage``.  If found → nothing to fix.
-            2. Otherwise, scan the *to-summarize* prefix backward to find
-               the last non-summary ``HumanMessage`` and move the cutoff
-               to its index (so it is included in the preserved group).
+        Unlike the previous implementation, this no longer forcibly
+        moves the cutoff to include the most recent user message.
+        Instead, when the preserved zone contains no user messages,
+        ``_LATEST_USER_INTENT_SECTION`` is injected into the summary
+        prompt so the LLM extracts the current sub-task intent.
+
+        Previous summary messages (tagged ``lc_source="summarization"``)
+        are skipped — they are not user messages.
 
         Args:
             messages: Full message list.
             cutoff_index: Original cutoff (from langchain helper).
 
         Returns:
-            Adjusted ``cutoff_index`` that preserves the last user message.
+            Adjusted ``cutoff_index`` — at most 1 less than the input.
         """
-        # Phase 1: already in the preserved zone?
-        for i in range(len(messages) - 1, cutoff_index - 1, -1):
-            msg = messages[i]
-            if isinstance(msg, HumanMessage):
-                if msg.additional_kwargs.get("lc_source") == "summarization":
-                    continue
-                # Found a genuine user message — it's already safe
-                break
-        else:
-            # Phase 2: no user message in the preserved zone.
-            # Walk backward through the prefix and find the last one.
-            for i in range(cutoff_index - 1, -1, -1):
-                msg = messages[i]
-                if isinstance(msg, HumanMessage):
-                    if msg.additional_kwargs.get("lc_source") == "summarization":
-                        continue
-                    return i
+        if cutoff_index <= 0:
+            return cutoff_index
+
+        boundary_msg = messages[cutoff_index - 1]
+        if isinstance(boundary_msg, HumanMessage) and (
+            boundary_msg.additional_kwargs.get("lc_source") != "summarization"
+        ):
+            return cutoff_index - 1
 
         return cutoff_index
 
@@ -1267,6 +1321,16 @@ class MamboSummarizationMiddleware(AgentMiddleware[SummarizationState, ContextT,
             effective_messages, cutoff_index
         )
 
+        # Determine if the preserved zone already contains a user message.
+        # If not, inject LATEST USER INTENT into the summary prompt so the
+        # LLM extracts the current sub-task from the summarized region.
+        has_user_in_preserved = any(
+            isinstance(msg, HumanMessage)
+            and msg.additional_kwargs.get("lc_source") != "summarization"
+            for msg in preserved_messages
+        )
+        intent_section = _LATEST_USER_INTENT_SECTION if not has_user_in_preserved else ""
+
         # Offload evicted messages to backend before summarization (if enabled).
         if self._offload_to_backend_flag:
             file_path = self._offload_to_backend(messages_to_summarize, request.runtime)
@@ -1280,7 +1344,10 @@ class MamboSummarizationMiddleware(AgentMiddleware[SummarizationState, ContextT,
         else:
             file_path = None
 
-        summary = self._create_summary(messages_to_summarize)
+        summary = self._create_summary(
+            messages_to_summarize,
+            latest_user_intent_section=intent_section,
+        )
 
         # Collect supplementary content from hooks (e.g. plan list state)
         hook_content = self._collect_hook_content(
@@ -1339,13 +1406,24 @@ class MamboSummarizationMiddleware(AgentMiddleware[SummarizationState, ContextT,
             effective_messages, cutoff_index
         )
 
+        # Determine if the preserved zone already contains a user message.
+        has_user_in_preserved = any(
+            isinstance(msg, HumanMessage)
+            and msg.additional_kwargs.get("lc_source") != "summarization"
+            for msg in preserved_messages
+        )
+        intent_section = _LATEST_USER_INTENT_SECTION if not has_user_in_preserved else ""
+
         # Offload to backend and generate summary concurrently — they are
         # independent.  Both coroutines catch all exceptions internally and
         # return None / empty string on failure, so asyncio.gather is safe.
         if self._offload_to_backend_flag:
             file_path, summary = await asyncio.gather(
                 self._aoffload_to_backend(messages_to_summarize, request.runtime),
-                self._acreate_summary(messages_to_summarize),
+                self._acreate_summary(
+                    messages_to_summarize,
+                    latest_user_intent_section=intent_section,
+                ),
             )
             if file_path is None:
                 msg = (
@@ -1356,7 +1434,10 @@ class MamboSummarizationMiddleware(AgentMiddleware[SummarizationState, ContextT,
                 warnings.warn(msg, stacklevel=2)
         else:
             file_path = None
-            summary = await self._acreate_summary(messages_to_summarize)
+            summary = await self._acreate_summary(
+                messages_to_summarize,
+                latest_user_intent_section=intent_section,
+            )
 
         # Collect supplementary content from hooks (e.g. plan list state)
         hook_content = self._collect_hook_content(

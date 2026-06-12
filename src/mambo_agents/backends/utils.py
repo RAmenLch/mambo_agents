@@ -82,6 +82,55 @@ class TreeEntry(BaseModel):
 
 
 # ---------------------------------------------------------------------------
+# Path validation
+# ---------------------------------------------------------------------------
+
+
+def validate_canonical_path(value: str, name: str = "path") -> str:
+    """Validate and normalize a virtual-filesystem path.
+
+    A canonical path is:
+
+    - Non-empty and non-whitespace-only
+    - Absolute (starts with ``"/"``)
+    - Not ``"/"`` (root directory is forbidden as a workspace anchor)
+    - Does not contain ``".."`` segments (no path traversal)
+    - Does not contain ``"//"`` (no double slashes)
+
+    Trailing slashes are stripped on success, so callers can assign the
+    return value directly.
+
+    Args:
+        value: The path string to validate.
+        name: Human-readable name for the parameter (used in error messages).
+
+    Returns:
+        Normalized path without trailing slash.
+
+    Raises:
+        ValueError: If *value* violates any canonical-path constraint.
+    """
+    if not value or not value.strip():
+        raise ValueError(f"{name} must not be empty")
+    if not value.startswith("/"):
+        raise ValueError(
+            f"{name} must be an absolute path starting with '/', got {value!r}"
+        )
+    normalized = value.rstrip("/")
+    if normalized == "/":
+        raise ValueError(
+            f"{name}='/' is forbidden; use a subdirectory like '/workspace'"
+        )
+    if ".." in normalized.split("/"):
+        raise ValueError(
+            f"{name} must not contain '..' path traversal, got {value!r}"
+        )
+    if "//" in normalized:
+        raise ValueError(f"{name} must not contain '//', got {value!r}")
+    return normalized
+
+
+# ---------------------------------------------------------------------------
 # Edit helpers
 # ---------------------------------------------------------------------------
 

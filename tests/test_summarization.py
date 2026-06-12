@@ -651,8 +651,13 @@ class TestAdjustCutoffForUserMessage:
         )
         assert result == 3, "cutoff should stay at 3 — last user message is preserved"
 
-    def test_user_in_summarize_zone__cutoff_moved(self):
-        """Last user message is in the to-summarize zone — cutoff adjusted upward."""
+    def test_user_in_summarize_zone__cutoff_not_moved(self):
+        """Last user message is in the to-summarize zone — cutoff NOT moved.
+
+        The simplified boundary-alignment strategy intentionally leaves
+        user messages in the summarize zone.  Their intent is captured
+        via ``_LATEST_USER_INTENT_SECTION`` in the summary prompt instead.
+        """
         messages = [
             HumanMessage(content="User 1"),
             AIMessage(content="AI 1"),
@@ -665,12 +670,18 @@ class TestAdjustCutoffForUserMessage:
         result = MamboSummarizationMiddleware._adjust_cutoff_for_user_message(
             messages, cutoff
         )
-        assert result == 3, (
-            f"Expected cutoff=3 to include H2 in preserved zone, got {result}"
+        assert result == 5, (
+            f"Expected cutoff=5 (boundary unchanged — intent handled via prompt), got {result}"
         )
 
     def test_summary_human_message_skipped(self):
-        """Previous summary HumanMessage is not treated as user message."""
+        """Previous summary HumanMessage at boundary — skipped, cutoff unchanged.
+
+        The summary message (lc_source="summarization") at the boundary
+        is not a genuine user message, so the cutoff stays put.  The
+        genuine user question in the summarize zone is intentionally
+        left there — its intent is captured via the prompt.
+        """
         messages = [
             HumanMessage(
                 content="Summary of earlier...",
@@ -684,8 +695,8 @@ class TestAdjustCutoffForUserMessage:
         result = MamboSummarizationMiddleware._adjust_cutoff_for_user_message(
             messages, cutoff
         )
-        assert result == 1, (
-            f"Expected cutoff=1 to keep user question, got {result}"
+        assert result == 3, (
+            f"Expected cutoff=3 (boundary unchanged — summary skipped, user intent via prompt), got {result}"
         )
 
     def test_no_user_message_at_all(self):
@@ -715,8 +726,13 @@ class TestAdjustCutoffForUserMessage:
         )
         assert result == 2, "last message IS the user — cutoff unchanged"
 
-    def test_multiple_user_messages__preserve_last(self):
-        """Only the most recent user message needs protecting."""
+    def test_multiple_user_messages__boundary_only(self):
+        """Multiple user messages — only boundary alignment, not preservation.
+
+        The last user message (U2) is in the summarize zone.  The simplified
+        strategy does NOT move the cutoff to preserve it — that responsibility
+        is handled by ``_LATEST_USER_INTENT_SECTION`` in the summary prompt.
+        """
         messages = [
             HumanMessage(content="User 1"),
             AIMessage(content="AI 1"),
@@ -728,8 +744,33 @@ class TestAdjustCutoffForUserMessage:
         result = MamboSummarizationMiddleware._adjust_cutoff_for_user_message(
             messages, cutoff
         )
+        assert result == 4, (
+            f"Expected cutoff=4 (boundary unchanged — intent via prompt), got {result}"
+        )
+
+    def test_user_at_cutoff_boundary__with_user_in_preserved_zone(self):
+        """User message at cutoff-1 with another user in preserved zone.
+
+        Regression test: Phase 1 used to stop after finding the user in
+        the preserved zone, leaving the user message at the cutoff
+        boundary unprotected.
+        """
+        messages = [
+            HumanMessage(content="User 1"),
+            AIMessage(content="AI 1"),
+            HumanMessage(content="User 2"),   # index 2 – at cutoff boundary!
+            AIMessage(content="AI 2"),
+            ToolMessage(content="Tool 2", tool_call_id="c2"),
+            AIMessage(content="AI 3"),
+            HumanMessage(content="User 3"),   # index 6 – in preserved zone
+            AIMessage(content="AI 4"),
+        ]
+        cutoff = 3
+        result = MamboSummarizationMiddleware._adjust_cutoff_for_user_message(
+            messages, cutoff
+        )
         assert result == 2, (
-            f"Expected cutoff=2 to preserve last user message (U2), got {result}"
+            f"Expected cutoff=2 to preserve User 2 at the boundary, got {result}"
         )
 
 

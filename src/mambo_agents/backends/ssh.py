@@ -45,6 +45,7 @@ from mambo_agents.backends.utils import (
     format_tree_entries,
     format_with_line_numbers,
     human_size,
+    validate_canonical_path,
 )
 
 # ---------------------------------------------------------------------------
@@ -114,6 +115,7 @@ class SshBackend(BackendProtocol):
         connect_timeout: int = _DEFAULT_SSH_CONNECT_TIMEOUT,
         execute_timeout: int = _DEFAULT_EXECUTE_TIMEOUT,
         max_output_bytes: int = _MAX_OUTPUT_BYTES,
+        enable_execute: bool = False,
         edit_whitelist: frozenset[str] | None = None,
         edit_blacklist: frozenset[str] | None = None,
         ignore_dirs: frozenset[str] | None = None,
@@ -132,7 +134,7 @@ class SshBackend(BackendProtocol):
                 "Provide at most one of them."
             )
 
-        self.workspace_root = workspace_root.rstrip("/")
+        self.workspace_root = validate_canonical_path(workspace_root, "workspace_root")
         self._host = host
         self._username = username
         self._port = port
@@ -142,6 +144,7 @@ class SshBackend(BackendProtocol):
         self._connect_timeout = connect_timeout
         self._execute_timeout = execute_timeout
         self._max_output_bytes = max_output_bytes
+        self._enable_execute = enable_execute
         self._edit_whitelist = edit_whitelist or frozenset()
         self._edit_blacklist = edit_blacklist or frozenset()
         self._ignore_dirs = ignore_dirs or frozenset()
@@ -282,7 +285,7 @@ class SshBackend(BackendProtocol):
     @property
     def tools(self) -> list[StructuredTool]:
         wr = self.workspace_root
-        return [
+        tools: list[StructuredTool] = [
             StructuredTool(
                 name="tree",
                 description=(
@@ -310,21 +313,27 @@ class SshBackend(BackendProtocol):
                 func=lambda **kwargs: self.delete(**kwargs),
                 coroutine=lambda **kwargs: self.adelete(**kwargs),
             ),
-            StructuredTool(
-                name="execute",
-                description=(
-                    "Execute a shell command on the remote server via SSH. "
-                    "Returns combined stdout and stderr output."
-                ),
-                args_schema=create_model(
-                    "ExecuteSchema",
-                    command=(str, Field(description="Shell command to execute")),
-                    timeout=(int | None, Field(default=None, description="Optional timeout in seconds")),
-                ),
-                func=lambda **kwargs: self.execute(**kwargs),
-                coroutine=lambda **kwargs: self.aexecute(**kwargs),
-            ),
         ]
+
+        if self._enable_execute:
+            tools.append(
+                StructuredTool(
+                    name="execute",
+                    description=(
+                        "Execute a shell command on the remote server via SSH. "
+                        "Returns combined stdout and stderr output."
+                    ),
+                    args_schema=create_model(
+                        "ExecuteSchema",
+                        command=(str, Field(description="Shell command to execute")),
+                        timeout=(int | None, Field(default=None, description="Optional timeout in seconds")),
+                    ),
+                    func=lambda **kwargs: self.execute(**kwargs),
+                    coroutine=lambda **kwargs: self.aexecute(**kwargs),
+                )
+            )
+
+        return tools
 
     @property
     def description(self) -> str:
@@ -337,15 +346,22 @@ class SshBackend(BackendProtocol):
                 "which can produce inaccurate results on non-GNU systems."
             )
         )
+        exec_note = ""
+        if self._enable_execute:
+            exec_note = (
+                f"\n**execute tool:** shell commands run in `{self._remote_root}`.  "
+                f"Use real filesystem paths in commands, NOT `{wr}` paths "
+                f"— the virtual workspace path does not exist on the remote filesystem."
+            )
+        else:
+            exec_note = " [shell execution disabled]"
+
         return (
             f"**Environment:** Remote Linux server via SSH "
-            f"(host: {self._host}, working directory: {self._remote_root}).\n"
+            f"(host: {self._host}, working directory: {self._remote_root}).{exec_note}\n"
             f"**Path mapping:** the workspace root `{wr}` maps to the remote "
             f"directory `{self._remote_root}` — all file tools must use paths under "
-            f"`{wr}`. Paths outside `{wr}` (including `/`) are rejected.\n"
-            f"**execute tool:** shell commands run in `{self._remote_root}`.  "
-            f"Use real filesystem paths in commands, NOT `{wr}` paths "
-            f"— the virtual workspace path does not exist on the remote filesystem."
+            f"`{wr}`. Paths outside `{wr}` (including `/`) are rejected."
             f"{py3_note}"
         )
 
@@ -576,6 +592,8 @@ class SshBackend(BackendProtocol):
         round-trips).  Otherwise falls back to SFTP: download → local
         replace → upload.
         """
+        if not old_str:
+            return EditResult(error="old_str must not be empty")
         if not self._check_edit_allowed(file_path):
             return EditResult(
                 error=(
@@ -745,6 +763,8 @@ class SshBackend(BackendProtocol):
         3. ``python3`` os.walk (portable last resort, used when
            GNU grep fails e.g. BSD/macOS with ``--include`` glob)
         """
+        if not pattern:
+            return GrepResult(error="pattern must not be empty")
         try:
             remote = self._resolve(path)
         except WorkspacePathError as e:

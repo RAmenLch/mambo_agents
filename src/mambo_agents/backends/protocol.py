@@ -375,6 +375,8 @@ class BackendProtocol(abc.ABC):
         max_read_chars: int = 100_000,
         summarizer: ReadSummarizer | None = None,
     ) -> None:
+        if max_read_chars < 1:
+            raise ValueError(f"max_read_chars must be >= 1, got {max_read_chars}")
         self._max_read_chars = max_read_chars
         self._summarizer: ReadSummarizer = summarizer or self._default_summarizer
 
@@ -435,6 +437,10 @@ class BackendProtocol(abc.ABC):
         files are never truncated.  Pass ``_apply_max_chars=False`` to
         bypass the limit (used internally by ``download_files``).
         """
+        if offset < 0:
+            return ReadResult(error=f"offset must be non-negative, got {offset}")
+        if limit < 1:
+            return ReadResult(error=f"limit must be positive, got {limit}")
         result = self.read_raw(file_path, offset, limit, include_line_numbers)
         if _apply_max_chars:
             result = self._apply_read_limit(result, file_path)

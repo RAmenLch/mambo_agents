@@ -430,6 +430,8 @@ class StateBackend(ThreadAwareWorkspace):
         *,
         replace_all: bool = False,
     ) -> EditResult:
+        if not old_str:
+            return EditResult(error="old_str must not be empty")
         files = self._read_files()
         # Check if file_path is a "directory" (contains child files)
         prefix = file_path.rstrip("/") + "/"
@@ -495,6 +497,8 @@ class StateBackend(ThreadAwareWorkspace):
         path: str = "/",
         glob: str | None = None,
     ) -> GrepResult:
+        if not pattern:
+            return GrepResult(error="pattern must not be empty")
         files = self._read_files()
         return _grep_in_memory(files, pattern, path, glob)
 

@@ -43,6 +43,7 @@ from mambo_agents.backends.protocol import (
     WriteResult,
 )
 from mambo_agents.backends.state import StateBackend
+from mambo_agents.backends.utils import validate_canonical_path
 
 # ---------------------------------------------------------------------------
 # Default workspace prefix
@@ -121,9 +122,9 @@ class HybridWorkspaceBackend(ThreadAwareWorkspace):
     ) -> None:
         super().__init__(max_read_chars=max_read_chars, summarizer=summarizer)
 
-        self.workspace_root = workspace_root.rstrip("/")
+        self.workspace_root = validate_canonical_path(workspace_root, "workspace_root")
         self._real = real_backend
-        self._prefix = mambo_prefix.rstrip("/")  # "/.mambo"
+        self._prefix = validate_canonical_path(mambo_prefix, "mambo_prefix")  # "/.mambo"
         self._custom_description = custom_description
 
         # --- Build virtual workspaces ---------------------------------
@@ -147,6 +148,11 @@ class HybridWorkspaceBackend(ThreadAwareWorkspace):
                 raise ValueError(
                     "Use '.' only to override the default workspace; "
                     "it cannot appear alongside other names."
+                )
+            if not isinstance(be, BackendProtocol):
+                raise TypeError(
+                    f"Virtual workspace '{name}' must be a BackendProtocol instance, "
+                    f"got {type(be).__name__}"
                 )
             self._virtual[name] = be
 
@@ -227,8 +233,13 @@ class HybridWorkspaceBackend(ThreadAwareWorkspace):
         """
         if normalized_path == strip_prefix:
             rel = ""
-        else:
+        elif normalized_path.startswith(strip_prefix + "/"):
             rel = normalized_path[len(strip_prefix):].lstrip("/")
+        else:
+            raise ValueError(
+                f"Cannot rewrite path {normalized_path!r}: "
+                f"not under prefix {strip_prefix!r}"
+            )
         ws = target_ws_root.rstrip("/")
         if not rel:
             return ws
@@ -248,6 +259,10 @@ class HybridWorkspaceBackend(ThreadAwareWorkspace):
         2. Default virtual workspace (``/.mambo/...``)
         3. Real backend (everything else)
         """
+        if not isinstance(path, str):
+            raise TypeError(
+                f"path must be a string, got {type(path).__name__}: {path!r}"
+            )
         p = path.rstrip("/")
         mambo = self._prefix  # "/.mambo"
 

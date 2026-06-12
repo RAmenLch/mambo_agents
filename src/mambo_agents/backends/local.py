@@ -46,6 +46,7 @@ from mambo_agents.backends.utils import (
     format_tree_entries,
     format_with_line_numbers,
     human_size,
+    validate_canonical_path,
 )
 
 # ---------------------------------------------------------------------------
@@ -133,7 +134,7 @@ class LocalBackend(BackendProtocol):
                 "Provide at most one of them."
             )
 
-        self.workspace_root = workspace_root.rstrip("/")
+        self.workspace_root = validate_canonical_path(workspace_root, "workspace_root")
         self._cwd = Path(root_dir).resolve() if root_dir else Path.cwd()
         self._default_timeout = timeout
         self._max_output_bytes = max_output_bytes
@@ -465,6 +466,8 @@ class LocalBackend(BackendProtocol):
         *,
         replace_all: bool = False,
     ) -> EditResult:
+        if not old_str:
+            return EditResult(error="old_str must not be empty")
         if not self._check_edit_allowed(file_path):
             return EditResult(
                 error=(
@@ -549,6 +552,8 @@ class LocalBackend(BackendProtocol):
         path: str = "/workspace",
         glob: str | None = None,
     ) -> GrepResult:
+        if not pattern:
+            return GrepResult(error="pattern must not be empty")
         try:
             resolved = self._resolve(path)
         except WorkspacePathError as e:
