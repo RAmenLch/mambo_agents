@@ -20,6 +20,19 @@ from langgraph.runtime import Runtime
 from langgraph.types import Overwrite
 from langgraph.typing import ContextT
 
+# LangGraph internal key used in the dict-form of Overwrite:
+#   {'__overwrite__': <value>}
+_OVERWRITE_KEY = "__overwrite__"
+
+
+def _unwrap_overwrite(value: Any) -> Any:
+    """Return the actual value if *value* is wrapped in an Overwrite marker."""
+    if isinstance(value, Overwrite):
+        return value.value
+    if isinstance(value, dict) and set(value.keys()) == {_OVERWRITE_KEY}:
+        return value[_OVERWRITE_KEY]
+    return value
+
 
 class PatchToolCallsMiddleware(AgentMiddleware[AgentState, ContextT, ResponseT]):
     """Patch dangling tool calls before each agent turn.
@@ -40,7 +53,7 @@ class PatchToolCallsMiddleware(AgentMiddleware[AgentState, ContextT, ResponseT])
         self, state: AgentState, runtime: Runtime,
     ) -> dict[str, Any] | None:
         """Detect and patch dangling tool calls before each agent turn."""
-        messages = state.get("messages")
+        messages = _unwrap_overwrite(state.get("messages"))
         if not messages:
             return None
 

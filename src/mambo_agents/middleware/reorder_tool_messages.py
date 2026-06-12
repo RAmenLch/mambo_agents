@@ -35,6 +35,8 @@ from langgraph.runtime import Runtime
 from langgraph.types import Overwrite
 from langgraph.typing import ContextT
 
+from mambo_agents.middleware.patch_tool_calls import _unwrap_overwrite
+
 
 class ReorderToolMessagesMiddleware(AgentMiddleware[AgentState, ContextT, ResponseT]):
     """Reorder ``ToolMessage`` entries to match ``AIMessage.tool_calls`` order.
@@ -58,7 +60,7 @@ class ReorderToolMessagesMiddleware(AgentMiddleware[AgentState, ContextT, Respon
         self, state: AgentState, runtime: Runtime,
     ) -> dict[str, Any] | None:
         """Reorder ToolMessages before each model call (sync)."""
-        messages = state.get("messages")
+        messages = _unwrap_overwrite(state.get("messages"))
         if not messages or len(messages) < 2:
             return None
 
