@@ -9,12 +9,11 @@ description = "AI Agent framework on LangChain/LangGraph — multi-backend files
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
-    "langchain",
-    "langgraph",
-    "deepagents", # 仅用于代码参考 后续删除
+    "langchain>=1.2",
+    "langgraph>=1.1",
+    "deepagents>=0.5.7", # 仅用于代码参考 后续删除
     "paramiko>=3.0",
     "wcmatch>=8.0",
-    "langchain_openai",
     "tree-sitter>=0.25",
     "tree-sitter-javascript>=0.25",
     "tree-sitter-typescript>=0.23",
@@ -40,5 +39,6 @@ markers = [
 dev = [
     "pytest>=8.0",
     "pytest-asyncio>=0.24",
-    "pytest-xdist>=3.8"
+    "pytest-xdist>=3.8",
+    "langchain-openai>=1.2",
 ]
