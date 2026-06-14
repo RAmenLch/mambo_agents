@@ -66,6 +66,7 @@ from langchain_core.messages import (
     ToolCall,
     ToolMessage,
 )
+from langchain_core.runnables import RunnableConfig
 from langgraph.runtime import Runtime
 from langgraph.types import interrupt
 from langgraph.typing import ContextT
@@ -302,6 +303,14 @@ class AutoSecurityReviewMiddleware(
         self._description_prefix = description_prefix
 
         # ---------- review model ----------
+        # IMPORTANT: the review model is invoked with an isolated config
+        # (``callbacks=[]``) in ``_ai_review()`` to prevent its internal
+        # LLM messages (SystemMessage, HumanMessage, AIMessage) from being
+        # captured by the main agent's ``stream_mode=["messages"]`` and
+        # emitted as stream events.  This isolation is applied at the
+        # ``invoke()`` call-site rather than at model-construction time so
+        # that we keep the same model instance (important for mocking in
+        # tests and for LangSmith tracing continuity).
         if isinstance(model, str):
             from langchain.chat_models import init_chat_model
 
@@ -394,6 +403,14 @@ class AutoSecurityReviewMiddleware(
         content involved in ``write`` / ``edit`` calls so the reviewer
         can inspect scripts for malicious patterns, backdoors, etc.
 
+        .. important::
+            The review model is invoked with an **isolated config**
+            (``callbacks=[]``) so that the review messages (SystemMessage,
+            HumanMessage, and the model's response) are **not** captured
+            by the main agent's ``stream_mode=["messages"]`` and emitted
+            as stream events.  This prevents the security review internals
+            from polluting the agent's message stream.
+
         Returns
         -------
         SecurityReviewResult
@@ -409,13 +426,22 @@ class AutoSecurityReviewMiddleware(
             file_content_label=file_label,
         )
 
+        # Isolate the review call from the main agent's streaming context.
+        # Without this, the review model's LLM messages (SystemMessage,
+        # HumanMessage, AI response) would be captured by langgraph's
+        # ``stream_mode=["messages"]`` and emitted to the consumer,
+        # polluting the main agent's message stream.
+        _isolated_config: RunnableConfig = {"callbacks": []}
+
         # Attempt structured-output (JSON-schema mode) for reliable parsing.
         try:
             structured_model = self._review_model.with_structured_output(
                 SecurityReviewResult,
                 method="json_schema",
             )
-            response: SecurityReviewResult = structured_model.invoke(messages)
+            response: SecurityReviewResult = structured_model.invoke(
+                messages, config=_isolated_config,
+            )
             return response
         except Exception:
             pass
@@ -425,13 +451,15 @@ class AutoSecurityReviewMiddleware(
             structured_model = self._review_model.with_structured_output(
                 SecurityReviewResult,
             )
-            response = structured_model.invoke(messages)
+            response = structured_model.invoke(
+                messages, config=_isolated_config,
+            )
             return response
         except Exception:
             pass
 
         # Last-resort fallback: parse raw text
-        raw = self._review_model.invoke(messages)
+        raw = self._review_model.invoke(messages, config=_isolated_config)
         content = raw.content if hasattr(raw, "content") else str(raw)
         content_lower = content.lower()
 
