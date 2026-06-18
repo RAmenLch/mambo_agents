@@ -20,6 +20,8 @@ from mambo_agents.middleware.security_review import (
     DEFAULT_SECURITY_REVIEW_SYSTEM_PROMPT,
     AutoSecurityReviewMiddleware,
     SecurityReviewConfig,
+    SecurityReviewFailedEvent,
+    SecurityReviewPassedEvent,
     SecurityReviewResult,
     _build_review_messages,
 )
@@ -73,6 +75,7 @@ class TestSecurityReviewConfig:
         assert cfg.model is None
         assert cfg.system_prompt is None
         assert cfg.review_tools == "all"
+        assert cfg.notify_on_pass is True
 
     def test_custom_model(self) -> None:
         cfg = SecurityReviewConfig(model="gpt-4o-mini")
@@ -86,6 +89,14 @@ class TestSecurityReviewConfig:
         cfg = SecurityReviewConfig()
         with pytest.raises(ValidationError):
             cfg.model = "something"  # type: ignore[misc]
+
+    def test_notify_on_pass_default(self) -> None:
+        cfg = SecurityReviewConfig()
+        assert cfg.notify_on_pass is True
+
+    def test_notify_on_pass_false(self) -> None:
+        cfg = SecurityReviewConfig(notify_on_pass=False)
+        assert cfg.notify_on_pass is False
 
 
 class TestSecurityReviewResult:
@@ -101,6 +112,94 @@ class TestSecurityReviewResult:
     def test_invalid_risk_level_rejected(self) -> None:
         with pytest.raises(ValidationError):
             SecurityReviewResult(is_safe=True, reason="ok", risk_level="invalid")  # type: ignore[arg-type]
+
+
+class TestSecurityReviewPassedEvent:
+    def test_minimal_construction(self) -> None:
+        event = SecurityReviewPassedEvent(
+            tool_call_id="call_123",
+            tool_name="write",
+            risk_level="low",
+            reason="Safe operation within workspace.",
+        )
+        assert event.type == "security_review_passed"
+        assert event.source == "security_review"
+        assert event.tool_call_id == "call_123"
+        assert event.tool_name == "write"
+        assert event.risk_level == "low"
+        assert event.reason == "Safe operation within workspace."
+        assert isinstance(event.timestamp, float)
+
+    def test_frozen(self) -> None:
+        event = SecurityReviewPassedEvent(
+            tool_call_id="call_123",
+            tool_name="write",
+            risk_level="low",
+            reason="ok",
+        )
+        with pytest.raises(ValidationError):
+            event.tool_call_id = "call_456"  # type: ignore[misc]
+
+    def test_invalid_risk_level_rejected(self) -> None:
+        with pytest.raises(ValidationError):
+            SecurityReviewPassedEvent(
+                tool_call_id="call_123",
+                tool_name="write",
+                risk_level="invalid",  # type: ignore[arg-type]
+                reason="ok",
+            )
+
+    def test_model_dump_excludes_none(self) -> None:
+        event = SecurityReviewPassedEvent(
+            tool_call_id="call_123",
+            tool_name="write",
+            risk_level="low",
+            reason="ok",
+        )
+        dumped = event.model_dump()
+        assert dumped["type"] == "security_review_passed"
+        assert dumped["source"] == "security_review"
+        assert "tool_call_id" in dumped
+        assert "timestamp" in dumped
+
+
+class TestSecurityReviewFailedEvent:
+    def test_minimal_construction(self) -> None:
+        event = SecurityReviewFailedEvent(
+            tool_call_id="call_456",
+            tool_name="write",
+            risk_level="critical",
+            reason="Modifying /etc/hosts is dangerous",
+        )
+        assert event.type == "security_review_failed"
+        assert event.source == "security_review"
+        assert event.tool_call_id == "call_456"
+        assert event.tool_name == "write"
+        assert event.risk_level == "critical"
+        assert "Modifying" in event.reason
+        assert isinstance(event.timestamp, float)
+
+    def test_frozen(self) -> None:
+        event = SecurityReviewFailedEvent(
+            tool_call_id="call_1",
+            tool_name="write",
+            risk_level="high",
+            reason="Dangerous shell command",
+        )
+        with pytest.raises(ValidationError):
+            event.tool_name = "edit"  # type: ignore[misc]
+
+    def test_model_dump(self) -> None:
+        event = SecurityReviewFailedEvent(
+            tool_call_id="call_1",
+            tool_name="write",
+            risk_level="high",
+            reason="cmd.exe invocation",
+        )
+        dumped = event.model_dump()
+        assert dumped["type"] == "security_review_failed"
+        assert dumped["source"] == "security_review"
+        assert dumped["tool_name"] == "write"
 
 
 # =============================================================================
@@ -187,6 +286,21 @@ class TestConstructor:
         )
         assert mw._tool_descriptions == {}
 
+    def test_notify_on_pass_default_true(self) -> None:
+        mw = AutoSecurityReviewMiddleware(
+            interrupt_on={"write": True},
+            model=FakeListChatModel(responses=[]),
+        )
+        assert mw._notify_on_pass is True
+
+    def test_notify_on_pass_explicit_false(self) -> None:
+        mw = AutoSecurityReviewMiddleware(
+            interrupt_on={"write": True},
+            model=FakeListChatModel(responses=[]),
+            notify_on_pass=False,
+        )
+        assert mw._notify_on_pass is False
+
 
 # =============================================================================
 # 4. _should_ai_review routing
@@ -221,7 +335,80 @@ class TestShouldAiReview:
 
 
 # =============================================================================
-# 5. _ai_review — with mocked model
+# 5. _emit_pass_notification
+# =============================================================================
+
+
+class TestEmitPassNotification:
+    def test_writes_event_when_writer_available(self) -> None:
+        """With an active stream writer, a SecurityReviewPassedEvent is emitted."""
+        writer_mock = MagicMock()
+        tc = _make_tool_call("write", call_id="call_abc")
+
+        with patch(
+            "mambo_agents.middleware.security_review.get_stream_writer",
+            return_value=writer_mock,
+        ):
+            AutoSecurityReviewMiddleware._emit_pass_notification(tc, _SAFE_RESULT)
+
+        writer_mock.assert_called_once()
+        payload = writer_mock.call_args[0][0]
+        assert payload["type"] == "security_review_passed"
+        assert payload["source"] == "security_review"
+        assert payload["tool_call_id"] == "call_abc"
+        assert payload["tool_name"] == "write"
+        assert payload["risk_level"] == "low"
+        assert payload["reason"] == "Looks fine"
+        assert isinstance(payload["timestamp"], float)
+
+    def test_silent_when_no_writer(self) -> None:
+        """Without a stream writer, the call is a silent no-op."""
+        tc = _make_tool_call("write")
+        # get_stream_writer raises RuntimeError → caught silently
+        with patch(
+            "mambo_agents.middleware.security_review.get_stream_writer",
+            side_effect=RuntimeError("no context"),
+        ):
+            AutoSecurityReviewMiddleware._emit_pass_notification(tc, _SAFE_RESULT)
+        # No exception raised
+
+
+class TestEmitFailNotification:
+    def test_writes_event_when_writer_available(self) -> None:
+        """With an active stream writer, a SecurityReviewFailedEvent is emitted."""
+        writer_mock = MagicMock()
+        tc = _make_tool_call("write", call_id="call_fail")
+
+        with patch(
+            "mambo_agents.middleware.security_review.get_stream_writer",
+            return_value=writer_mock,
+        ):
+            AutoSecurityReviewMiddleware._emit_fail_notification(tc, _UNSAFE_RESULT)
+
+        writer_mock.assert_called_once()
+        payload = writer_mock.call_args[0][0]
+        assert payload["type"] == "security_review_failed"
+        assert payload["source"] == "security_review"
+        assert payload["tool_call_id"] == "call_fail"
+        assert payload["tool_name"] == "write"
+        assert payload["risk_level"] == "high"
+        assert "outside" in payload["reason"]
+        assert isinstance(payload["timestamp"], float)
+
+    def test_silent_when_no_writer(self) -> None:
+        """Without a stream writer, the call is a silent no-op (fail-silent,
+        not fail-closed — the HITL interrupt still happens independently)."""
+        tc = _make_tool_call("write")
+        with patch(
+            "mambo_agents.middleware.security_review.get_stream_writer",
+            side_effect=RuntimeError("no context"),
+        ):
+            AutoSecurityReviewMiddleware._emit_fail_notification(tc, _UNSAFE_RESULT)
+        # No exception raised
+
+
+# =============================================================================
+# 6. _ai_review — with mocked model
 # =============================================================================
 
 
@@ -256,8 +443,8 @@ class TestAiReview:
         assert result.is_safe is False
         assert "outside" in result.reason
 
-    def test_ai_review_fallback_parses_unsafe_text(self, mock_model: MagicMock) -> None:
-        """When structured output fails, raw text containing 'unsafe' is detected."""
+    def test_ai_review_fallback_returns_unsafe(self, mock_model: MagicMock) -> None:
+        """When structured output fails, fail-closed → UNSAFE, never auto-approve."""
         mw = AutoSecurityReviewMiddleware(
             interrupt_on={"write": True},
             model=mock_model,
@@ -265,28 +452,38 @@ class TestAiReview:
         # Make structured output fail
         mock_model.with_structured_output.side_effect = ValueError("unsupported")
 
-        # Raw invoke returns text with "unsafe"
+        # Raw invoke fallback returns a diagnostic message
         mock_msg = MagicMock()
-        mock_msg.content = "This tool call is UNSAFE because it writes to /etc"
+        mock_msg.content = "Error: tool calling not available"
         mock_model.invoke.return_value = mock_msg
 
         result = mw._ai_review(_make_tool_call("write"))
         assert result.is_safe is False
-        assert "UNSAFE" in result.reason
+        assert result.risk_level == "high"
+        assert "structured output failed" in result.reason.lower()
+        assert "ValueError" in result.reason
+        assert "unsupported" in result.reason
+        assert "Error: tool calling not available" in result.reason
 
-    def test_ai_review_fallback_parses_safe_text(self, mock_model: MagicMock) -> None:
-        """When structured output fails, raw text without 'unsafe' is deemed safe."""
+    def test_ai_review_fallback_never_auto_approves(
+        self, mock_model: MagicMock,
+    ) -> None:
+        """Even if the model 'thinks' the call is safe in raw text, fail-closed
+        means we NEVER auto-approve on parse failure — always UNSAFE."""
         mw = AutoSecurityReviewMiddleware(
             interrupt_on={"write": True},
             model=mock_model,
         )
         mock_model.with_structured_output.side_effect = ValueError("unsupported")
+        # Raw text says "safe" — but we ignore it now
         mock_msg = MagicMock()
         mock_msg.content = "This looks completely fine."
         mock_model.invoke.return_value = mock_msg
 
         result = mw._ai_review(_make_tool_call("write"))
-        assert result.is_safe is True
+        # Fail-closed: structured output failed → UNSAFE, NOT safe
+        assert result.is_safe is False
+        assert "This looks completely fine" in result.reason
 
     def test_ai_review_includes_tool_description(self, mock_model: MagicMock) -> None:
         """Verify that tool description is sent to the model."""
@@ -308,12 +505,12 @@ class TestAiReview:
 
 
 # =============================================================================
-# 6. _build_action_and_config — human-facing description
+# 7. _build_action_and_config — human-facing description
 # =============================================================================
 
 
 class TestBuildActionAndConfig:
-    def test_no_ai_review(self) -> None:
+    def test_builds_clean_description(self) -> None:
         mw = AutoSecurityReviewMiddleware(
             interrupt_on={"write": True},
             model=FakeListChatModel(responses=[]),
@@ -321,32 +518,19 @@ class TestBuildActionAndConfig:
         tc = _make_tool_call("write")
         cfg = mw._interrupt_on["write"]
         action, review = mw._build_action_and_config(tc, cfg)
-        assert action["name"] == "write"
-        assert action["args"] == tc["args"]
-        assert "AI" not in str(action.get("description", ""))
-        assert "/test.txt" in str(action.get("description", ""))
-
-    def test_with_ai_review_result(self) -> None:
-        mw = AutoSecurityReviewMiddleware(
-            interrupt_on={"write": True},
-            model=FakeListChatModel(responses=[]),
-        )
-        tc = _make_tool_call("write")
-        cfg = mw._interrupt_on["write"]
-        review = SecurityReviewResult(
-            is_safe=False,
-            reason="Modifying /etc/hosts is dangerous",
-            risk_level="critical",
-        )
-        action, _review_cfg = mw._build_action_and_config(tc, cfg, ai_review=review)
-        desc = str(action.get("description", ""))
-        assert "UNSAFE" in desc or "安全审查" in desc  # AI header
-        assert "CRITICAL" in desc or "critical" in desc.lower()
-        assert "Modifying" in desc or "/etc/hosts" in desc
+        assert action.name == "write"
+        assert action.args == tc["args"]
+        assert action.tool_call_id == "call_1"
+        desc = action.description or ""
+        # Clean — no AI header injection
+        assert "AI" not in desc
+        assert "UNSAFE" not in desc
+        assert "安全审查" not in desc
+        assert "/test.txt" in desc
 
 
 # =============================================================================
-# 7. _process_decision
+# 8. _process_decision
 # =============================================================================
 
 
@@ -409,7 +593,7 @@ class TestProcessDecision:
 
 
 # =============================================================================
-# 8. after_model — main interception logic (mocked)
+# 9. after_model — main interception logic (mocked)
 # =============================================================================
 
 
@@ -450,6 +634,58 @@ class TestAfterModelNoOp:
             ]
         }
         assert mw.after_model(state, _EMPTY_RUNTIME) is None
+
+    def test_replay_skips_ai_review_matches_by_tool_call_id(self) -> None:
+        """On replay, AI review is NOT called.  Decisions are matched to
+        tool_calls by ``tool_call_id``."""
+        mw = AutoSecurityReviewMiddleware(
+            interrupt_on={"write": True, "edit": True},
+            model=FakeListChatModel(responses=[]),
+        )
+        mw._ai_review = MagicMock(side_effect=RuntimeError("must not be called"))  # type: ignore[method-assign]
+
+        tc_write = _make_tool_call("write", call_id="cw")
+        tc_edit = _make_tool_call("edit", {"file_path": "/f", "old_str": "a", "new_str": "b"}, "ce")
+        ai_msg = AIMessage(content="", tool_calls=[tc_write, tc_edit])
+        state = {"messages": [ai_msg]}
+
+        scratchpad = MagicMock()
+        scratchpad.resume = ["fake"]
+        with patch(
+            "mambo_agents.middleware.security_review.CONFIG_KEY_SCRATCHPAD",
+            "_test_scratchpad",
+        ), patch(
+            "mambo_agents.middleware.security_review.get_config",
+            return_value={"configurable": {"_test_scratchpad": scratchpad}},
+        ), patch(
+            "mambo_agents.middleware.security_review.interrupt",
+            return_value={
+                "decisions": [{"type": "approve", "tool_call_id": "ce"}]
+            },
+        ):
+            result = mw.after_model(state, _EMPTY_RUNTIME)
+
+        mw._ai_review.assert_not_called()
+        assert result is not None
+        # write was auto-approved (no decision), edit matches by tool_call_id
+        revised = result["messages"][0].tool_calls
+        assert len(revised) == 2
+        names = [t["name"] for t in revised]
+        assert "write" in names
+        assert "edit" in names
+
+    def test_replay_no_tool_calls_returns_none(self) -> None:
+        """When the last AIMessage has no tool_calls, after_model returns None."""
+        mw = AutoSecurityReviewMiddleware(
+            interrupt_on={"write": True},
+            model=FakeListChatModel(responses=[]),
+        )
+        ai_msg = AIMessage(content="done", tool_calls=[])
+        state = {"messages": [ai_msg]}
+        mw._ai_review = MagicMock(side_effect=RuntimeError("must not be called"))  # type: ignore[method-assign]
+        result = mw.after_model(state, _EMPTY_RUNTIME)
+        assert result is None
+        mw._ai_review.assert_not_called()
 
 
 class TestAfterModelAiAutoApproved:
@@ -493,6 +729,43 @@ class TestAfterModelAiAutoApproved:
         result = mw.after_model(state, _EMPTY_RUNTIME)
         assert result is None
 
+    def test_notify_on_pass_true_calls_emit(self) -> None:
+        """When notify_on_pass=True (default), _emit_pass_notification is invoked."""
+        mw = AutoSecurityReviewMiddleware(
+            interrupt_on={"write": True},
+            model=FakeListChatModel(responses=[]),
+        )
+        mw._ai_review = MagicMock(return_value=_SAFE_RESULT)  # type: ignore[method-assign]
+        mw._emit_pass_notification = MagicMock()  # type: ignore[method-assign]
+
+        state = {
+            "messages": [
+                AIMessage(content="", tool_calls=[_make_tool_call("write")]),
+            ]
+        }
+        result = mw.after_model(state, _EMPTY_RUNTIME)
+        assert result is None
+        mw._emit_pass_notification.assert_called_once()
+
+    def test_notify_on_pass_false_skips_emit(self) -> None:
+        """When notify_on_pass=False, _emit_pass_notification is never called."""
+        mw = AutoSecurityReviewMiddleware(
+            interrupt_on={"write": True},
+            model=FakeListChatModel(responses=[]),
+            notify_on_pass=False,
+        )
+        mw._ai_review = MagicMock(return_value=_SAFE_RESULT)  # type: ignore[method-assign]
+        mw._emit_pass_notification = MagicMock()  # type: ignore[method-assign]
+
+        state = {
+            "messages": [
+                AIMessage(content="", tool_calls=[_make_tool_call("write")]),
+            ]
+        }
+        result = mw.after_model(state, _EMPTY_RUNTIME)
+        assert result is None
+        mw._emit_pass_notification.assert_not_called()
+
 
 class TestAfterModelAiUnsafeEscalatesToHuman:
     """AI flags unsafe → interrupt() called, decisions processed."""
@@ -503,6 +776,7 @@ class TestAfterModelAiUnsafeEscalatesToHuman:
             model=FakeListChatModel(responses=[]),
         )
         mw._ai_review = MagicMock(return_value=_UNSAFE_RESULT)  # type: ignore[method-assign]
+        mw._emit_fail_notification = MagicMock()  # type: ignore[method-assign]
 
         tc = _make_tool_call("write", call_id="call_1")
         state = {
@@ -517,13 +791,15 @@ class TestAfterModelAiUnsafeEscalatesToHuman:
         ) as mock_interrupt:
             result = mw.after_model(state, _EMPTY_RUNTIME)
 
-        # interrupt was called with HITLRequest containing AI assessment
+        # Fail event emitted BEFORE interrupt
+        mw._emit_fail_notification.assert_called_once()
         mock_interrupt.assert_called_once()
         hitl: Any = mock_interrupt.call_args[0][0]
         assert hitl["action_requests"][0]["name"] == "write"
-        # AI review reason should be in the human-facing description
+        # Description is clean — AI info NOT injected
         desc = str(hitl["action_requests"][0].get("description", ""))
-        assert "unsafe" in desc.lower() or "UNSAFE" in desc
+        assert "UNSAFE" not in desc
+        assert "安全审查" not in desc
 
         # Approved → tool_calls preserved as-is
         assert result is not None
@@ -713,7 +989,7 @@ class TestAfterModelPreservesNonInterruptTools:
 
 
 # =============================================================================
-# 9. Integration test — create_mambo_agent + security_review config
+# 10. Integration test — create_mambo_agent + security_review config
 # =============================================================================
 
 

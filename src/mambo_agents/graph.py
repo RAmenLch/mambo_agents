@@ -12,7 +12,7 @@ from collections.abc import Sequence
 from typing import Any
 
 from langchain.agents.factory import create_agent as _langchain_create_agent
-from langchain.agents.middleware import HumanInTheLoopMiddleware, InterruptOnConfig
+from langchain.agents.middleware import InterruptOnConfig
 from langchain.agents.middleware.types import AgentMiddleware
 from langchain_core.language_models import BaseChatModel
 from langchain_core.runnables import RunnableConfig
@@ -413,7 +413,18 @@ def create_mambo_agent(
             )
         else:
             # ---- Classic HITL (no AI review) ----
-            mw.append(HumanInTheLoopMiddleware(interrupt_on=interrupt_on))
+            # Use AutoSecurityReviewMiddleware with empty review_tools to get
+            # tool_call_id in interrupt payloads (same behaviour as upstream
+            # HumanInTheLoopMiddleware, but with proper tool_call linking).
+            mw.append(
+                AutoSecurityReviewMiddleware(
+                    interrupt_on=interrupt_on,
+                    model=model,
+                    backend=backend,
+                    review_tools=frozenset(),
+                    tool_descriptions=build_tool_descriptions(backend, tools=tools),
+                )
+            )
 
     # ---- Safety net (always on) -------------------------------------------
     # Patch first to fill dangling ToolMessages, then reorder to match

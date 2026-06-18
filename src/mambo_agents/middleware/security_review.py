@@ -46,13 +46,11 @@ Users opt-in via the ``security_review`` parameter of ``create_mambo_agent``.
 
 from __future__ import annotations
 
+import time
 from typing import Any, Literal
 
 from langchain.agents.middleware.human_in_the_loop import (  # type: ignore[import-untyped]
-    ActionRequest,
-    HITLRequest,
     InterruptOnConfig,
-    ReviewConfig,
 )
 from langchain.agents.middleware.types import (  # type: ignore[import-untyped]
     AgentMiddleware,
@@ -67,6 +65,8 @@ from langchain_core.messages import (
     ToolMessage,
 )
 from langchain_core.runnables import RunnableConfig
+from langgraph._internal._constants import CONFIG_KEY_SCRATCHPAD
+from langgraph.config import get_config, get_stream_writer
 from langgraph.runtime import Runtime
 from langgraph.types import interrupt
 from langgraph.typing import ContextT
@@ -116,6 +116,88 @@ class SecurityReviewConfig(BaseModel):
             "others fall through to direct HITL (no AI)."
         ),
     )
+    notify_on_pass: bool = Field(
+        default=True,
+        description=(
+            "When ``True`` (default), a ``SecurityReviewPassedEvent`` custom "
+            "stream event is emitted for every tool call that passes AI review. "
+            "The event carries ``tool_call_id``, ``tool_name``, ``risk_level`` "
+            "and ``reason`` so consumers can bind it to the exact tool call "
+            "without injecting messages into the LLM context."
+        ),
+    )
+
+
+class SecurityReviewPassedEvent(BaseModel):
+    """Custom stream event emitted when an AI security review passes.
+
+    This event is **not** a LangGraph message — it is written via
+    ``get_stream_writer()`` so it neither enters the LLM context nor
+    triggers any graph execution.  Consumers receive it when streaming
+    with ``stream_mode=["custom"]``.
+    """
+
+    model_config = ConfigDict(frozen=True)
+
+    type: Literal["security_review_passed"] = "security_review_passed"
+    """Discriminator for custom event routing."""
+
+    source: Literal["security_review"] = Field(
+        default="security_review",
+        description="Identifies the middleware source of this event.",
+    )
+    tool_call_id: str = Field(
+        description="The ``id`` of the tool call that passed review.",
+    )
+    tool_name: str = Field(
+        description="Name of the reviewed tool.",
+    )
+    risk_level: Literal["low", "medium", "high", "critical"] = Field(
+        description="AI-assessed risk level of the tool call.",
+    )
+    reason: str = Field(
+        description="Brief explanation for why the tool call was deemed safe.",
+    )
+    timestamp: float = Field(
+        default_factory=time.time,
+        description="Unix timestamp when the event was emitted.",
+    )
+
+
+class SecurityReviewFailedEvent(BaseModel):
+    """Custom stream event emitted when an AI security review flags a tool
+    call as unsafe (before escalating to human review via ``interrupt()``).
+
+    Emitted **before** ``interrupt()`` so the consumer receives it in the
+    same stream tick, before the graph pauses.  Consumers receive it when
+    streaming with ``stream_mode=["custom"]``.
+    """
+
+    model_config = ConfigDict(frozen=True)
+
+    type: Literal["security_review_failed"] = "security_review_failed"
+    """Discriminator for custom event routing."""
+
+    source: Literal["security_review"] = Field(
+        default="security_review",
+        description="Identifies the middleware source of this event.",
+    )
+    tool_call_id: str = Field(
+        description="The ``id`` of the tool call that failed review.",
+    )
+    tool_name: str = Field(
+        description="Name of the reviewed tool.",
+    )
+    risk_level: Literal["low", "medium", "high", "critical"] = Field(
+        description="AI-assessed risk level of the tool call.",
+    )
+    reason: str = Field(
+        description="Explanation for why the tool call was flagged unsafe.",
+    )
+    timestamp: float = Field(
+        default_factory=time.time,
+        description="Unix timestamp when the event was emitted.",
+    )
 
 
 class SecurityReviewResult(BaseModel):
@@ -135,6 +217,77 @@ class SecurityReviewResult(BaseModel):
     risk_level: Literal["low", "medium", "high", "critical"] = Field(
         default="low",
         description="Assessed risk level of the tool call.",
+    )
+
+
+class ActionRequest(BaseModel):
+    """An action that requires human approval before execution.
+
+    Carries ``tool_call_id`` so consumers can precisely match each action
+    to a specific tool call from the originating ``AIMessage``, even when
+    multiple tool calls of the same name are interrupted together.
+
+    Replaces langchain's ``ActionRequest`` TypedDict.
+    """
+
+    model_config = ConfigDict(frozen=True)
+
+    name: str = Field(description="The name of the action being requested.")
+    args: dict[str, Any] = Field(
+        description="Key-value pairs of args needed for the action.",
+    )
+    tool_call_id: str = Field(
+        description="The ``id`` of the originating ``ToolCall``.",
+    )
+    description: str | None = Field(
+        default=None,
+        description="Human-readable description of the action to be reviewed.",
+    )
+
+
+class ReviewConfig(BaseModel):
+    """Review configuration for a human-in-the-loop action.
+
+    Carries ``tool_call_id`` alongside ``action_name`` for unambiguous
+    action identification.
+
+    Replaces langchain's ``ReviewConfig`` TypedDict.
+    """
+
+    model_config = ConfigDict(frozen=True)
+
+    action_name: str = Field(
+        description="Name of the action associated with this review configuration.",
+    )
+    tool_call_id: str = Field(
+        description="The ``id`` of the originating ``ToolCall``.",
+    )
+    allowed_decisions: list[str] = Field(
+        description="The decisions that are allowed for this action.",
+    )
+    args_schema: dict[str, Any] | None = Field(
+        default=None,
+        description="JSON schema for the args associated with the action.",
+    )
+
+
+class HITLRequest(BaseModel):
+    """Request for human feedback on a sequence of tool calls.
+
+    Each ``ActionRequest`` and ``ReviewConfig`` carries a ``tool_call_id``
+    so the consumer can unambiguously associate decisions with specific
+    tool calls.
+
+    Replaces langchain's ``HITLRequest`` TypedDict.
+    """
+
+    model_config = ConfigDict(frozen=True)
+
+    action_requests: list[ActionRequest] = Field(
+        description="A list of agent actions for human review.",
+    )
+    review_configs: list[ReviewConfig] = Field(
+        description="Review configuration for all actions under review.",
     )
 
 
@@ -245,6 +398,12 @@ class AutoSecurityReviewMiddleware(
     - Tool in ``interrupt_on`` but **not** in ``review_tools`` →
       direct HITL (no AI review), same as ``HumanInTheLoopMiddleware``.
 
+    **Replay** — detected via ``CONFIG_KEY_SCRATCHPAD``.  On replay the
+    AI review is **skipped entirely**.  User decisions (which carry
+    ``tool_call_id`` from the ``ActionRequest``) are matched directly to
+    ``last_ai_msg.tool_calls`` by id.  Auto-approved tools (no matching
+    decision) are preserved as-is.
+
     Parameters
     ----------
     interrupt_on:
@@ -286,6 +445,7 @@ class AutoSecurityReviewMiddleware(
         security_review_system_prompt: str | None = None,
         description_prefix: str = "Tool execution requires approval",
         tool_descriptions: dict[str, str] | None = None,
+        notify_on_pass: bool = True,
     ) -> None:
         super().__init__()
 
@@ -330,6 +490,9 @@ class AutoSecurityReviewMiddleware(
 
         # ---------- tool descriptions for richer review context ----------
         self._tool_descriptions: dict[str, str] = tool_descriptions or {}
+
+        # ---------- notify-on-pass ----------
+        self._notify_on_pass: bool = notify_on_pass
 
     # ------------------------------------------------------------------
     # Resolve file content from backend (for write / edit tools)
@@ -433,47 +596,101 @@ class AutoSecurityReviewMiddleware(
         # polluting the main agent's message stream.
         _isolated_config: RunnableConfig = {"callbacks": []}
 
-        # Attempt structured-output (JSON-schema mode) for reliable parsing.
+        # Attempt structured output via function-calling (tools API).
+        # Chosen over ``json_schema`` because DeepSeek and other third-party
+        # providers do not support OpenAI's Structured Output API
+        # (``response_format: {type: "json_schema", ...}``), but universally
+        # support the standard function-calling / tool-calling protocol.
         try:
             structured_model = self._review_model.with_structured_output(
                 SecurityReviewResult,
-                method="json_schema",
+                method="function_calling",
             )
             response: SecurityReviewResult = structured_model.invoke(
                 messages, config=_isolated_config,
             )
             return response
-        except Exception:
-            pass
+        except Exception as exc:
+            exc_info = f"{type(exc).__name__}: {exc}"
 
-        # Fallback: try without explicit method
+        # Fail-closed: structured output failed — gather diagnostics then
+        # escalate to human review.  We try a raw invoke to capture the
+        # model's unparsed response for context.
+        raw_excerpt = ""
         try:
-            structured_model = self._review_model.with_structured_output(
-                SecurityReviewResult,
-            )
-            response = structured_model.invoke(
-                messages, config=_isolated_config,
-            )
-            return response
+            raw = self._review_model.invoke(messages, config=_isolated_config)
+            raw_content = raw.content if hasattr(raw, "content") else str(raw)
+            # Truncate to avoid a giant reason string
+            if isinstance(raw_content, str) and len(raw_content) > 500:
+                raw_excerpt = raw_content[:500] + "..."
+            elif isinstance(raw_content, str):
+                raw_excerpt = raw_content
         except Exception:
-            pass
+            raw_excerpt = "(unable to retrieve raw response)"
 
-        # Last-resort fallback: parse raw text
-        raw = self._review_model.invoke(messages, config=_isolated_config)
-        content = raw.content if hasattr(raw, "content") else str(raw)
-        content_lower = content.lower()
-
-        if "unsafe" in content_lower or "not safe" in content_lower:
-            return SecurityReviewResult(
-                is_safe=False,
-                reason=content.strip()[:200],
-                risk_level="high",
-            )
         return SecurityReviewResult(
-            is_safe=True,
-            reason="Auto-parsed as safe from text response",
-            risk_level="low",
+            is_safe=False,
+            reason=(
+                f"Security review unavailable: structured output failed. "
+                f"Exception: {exc_info} | "
+                f"Raw response: {raw_excerpt}"
+            ),
+            risk_level="high",
         )
+
+    # ------------------------------------------------------------------
+    # Emit pass notification (custom stream event — no LLM context pollution)
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _emit_pass_notification(
+        tool_call: ToolCall,
+        review: SecurityReviewResult,
+    ) -> None:
+        """Emit a ``SecurityReviewPassedEvent`` via the stream writer.
+
+        The event is a custom stream payload (not a LangGraph message), so
+        it does **not** enter the LLM context or affect agent execution.
+        Consumers receive it when streaming with ``stream_mode=["custom"]``.
+
+        When there is no active langgraph runnable context (e.g. unit
+        tests that call ``after_model`` directly), the ``RuntimeError``
+        from ``get_stream_writer()`` is silently caught — the notification
+        is best-effort, not critical.
+        """
+        try:
+            writer = get_stream_writer()
+        except RuntimeError:
+            return  # No langgraph context (e.g. unit tests)
+        event = SecurityReviewPassedEvent(
+            tool_call_id=tool_call["id"],
+            tool_name=tool_call["name"],
+            risk_level=review.risk_level,
+            reason=review.reason,
+        )
+        writer(event.model_dump())
+
+    @staticmethod
+    def _emit_fail_notification(
+        tool_call: ToolCall,
+        review: SecurityReviewResult,
+    ) -> None:
+        """Emit a ``SecurityReviewFailedEvent`` via the stream writer
+        **before** ``interrupt()`` blocks the stream.
+
+        See ``_emit_pass_notification`` for context-semantics notes.
+        """
+        try:
+            writer = get_stream_writer()
+        except RuntimeError:
+            return  # No langgraph context (e.g. unit tests)
+        event = SecurityReviewFailedEvent(
+            tool_call_id=tool_call["id"],
+            tool_name=tool_call["name"],
+            risk_level=review.risk_level,
+            reason=review.reason,
+        )
+        writer(event.model_dump())
 
     # ------------------------------------------------------------------
     # Build human-facing action / config (mirrors HITL middleware)
@@ -483,17 +700,18 @@ class AutoSecurityReviewMiddleware(
         self,
         tool_call: ToolCall,
         config: InterruptOnConfig,
-        *,
-        ai_review: SecurityReviewResult | None = None,
     ) -> tuple[ActionRequest, ReviewConfig]:
         """Create an ``ActionRequest`` and ``ReviewConfig`` for a tool call.
 
-        When *ai_review* is provided (AI pre-screened & flagged unsafe), its
-        ``reason`` and ``risk_level`` are prepended to the description so the
-        human reviewer can see the AI's assessment.
+        Both carry ``tool_call_id`` so the consumer can unambiguously
+        associate the HITL interrupt with a specific tool call.
+
+        The ``description`` is kept clean — AI review results are delivered
+        separately via ``SecurityReviewFailedEvent`` custom stream events.
         """
         tool_name = tool_call["name"]
         tool_args = tool_call["args"]
+        tool_call_id: str = tool_call["id"]
 
         # --- base description (from user config or defaults) ---
         description_value = config.get("description")
@@ -507,24 +725,15 @@ class AutoSecurityReviewMiddleware(
                 f"Tool: {tool_name}\nArgs: {tool_args}"
             )
 
-        # --- inject AI review assessment if available ---
-        if ai_review is not None:
-            ai_header = (
-                f"\n\n{'─' * 50}\n"
-                f"🤖 AI 安全审查: **UNSAFE**\n"
-                f"   风险等级: {ai_review.risk_level.upper()}\n"
-                f"   判断理由: {ai_review.reason}\n"
-                f"{'─' * 50}"
-            )
-            description = ai_header + "\n\n" + description
-
         action_request = ActionRequest(
             name=tool_name,
             args=tool_args,
+            tool_call_id=tool_call_id,
             description=description,
         )
         review_config = ReviewConfig(
             action_name=tool_name,
+            tool_call_id=tool_call_id,
             allowed_decisions=config["allowed_decisions"],
         )
         return action_request, review_config
@@ -600,14 +809,11 @@ class AutoSecurityReviewMiddleware(
     ) -> dict[str, Any] | None:
         """Review tool calls with AI (if configured), escalate unsafe/hitl to human.
 
-        Steps
-        -----
-        1. Locate the last ``AIMessage`` and its ``tool_calls``.
-        2. Identify which calls match ``interrupt_on``.
-        3. For tools in ``review_tools`` → AI review → auto-approve safe ones.
-        4. For tools not in ``review_tools`` → direct HITL (no AI).
-        5. Combine all unsafe/direct-HITL calls into one ``HITLRequest`` → ``interrupt()``.
-        6. Process human decisions and return updated messages.
+        Writes auto-approved indices to ``_reviewed_msg_ids`` via
+        ``CONFIG_KEY_SEND`` before ``interrupt()``.  Send-writes are
+        persisted through ``put_writes`` and applied to the channel
+        via ``apply_writes`` on replay, so ``state["_reviewed_msg_ids"]``
+        carries the data on the second pass.
         """
         messages = state.get("messages", [])
         if not messages:
@@ -620,39 +826,89 @@ class AutoSecurityReviewMiddleware(
         if last_ai_msg is None or not last_ai_msg.tool_calls:
             return None
 
-        # ---- buckets ----
-        auto_approved: dict[int, bool] = {}  # index → ai-approved
-        actions_for_human: list[ActionRequest] = []
-        configs_for_human: list[ReviewConfig] = []
-        human_indices: list[int] = []  # tool_call indices that need human review
+        # ---- detect replay (interrupt scratchpad introspection) ----
+        try:
+            conf = get_config()["configurable"]
+        except RuntimeError:
+            is_replay = False  # outside runnable context (e.g. unit tests)
+        else:
+            scratchpad = conf.get(CONFIG_KEY_SCRATCHPAD)
+            is_replay = bool(scratchpad and scratchpad.resume)
+
+        if is_replay:
+            # REPLAY — the user already reviewed each action.  Skip AI
+            # review entirely.  Call ``interrupt()`` with a minimal
+            # payload to get the resume value (user decisions).  Match
+            # decisions to tool_calls by ``tool_call_id``.
+            decisions: list[dict[str, Any]] = interrupt({})["decisions"]  # type: ignore[assignment]
+            by_id = {d.get("tool_call_id"): d for d in decisions}
+
+            revised_tool_calls: list[ToolCall] = []
+            synthetic_tool_msgs: list[ToolMessage] = []
+
+            for tool_call in last_ai_msg.tool_calls:
+                config = self._interrupt_on.get(tool_call["name"])
+                if config is None:
+                    revised_tool_calls.append(tool_call)
+                    continue
+                decision = by_id.get(tool_call["id"])
+                if decision is None:
+                    # auto-approved by AI on first run — keep as-is
+                    revised_tool_calls.append(tool_call)
+                    continue
+                revised_call, tool_msg = self._process_decision(
+                    decision, tool_call, config,
+                )
+                if revised_call is not None:
+                    revised_tool_calls.append(revised_call)
+                if tool_msg is not None:
+                    synthetic_tool_msgs.append(tool_msg)
+
+            last_ai_msg.tool_calls = revised_tool_calls
+            return {"messages": [last_ai_msg, *synthetic_tool_msgs]}
+
+        # ---- FIRST RUN: AI security review for review_tools ----
+        auto_approved: dict[int, bool] = {}
+        failed_reviews: list[tuple[ToolCall, SecurityReviewResult]] = []
 
         for idx, tool_call in enumerate(last_ai_msg.tool_calls):
             config = self._interrupt_on.get(tool_call["name"])
             if config is None:
-                # Not in interrupt_on → pass through
                 continue
 
-            ai_review_result: SecurityReviewResult | None = None
-
             if self._should_ai_review(tool_call["name"]):
-                # ---- AI review path ----
                 review = self._ai_review(tool_call)
                 if review.is_safe:
                     auto_approved[idx] = True
+                    if self._notify_on_pass:
+                        self._emit_pass_notification(tool_call, review)
                     continue
-                # AI flagged unsafe → save reason for human, then fall through to HITL
-                ai_review_result = review
+                failed_reviews.append((tool_call, review))
 
-            # ---- direct HITL (or AI-flagged-unsafe) ----
+        # Emit fail events.
+        for tool_call, review in failed_reviews:
+            self._emit_fail_notification(tool_call, review)
+
+        # ---- build human-review actions ----
+        actions_for_human: list[ActionRequest] = []
+        configs_for_human: list[ReviewConfig] = []
+        human_indices: list[int] = []
+
+        for idx, tool_call in enumerate(last_ai_msg.tool_calls):
+            config = self._interrupt_on.get(tool_call["name"])
+            if config is None:
+                continue
+            if idx in auto_approved:
+                continue
+
             action_req, review_cfg = self._build_action_and_config(
-                tool_call, config, ai_review=ai_review_result,
+                tool_call, config,
             )
             actions_for_human.append(action_req)
             configs_for_human.append(review_cfg)
             human_indices.append(idx)
 
         if not actions_for_human:
-            # All either auto-approved or pass-through
             return None
 
         # ---- interrupt for human review ----
@@ -660,7 +916,7 @@ class AutoSecurityReviewMiddleware(
             action_requests=actions_for_human,
             review_configs=configs_for_human,
         )
-        decisions = interrupt(hitl_request)["decisions"]
+        decisions = interrupt(hitl_request.model_dump(exclude_none=True))["decisions"]
 
         if len(decisions) != len(actions_for_human):
             msg = (
@@ -676,10 +932,8 @@ class AutoSecurityReviewMiddleware(
         decision_iter = iter(decisions)
         for idx, tool_call in enumerate(last_ai_msg.tool_calls):
             if idx in auto_approved:
-                # Auto-approved by AI — keep as-is
                 revised_tool_calls.append(tool_call)
             elif idx in human_indices:
-                # Human-reviewed
                 config = self._interrupt_on[tool_call["name"]]
                 decision = next(decision_iter)
                 revised_call, tool_msg = self._process_decision(
@@ -690,7 +944,6 @@ class AutoSecurityReviewMiddleware(
                 if tool_msg is not None:
                     synthetic_tool_msgs.append(tool_msg)
             else:
-                # Not in interrupt_on — keep as-is
                 revised_tool_calls.append(tool_call)
 
         last_ai_msg.tool_calls = revised_tool_calls
