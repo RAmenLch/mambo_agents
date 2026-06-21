@@ -511,6 +511,11 @@ Multi-source loading: later-loaded skills override earlier ones with the same na
 
 **Purpose:** Review tool calls for safety before actual execution (or before pausing for human approval), using a cheaper model.
 
+Two review modes:
+
+- **llm** (default): single structured-output LLM call per tool call — fast and cheap.
+- **agent**: a dedicated review agent with read-only backend tools that can inspect the workspace before delivering a verdict via ``最终审核结果``. Backend tools (core 6 + ``backend.tools``) get agent review; non-backend user tools fall back to llm review.
+
 ```python
 # Classic HITL (no AI pre-review)
 agent = create_mambo_agent(
@@ -518,13 +523,23 @@ agent = create_mambo_agent(
     interrupt_on={"write": True, "edit": True},
 )
 
-# AI pre-review — all interrupt_on tools
+# AI pre-review — llm mode (default)
 from mambo_agents.middleware.security_review import SecurityReviewConfig
 
 agent = create_mambo_agent(
     "gpt-4o",
     interrupt_on={"write": True, "edit": True, "delete": True},
     security_review=SecurityReviewConfig(),
+)
+
+# Agent-mode — backend tools reviewed by agent with read-only workspace
+agent = create_mambo_agent(
+    "gpt-4o",
+    interrupt_on={"write": True, "edit": True, "delete": True},
+    security_review=SecurityReviewConfig(
+        review_mode="agent",
+        agent_max_steps=5,
+    ),
 )
 
 # Custom pre-review — review only specific tools, using a separate model
@@ -878,6 +893,18 @@ SecurityReviewConfig(
     system_prompt: str | None = None,
     # None = use built-in security review prompt
     # custom = override the review prompt
+
+    review_mode: Literal["llm", "agent"] = "llm",
+    # "llm" = single LLM call per tool call (fast, default)
+    # "agent" = dedicated review agent with read-only backend tools
+    #           Backend tools → agent review; user tools → llm review
+
+    agent_max_steps: int = 5,
+    # Max steps for the review agent (only used in agent mode)
+
+    agent_tools: frozenset[str] | None = None,
+    # Backend tool names to expose to the review agent in agent mode
+    # None = all registered backend tools are available
 )
 ```
 

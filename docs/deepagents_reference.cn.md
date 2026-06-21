@@ -40,7 +40,7 @@
 
 | 对比维度 | deepagents | Mambo Agents | 取舍说明 |
 |----------|------------|--------------|----------|
-| **安全审查** | `HumanInTheLoopMiddleware`（简单人工审批） | `AutoSecurityReviewMiddleware`（AI 预审 + 人工兜底） | Mambo 增加 AI 自动审查层，减少人工审批打断频率 |
+| **安全审查** | `HumanInTheLoopMiddleware`（简单人工审批） | `AutoSecurityReviewMiddleware`（AI 预审 + 人工兜底；支持 llm 和 agent 双模式 — agent 模式运行专用审查 agent，配备只读后端工具） | Mambo 增加 AI 自动审查层，减少人工审批打断频率；agent 模式允许审查前检查工作区 |
 | **任务规划** | `TodoListMiddleware`（简单 TODO 管理） | `MamboPlanMiddleware`（结构化计划 + 摘要集成钩子） | Mambo 的计划与摘要系统深度耦合，防止压缩丢失计划状态 |
 | **多模型兼容** | ❌ 无工具消息重排序 | ✅ `ReorderToolMessagesMiddleware` | 某些多模态模型对工具消息顺序敏感，Mambo 显式处理 |
 | **工具扩展性** | `FilesystemMiddleware`（六核心工具 + 后端额外工具 + 多模态 read） | ✅ `BackendToolsMiddleware`（六核心工具 + 后端额外工具自动注入）<br>• `include_line_numbers` 参数：Mambo 的 `read` 默认不返回行号，模型可自行决定在需要定位行号时传 `True`（deepagents 总是无条件加行号，不可关闭）<br>• `build_tool_descriptions()` 提取所有工具描述映射，供 `AutoSecurityReviewMiddleware` 安全审查时理解工具用途 | 基础工具层面的差异化：`include_line_numbers` 的可控性减少了无关噪音；`build_tool_descriptions()` 使工具描述可被其他中间件消费 |
@@ -87,7 +87,7 @@
 | 对话摘要 | `SummarizationMiddleware` | `MamboSummarizationMiddleware`（扩展）<br>• **链式摘要**：在多轮摘要中保留前次摘要内容，使用 `CHAINED_SUMMARY_PROMPT` 要求模型合并历史摘要而非覆盖，防止跨轮次信息丢失<br>• **CJK token 计数**：自动检测中文/日文/韩文字符占比，使用与英文不同的 chars-per-token 比例估算 token 数，避免 CJK 文本的 token 严重低估<br>• **保护最近用户消息**：确保最新的 user message 不会被摘要掉（langchain 基类无此保护）<br>• **可选后端持久化**：被移除的原始消息可写入 `BackendProtocol` 的 `/conversation_history/{thread_id}.md` 文件 |
 | 悬空工具修复 | `PatchToolCallsMiddleware` | `PatchToolCallsMiddleware`（保持） |
 | 工具消息重排序 | ❌ | ✅ `ReorderToolMessagesMiddleware` |
-| 安全审查 | `HumanInTheLoopMiddleware` | ✅ `AutoSecurityReviewMiddleware`（AI 预审 + 人工审批） |
+| 安全审查 | `HumanInTheLoopMiddleware` | ✅ `AutoSecurityReviewMiddleware`（AI 预审 + 人工审批；llm/agent 双模式） |
 | 任务规划 | `TodoListMiddleware` | ✅ `MamboPlanMiddleware`（结构化 + 摘要集成） |
 | 记忆加载 | `MemoryMiddleware` | ✅ `MamboMemoryMiddleware` |
 | 工具排除 | `_ToolExclusionMiddleware` | ❌ |

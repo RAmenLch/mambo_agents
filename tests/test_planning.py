@@ -566,6 +566,7 @@ class TestCreateAgentAutoWiring:
         assert "Task 1" in result
         assert "🔄" in result
 
+    @pytest.mark.integration
     def test_create_agent_with_plan_and_summarization(self):
         """Agent creation with both PlanMiddleware and summarization succeeds."""
         model = _get_model()
@@ -581,6 +582,7 @@ class TestCreateAgentAutoWiring:
         )
         assert agent is not None
 
+    @pytest.mark.integration
     def test_summarization_alone__no_plan(self):
         """Summarization without PlanMiddleware works fine."""
         model = _get_model()
@@ -592,6 +594,7 @@ class TestCreateAgentAutoWiring:
         )
         assert agent is not None
 
+    @pytest.mark.integration
     def test_plan_alone__no_summarization(self):
         """PlanMiddleware without summarization works fine."""
         model = _get_model()

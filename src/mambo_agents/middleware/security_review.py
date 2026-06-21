@@ -5,24 +5,31 @@ immediately pausing for human approval, this middleware **first** asks an
 AI to review each tool call for security risks.  Only tool calls that the
 AI flags as **unsafe** are escalated to human review via ``interrupt()``.
 
-When a ``backend`` is provided, the middleware can also inspect the
-**actual file content** involved—particularly useful for reviewing
-scripts (e.g., Python, shell, batch) that the AI agent generates.
-For ``write`` / ``edit`` operations the file path and content are
-read via the backend and included in the review context.
-
 Users opt-in via the ``security_review`` parameter of ``create_mambo_agent``.
+
+Two review modes are available:
+
+- **llm** (default): single structured-output LLM call per tool call.
+- **agent**: a dedicated review agent with optional read-only backend
+  tools.  The agent can inspect the workspace before delivering a
+  structured verdict via the ``最终审核结果`` tool.  Backend tools
+  (core 6 + ``backend.tools``) use agent review; non-backend user tools
+  fall back to llm review.
 
 .. code-block:: python
 
-    # Default — no AI review (classic HITL)
-    agent = create_mambo_agent("gpt-4o", interrupt_on={"write": True})
+    # Default — llm-mode review
+    agent = create_mambo_agent("gpt-4o", interrupt_on={"write": True},
+                               security_review=SecurityReviewConfig())
 
-    # Opt-in AI review — all interrupt_on tools
+    # Agent-mode — backend tools reviewed by agent with read-only workspace
     agent = create_mambo_agent(
         "gpt-4o",
         interrupt_on={"write": True, "edit": True},
-        security_review=SecurityReviewConfig(),
+        security_review=SecurityReviewConfig(
+            review_mode="agent",
+            agent_max_steps=5,
+        ),
     )
 
     # Custom: only review "edit" with a cheaper model
@@ -35,14 +42,8 @@ Users opt-in via the ``security_review`` parameter of ``create_mambo_agent``.
         ),
     )
 
-    # With backend — reads actual file content for deeper script review
-    agent = create_mambo_agent(
-        "gpt-4o",
-        interrupt_on={"write": True, "edit": True},
-        security_review=SecurityReviewConfig(),
-        backend=my_backend,
-    )
 """
+
 
 from __future__ import annotations
 
@@ -65,6 +66,7 @@ from langchain_core.messages import (
     ToolMessage,
 )
 from langchain_core.runnables import RunnableConfig
+from langchain_core.tools import BaseTool
 from langgraph._internal._constants import CONFIG_KEY_SCRATCHPAD
 from langgraph.config import get_config, get_stream_writer
 from langgraph.runtime import Runtime
@@ -73,7 +75,11 @@ from langgraph.typing import ContextT
 from pydantic import BaseModel, ConfigDict, Field
 
 from mambo_agents.backends.protocol import BackendProtocol
-
+from mambo_agents.middleware.review_agent import (
+    FinalReviewResult,
+    create_review_agent,
+    run_review_sync,
+)
 
 # ---------------------------------------------------------------------------
 # Pydantic models
@@ -86,6 +92,14 @@ class SecurityReviewConfig(BaseModel):
     Pass this to ``create_mambo_agent(security_review=...)`` to enable the
     feature.  Without it, ``interrupt_on`` uses classic
     ``HumanInTheLoopMiddleware`` with no AI review.
+
+    Two review modes are supported:
+
+    - ``"llm"`` (default): single structured-output LLM call per tool call.
+    - ``"agent"``: dedicated review agent with optional read-only backend
+      tools (``ls``/``read``/``grep``/``glob``) that can inspect the
+      workspace.  Backend tools get agent review; non-backend user tools
+      fall back to llm review.
 
     All fields are optional — sensible defaults are applied when omitted.
     """
@@ -124,6 +138,34 @@ class SecurityReviewConfig(BaseModel):
             "The event carries ``tool_call_id``, ``tool_name``, ``risk_level`` "
             "and ``reason`` so consumers can bind it to the exact tool call "
             "without injecting messages into the LLM context."
+        ),
+    )
+    review_mode: Literal["llm", "agent"] = Field(
+        default="llm",
+        description=(
+            "Review mode:\n"
+            "- ``'llm'`` (default): single LLM call with structured output.\n"
+            "- ``'agent'``: full review agent with optional read-only tools "
+            "that can inspect the workspace before delivering a verdict. "
+            "The agent MUST call ``最终审核结果`` within a limited number of steps."
+        ),
+    )
+    agent_max_steps: int = Field(
+        default=5,
+        description=(
+            "Max steps for the review agent (only used when "
+            "``review_mode='agent'``).  The agent is forced to deliver a "
+            "verdict within this limit."
+        ),
+    )
+    agent_tools: frozenset[str] | None = Field(
+        default=None,
+        description=(
+            "Backend tool names to expose to the review agent in agent mode. "
+            "``None`` (default) means all registered tools are available. "
+            "Set to an empty ``frozenset()`` to give the agent no tools "
+            "(pure LLM-style review).  Only read-only tools should be "
+            "included — the audit backend is already read-only."
         ),
     )
 
@@ -328,43 +370,33 @@ Respond with your structured assessment."""
 
 
 # ---------------------------------------------------------------------------
-# Helper – build review messages
+# Helper — build review messages
 # ---------------------------------------------------------------------------
+
 
 def _build_review_messages(
     system_prompt: str,
     tool_call: ToolCall,
     *,
     tool_description: str | None = None,
-    file_content: str | None = None,
-    file_content_label: str = "File content",
 ) -> list[SystemMessage | HumanMessage]:
-    """Construct messages for the security review model call.
+    """Build the system + human message pair for a security review.
 
-    When *tool_description* is provided, it is included so the AI reviewer
-    understands the tool's purpose and capabilities, not just its name.
-
-    When *file_content* is provided (via the backend), the actual script/file
-    body is included so the reviewer can inspect it for security risks.
-    *file_content_label* specifies how the content block is titled
-    (e.g. "Current file content" for edits, "New file content" for writes).
+    Parameters
+    ----------
+    system_prompt:
+        The system prompt for the reviewer.
+    tool_call:
+        The tool call to review.
+    tool_description:
+        Optional human-readable description of the tool's purpose.
+        When provided, injected into the human message so the reviewer
+        understands the intent behind the raw name + args.
     """
-    description_block = ""
+    desc_block = ""
     if tool_description:
-        description_block = (
-            f"**Tool description:** {tool_description}\n\n"
-        )
-
-    file_block = ""
-    if file_content is not None:
-        # Truncate very large files to avoid blowing context
-        max_chars = 12000
-        if len(file_content) > max_chars:
-            truncated = file_content[:max_chars] + "\n\n... [truncated]"
-        else:
-            truncated = file_content
-        file_block = (
-            f"**{file_content_label}:**\n```\n{truncated}\n```\n\n"
+        desc_block = (
+            f"\n**Tool description:** {tool_description}"
         )
 
     return [
@@ -373,10 +405,9 @@ def _build_review_messages(
             content=(
                 f"Please review the following tool call for security risks:\n\n"
                 f"**Tool name:** `{tool_call['name']}`\n"
-                f"{description_block}"
-                f"**Arguments:**\n```json\n{tool_call['args']}\n```\n"
-                f"{file_block}"
-            ).rstrip()
+                f"**Arguments:**\n```json\n{tool_call['args']}\n```"
+                f"{desc_block}"
+            )
         ),
     ]
 
@@ -412,12 +443,6 @@ class AutoSecurityReviewMiddleware(
     model:
         Chat model used for the security review.  Set to the agent model
         by default.
-    backend:
-        Optional backend for reading file content during review.
-        When provided and a tool call targets ``write`` or ``edit``,
-        the actual file content is read via the backend and included
-        in the review context so the AI can audit the script body.
-        ``None`` (default) reviews only the tool arguments.
     review_tools:
         Set of tool names to AI-review.  ``None`` (or empty) means every
         tool gets direct HITL (no AI).  ``"all"`` means every
@@ -428,10 +453,6 @@ class AutoSecurityReviewMiddleware(
     description_prefix:
         Prefix used when constructing human-facing action-request
         descriptions.
-    tool_descriptions:
-        Optional mapping of tool name → description for richer review
-        context.  If omitted, the reviewer only sees the tool name and
-        raw arguments, not its purpose or capabilities.
     """
 
     # ------------------------------------------------------------------
@@ -440,12 +461,16 @@ class AutoSecurityReviewMiddleware(
         interrupt_on: dict[str, bool | InterruptOnConfig],
         *,
         model: str | BaseChatModel,
-        backend: BackendProtocol | None = None,
         review_tools: frozenset[str] | Literal["all"] = "all",
         security_review_system_prompt: str | None = None,
         description_prefix: str = "Tool execution requires approval",
-        tool_descriptions: dict[str, str] | None = None,
         notify_on_pass: bool = True,
+        review_mode: Literal["llm", "agent"] = "llm",
+        agent_max_steps: int = 5,
+        agent_backend: BackendProtocol | None = None,
+        agent_tools: frozenset[str] | None = None,
+        tool_descriptions: dict[str, str] | None = None,
+        backend_tool_names: frozenset[str] = frozenset(),
     ) -> None:
         super().__init__()
 
@@ -463,14 +488,6 @@ class AutoSecurityReviewMiddleware(
         self._description_prefix = description_prefix
 
         # ---------- review model ----------
-        # IMPORTANT: the review model is invoked with an isolated config
-        # (``callbacks=[]``) in ``_ai_review()`` to prevent its internal
-        # LLM messages (SystemMessage, HumanMessage, AIMessage) from being
-        # captured by the main agent's ``stream_mode=["messages"]`` and
-        # emitted as stream events.  This isolation is applied at the
-        # ``invoke()`` call-site rather than at model-construction time so
-        # that we keep the same model instance (important for mocking in
-        # tests and for LangSmith tracing continuity).
         if isinstance(model, str):
             from langchain.chat_models import init_chat_model
 
@@ -482,78 +499,76 @@ class AutoSecurityReviewMiddleware(
             security_review_system_prompt or DEFAULT_SECURITY_REVIEW_SYSTEM_PROMPT
         )
 
-        # ---------- backend for file-content inspection ----------
-        self._backend: BackendProtocol | None = backend
-
         # ---------- which tools get AI-reviewed ----------
         self._review_tools: frozenset[str] | Literal["all"] = review_tools
-
-        # ---------- tool descriptions for richer review context ----------
-        self._tool_descriptions: dict[str, str] = tool_descriptions or {}
 
         # ---------- notify-on-pass ----------
         self._notify_on_pass: bool = notify_on_pass
 
+        # ---------- agent-mode config ----------
+        self._review_mode: Literal["llm", "agent"] = review_mode
+        self._agent_max_steps: int = agent_max_steps
+        self._agent_backend: BackendProtocol | None = agent_backend
+        self._agent_tools: frozenset[str] | None = agent_tools
+        self._tool_descriptions: dict[str, str] = tool_descriptions or {}
+        self._backend_tool_names: frozenset[str] = backend_tool_names
+
+        # ---------- agent-mode: pre-build review agent if backend available ----------
+        self._cached_review_agent: object | None = None
+        if self._review_mode == "agent":
+            self._init_review_agent()
+
     # ------------------------------------------------------------------
-    # Resolve file content from backend (for write / edit tools)
+    # Agent-mode: build the review agent once
     # ------------------------------------------------------------------
 
-    _FILE_PATH_KEYS: tuple[str, ...] = ("file_path", "path")
+    def _init_review_agent(self) -> None:
+        """Build (or rebuild) the agent-mode review agent.
 
-    def _resolve_file_content(
-        self,
-        tool_call: ToolCall,
-    ) -> tuple[str | None, str | None]:
-        """Read the file that the tool call targets, if a backend is available.
-
-        Returns
-        -------
-        (file_content, file_content_label)
-            - For ``write``: reads the *new* content from ``tool_call['args']['content']``
-              (if present) directly without a round-trip — the AI is evaluating
-              the content before it hits disk.
-            - For ``edit``: reads the *current* file via the backend so the
-              AI can see what's already on disk alongside the proposed changes.
-            - For other tools: ``(None, None)``.
+        Called from ``__init__`` when ``review_mode='agent'`` and also
+        lazily if the agent hasn't been built yet.
         """
-        if self._backend is None:
-            return None, None
+        from mambo_agents.middleware.backend_tools import build_core_tools
 
-        args = tool_call.get("args", {})
-        tool_name = tool_call["name"]
-
-        # --- write tool: the new content is already in the arguments ---
-        if tool_name in ("write", "awsrite", "awrite"):
-            content = args.get("content")
-            if isinstance(content, str) and content.strip():
-                return content, "New file content"
-            # If no inline content, try reading the target path
-            for key in self._FILE_PATH_KEYS:
-                path = args.get(key)
-                if path:
-                    break
+        tools: list[BaseTool] = []
+        if self._agent_backend is not None:
+            # Core read-only tools are always present — never filtered
+            core_tools = build_core_tools(self._agent_backend)
+            # agent_tools only controls EXTRA tools from the backend
+            if self._agent_tools is not None:
+                extra = [
+                    t for t in self._agent_backend.tools
+                    if t.name in self._agent_tools
+                ]
             else:
-                return None, None
-            result = self._backend.read(path)
-            if result.error is None and result.content:
-                return result.content, "Current file content"
-            return None, None
+                extra = list(self._agent_backend.tools)
+            tools = core_tools + extra
 
-        # --- edit tool: read the current file to show what's being changed ---
-        if tool_name in ("edit", "aedit"):
-            for key in self._FILE_PATH_KEYS:
-                path = args.get(key)
-                if path:
-                    break
-            else:
-                return None, None
-            result = self._backend.read(path)
-            if result.error is None and result.content:
-                return result.content, "Current file content (pre-edit)"
-            return None, None
+        # Inject backend description into prompt so the review agent
+        # understands path routing (e.g. HybridWorkspaceBackend's
+        # .mambo prefix, workspace_root, etc.).
+        # Use the agent-specific prompt by default, but let user-provided
+        # system_prompt override.
+        from mambo_agents.middleware.review_agent import DEFAULT_REVIEW_AGENT_SYSTEM_PROMPT
 
-        # --- other tools: no file content needed ---
-        return None, None
+        if self._review_system_prompt != DEFAULT_SECURITY_REVIEW_SYSTEM_PROMPT:
+            _prompt = self._review_system_prompt
+        else:
+            _prompt = DEFAULT_REVIEW_AGENT_SYSTEM_PROMPT.format(
+                max_steps=self._agent_max_steps,
+                final_tool_name="submit_review_verdict",
+            )
+        if self._agent_backend is not None:
+            _prompt += (
+                f"\n\n## 工作区信息\n\n{self._agent_backend.description}"
+            )
+
+        self._cached_review_agent = create_review_agent(
+            model=self._review_model,
+            system_prompt=_prompt,
+            tools=tools,
+            max_steps=self._agent_max_steps,
+        )
 
     # ------------------------------------------------------------------
     # AI security review (single tool call)
@@ -562,45 +577,50 @@ class AutoSecurityReviewMiddleware(
     def _ai_review(self, tool_call: ToolCall) -> SecurityReviewResult:
         """Ask the AI model to review a single tool call for security.
 
-        When a backend is configured, this method reads the actual file
-        content involved in ``write`` / ``edit`` calls so the reviewer
-        can inspect scripts for malicious patterns, backdoors, etc.
+        Two modes (controlled by ``review_mode``):
+
+        - **llm** (default): single structured-output LLM call, no tools.
+        - **agent**: full review agent with optional read-only tools that
+          can inspect the workspace.  The agent MUST call
+          ``最终审核结果`` within the configured step limit.
 
         .. important::
-            The review model is invoked with an **isolated config**
-            (``callbacks=[]``) so that the review messages (SystemMessage,
-            HumanMessage, and the model's response) are **not** captured
-            by the main agent's ``stream_mode=["messages"]`` and emitted
-            as stream events.  This prevents the security review internals
-            from polluting the agent's message stream.
+            In llm mode, the review model is invoked with an **isolated
+            config** (``callbacks=[]``) so that the review messages are
+            **not** captured by the main agent's stream.  Agent mode is
+            inherently isolated (separate graph).
 
         Returns
         -------
         SecurityReviewResult
             Structured assessment with ``is_safe``, ``reason`` and ``risk_level``.
         """
+        if self._review_mode == "agent" and self._should_agent_review(tool_call):
+            return self._ai_review_agent(tool_call)
+        return self._ai_review_llm(tool_call)
+
+    def _should_agent_review(self, tool_call: ToolCall) -> bool:
+        """Determine whether *tool_call* should use agent-mode review.
+
+        When ``review_mode='agent'`` and ``backend_tool_names`` is
+        non-empty, only backend tools get agent review; all others
+        fall through to LLM review.  When ``backend_tool_names`` is
+        empty (default), **all** tools get agent review.
+        """
+        if not self._backend_tool_names:
+            return True  # No routing info → agent for everything
+        return tool_call["name"] in self._backend_tool_names
+
+    def _ai_review_llm(self, tool_call: ToolCall) -> SecurityReviewResult:
+        """LLM-mode review — single structured-output call."""
         tool_desc = self._tool_descriptions.get(tool_call["name"])
-        file_content, file_label = self._resolve_file_content(tool_call)
         messages = _build_review_messages(
-            self._review_system_prompt,
-            tool_call,
+            self._review_system_prompt, tool_call,
             tool_description=tool_desc,
-            file_content=file_content,
-            file_content_label=file_label,
         )
 
-        # Isolate the review call from the main agent's streaming context.
-        # Without this, the review model's LLM messages (SystemMessage,
-        # HumanMessage, AI response) would be captured by langgraph's
-        # ``stream_mode=["messages"]`` and emitted to the consumer,
-        # polluting the main agent's message stream.
         _isolated_config: RunnableConfig = {"callbacks": []}
 
-        # Attempt structured output via function-calling (tools API).
-        # Chosen over ``json_schema`` because DeepSeek and other third-party
-        # providers do not support OpenAI's Structured Output API
-        # (``response_format: {type: "json_schema", ...}``), but universally
-        # support the standard function-calling / tool-calling protocol.
         try:
             structured_model = self._review_model.with_structured_output(
                 SecurityReviewResult,
@@ -613,14 +633,10 @@ class AutoSecurityReviewMiddleware(
         except Exception as exc:
             exc_info = f"{type(exc).__name__}: {exc}"
 
-        # Fail-closed: structured output failed — gather diagnostics then
-        # escalate to human review.  We try a raw invoke to capture the
-        # model's unparsed response for context.
         raw_excerpt = ""
         try:
             raw = self._review_model.invoke(messages, config=_isolated_config)
             raw_content = raw.content if hasattr(raw, "content") else str(raw)
-            # Truncate to avoid a giant reason string
             if isinstance(raw_content, str) and len(raw_content) > 500:
                 raw_excerpt = raw_content[:500] + "..."
             elif isinstance(raw_content, str):
@@ -637,6 +653,51 @@ class AutoSecurityReviewMiddleware(
             ),
             risk_level="high",
         )
+
+    def _ai_review_agent(self, tool_call: ToolCall) -> SecurityReviewResult:
+        """Agent-mode review — runs a mini review agent with optional tools."""
+        if self._cached_review_agent is None:
+            self._init_review_agent()
+
+        agent = self._cached_review_agent
+        if agent is None:
+            return SecurityReviewResult(
+                is_safe=False,
+                reason="Review agent unavailable — agent not initialised.",
+                risk_level="high",
+            )
+
+        tool_name = tool_call["name"]
+        tool_args = tool_call["args"]
+        tool_desc = ""
+        if self._tool_descriptions and tool_name in self._tool_descriptions:
+            tool_desc = f"\n**Tool description:** {self._tool_descriptions[tool_name]}"
+
+        review_prompt = (
+            f"Please review the following tool call for security risks:\n\n"
+            f"**Tool name:** `{tool_name}`\n"
+            f"**Arguments:**\n```json\n{tool_args}\n```"
+            f"{tool_desc}\n\n"
+            f"You may use read-only tools (ls, read, grep, glob) to inspect "
+            f"the workspace if needed.  When done, call `最终审核结果`."
+        )
+
+        try:
+            result: FinalReviewResult = run_review_sync(agent, review_prompt)
+            return SecurityReviewResult(
+                is_safe=result.is_safe,
+                reason=result.reason,
+                risk_level=result.risk_level,
+            )
+        except Exception as exc:
+            return SecurityReviewResult(
+                is_safe=False,
+                reason=(
+                    f"Review agent failed: {type(exc).__name__}: {exc}. "
+                    f"Escalating to human review."
+                ),
+                risk_level="high",
+            )
 
     # ------------------------------------------------------------------
     # Emit pass notification (custom stream event — no LLM context pollution)
@@ -793,7 +854,7 @@ class AutoSecurityReviewMiddleware(
         raise ValueError(msg)
 
     # ------------------------------------------------------------------
-    # after_model — main interception logic (mixed AI-review + direct-HITL)
+    # after_model — main interception logic
     # ------------------------------------------------------------------
 
     def _should_ai_review(self, tool_name: str) -> bool:
@@ -802,152 +863,148 @@ class AutoSecurityReviewMiddleware(
             return tool_name in self._interrupt_on
         return tool_name in self._review_tools
 
+    @staticmethod
+    def _get_last_ai_message(state: AgentState[Any]) -> AIMessage | None:
+        """Return the last AIMessage with tool_calls, or None."""
+        messages = state.get("messages", [])
+        if not messages:
+            return None
+        last = next(
+            (msg for msg in reversed(messages) if isinstance(msg, AIMessage)),
+            None,
+        )
+        if last is None or not last.tool_calls:
+            return None
+        return last
+
+    @staticmethod
+    def _detect_replay() -> bool:
+        """Return True if the node is being re-executed after an interrupt."""
+        try:
+            conf = get_config()["configurable"]
+        except RuntimeError:
+            return False
+        scratchpad = conf.get(CONFIG_KEY_SCRATCHPAD)
+        if scratchpad is None:
+            return False
+        return scratchpad.get_null_resume(False) is not None
+
+    def _rebuild_tool_calls(
+        self,
+        tool_calls: list[ToolCall],
+        decisions_by_id: dict[str, dict[str, Any]],
+    ) -> tuple[list[ToolCall], list[ToolMessage]]:
+        """Apply human decisions to tool_calls.
+
+        Only tool calls with an entry in *decisions_by_id* are modified;
+        all others (auto-approved, not in interrupt_on) are preserved as-is.
+        """
+        revised: list[ToolCall] = []
+        msgs: list[ToolMessage] = []
+
+        for tc in tool_calls:
+            config = self._interrupt_on.get(tc["name"])
+            if config is None:
+                revised.append(tc)
+                continue
+            decision = decisions_by_id.get(tc["id"])
+            if decision is None:
+                revised.append(tc)
+                continue
+            new_tc, msg = self._process_decision(decision, tc, config)
+            if new_tc is not None:
+                revised.append(new_tc)
+            if msg is not None:
+                msgs.append(msg)
+
+        return revised, msgs
+
+    def _handle_replay(
+        self, last_ai_msg: AIMessage
+    ) -> tuple[list[ToolCall], list[ToolMessage]]:
+        """Replay: retrieve stored decisions by tool_call_id, skip AI review."""
+        decisions: list[dict[str, Any]] = interrupt({})["decisions"]
+        by_id: dict[str, dict[str, Any]] = {
+            d["tool_call_id"]: d for d in decisions
+        }
+        return self._rebuild_tool_calls(last_ai_msg.tool_calls, by_id)
+
+    def _handle_first_run(
+        self, last_ai_msg: AIMessage
+    ) -> tuple[list[ToolCall], list[ToolMessage]] | None:
+        """First run: AI review, then interrupt for human on unsafe tools.
+
+        Returns None when all tools are auto-approved (no interrupt needed).
+        """
+        actions_for_human: list[ActionRequest] = []
+        configs_for_human: list[ReviewConfig] = []
+
+        for tc in last_ai_msg.tool_calls:
+            config = self._interrupt_on.get(tc["name"])
+            if config is None:
+                continue
+
+            if self._should_ai_review(tc["name"]):
+                review = self._ai_review(tc)
+                if review.is_safe:
+                    if self._notify_on_pass:
+                        self._emit_pass_notification(tc, review)
+                    continue
+                self._emit_fail_notification(tc, review)
+
+            action_req, review_cfg = self._build_action_and_config(tc, config)
+            actions_for_human.append(action_req)
+            configs_for_human.append(review_cfg)
+
+        if not actions_for_human:
+            return None
+
+        hitl_request = HITLRequest(
+            action_requests=actions_for_human,
+            review_configs=configs_for_human,
+        )
+        decisions: list[dict[str, Any]] = interrupt(
+            hitl_request.model_dump(exclude_none=True)
+        )["decisions"]
+
+        if len(decisions) != len(actions_for_human):
+            raise ValueError(
+                f"Mismatch: {len(decisions)} decisions vs "
+                f"{len(actions_for_human)} human-review calls."
+            )
+
+        by_id: dict[str, dict[str, Any]] = {
+            actions_for_human[i].tool_call_id: d
+            for i, d in enumerate(decisions)
+        }
+        return self._rebuild_tool_calls(last_ai_msg.tool_calls, by_id)
+
     def after_model(
         self,
         state: AgentState[Any],
         runtime: Runtime[ContextT],
     ) -> dict[str, Any] | None:
-        """Review tool calls with AI (if configured), escalate unsafe/hitl to human.
+        """AI security review → human-in-the-loop for unsafe tool calls.
 
-        Writes auto-approved indices to ``_reviewed_msg_ids`` via
-        ``CONFIG_KEY_SEND`` before ``interrupt()``.  Send-writes are
-        persisted through ``put_writes`` and applied to the channel
-        via ``apply_writes`` on replay, so ``state["_reviewed_msg_ids"]``
-        carries the data on the second pass.
+        On first execution, tools configured for AI review are screened;
+        safe calls auto-approved, unsafe escalated via ``interrupt()``.
+        On replay, AI review is skipped and stored decisions are applied
+        by ``tool_call_id``.
         """
-        messages = state.get("messages", [])
-        if not messages:
+        last_ai_msg = self._get_last_ai_message(state)
+        if last_ai_msg is None:
             return None
 
-        last_ai_msg = next(
-            (msg for msg in reversed(messages) if isinstance(msg, AIMessage)),
-            None,
-        )
-        if last_ai_msg is None or not last_ai_msg.tool_calls:
-            return None
-
-        # ---- detect replay (interrupt scratchpad introspection) ----
-        try:
-            conf = get_config()["configurable"]
-        except RuntimeError:
-            is_replay = False  # outside runnable context (e.g. unit tests)
+        if self._detect_replay():
+            revised_calls, tool_msgs = self._handle_replay(last_ai_msg)
         else:
-            scratchpad = conf.get(CONFIG_KEY_SCRATCHPAD)
-            is_replay = bool(scratchpad and scratchpad.resume)
+            result = self._handle_first_run(last_ai_msg)
+            if result is None:
+                return None
+            revised_calls, tool_msgs = result
 
-        if is_replay:
-            # REPLAY — the user already reviewed each action.  Skip AI
-            # review entirely.  Call ``interrupt()`` with a minimal
-            # payload to get the resume value (user decisions).  Match
-            # decisions to tool_calls by ``tool_call_id``.
-            decisions: list[dict[str, Any]] = interrupt({})["decisions"]  # type: ignore[assignment]
-            by_id = {d.get("tool_call_id"): d for d in decisions}
-
-            revised_tool_calls: list[ToolCall] = []
-            synthetic_tool_msgs: list[ToolMessage] = []
-
-            for tool_call in last_ai_msg.tool_calls:
-                config = self._interrupt_on.get(tool_call["name"])
-                if config is None:
-                    revised_tool_calls.append(tool_call)
-                    continue
-                decision = by_id.get(tool_call["id"])
-                if decision is None:
-                    # auto-approved by AI on first run — keep as-is
-                    revised_tool_calls.append(tool_call)
-                    continue
-                revised_call, tool_msg = self._process_decision(
-                    decision, tool_call, config,
-                )
-                if revised_call is not None:
-                    revised_tool_calls.append(revised_call)
-                if tool_msg is not None:
-                    synthetic_tool_msgs.append(tool_msg)
-
-            last_ai_msg.tool_calls = revised_tool_calls
-            return {"messages": [last_ai_msg, *synthetic_tool_msgs]}
-
-        # ---- FIRST RUN: AI security review for review_tools ----
-        auto_approved: dict[int, bool] = {}
-        failed_reviews: list[tuple[ToolCall, SecurityReviewResult]] = []
-
-        for idx, tool_call in enumerate(last_ai_msg.tool_calls):
-            config = self._interrupt_on.get(tool_call["name"])
-            if config is None:
-                continue
-
-            if self._should_ai_review(tool_call["name"]):
-                review = self._ai_review(tool_call)
-                if review.is_safe:
-                    auto_approved[idx] = True
-                    if self._notify_on_pass:
-                        self._emit_pass_notification(tool_call, review)
-                    continue
-                failed_reviews.append((tool_call, review))
-
-        # Emit fail events.
-        for tool_call, review in failed_reviews:
-            self._emit_fail_notification(tool_call, review)
-
-        # ---- build human-review actions ----
-        actions_for_human: list[ActionRequest] = []
-        configs_for_human: list[ReviewConfig] = []
-        human_indices: list[int] = []
-
-        for idx, tool_call in enumerate(last_ai_msg.tool_calls):
-            config = self._interrupt_on.get(tool_call["name"])
-            if config is None:
-                continue
-            if idx in auto_approved:
-                continue
-
-            action_req, review_cfg = self._build_action_and_config(
-                tool_call, config,
-            )
-            actions_for_human.append(action_req)
-            configs_for_human.append(review_cfg)
-            human_indices.append(idx)
-
-        if not actions_for_human:
-            return None
-
-        # ---- interrupt for human review ----
-        hitl_request = HITLRequest(
-            action_requests=actions_for_human,
-            review_configs=configs_for_human,
-        )
-        decisions = interrupt(hitl_request.model_dump(exclude_none=True))["decisions"]
-
-        if len(decisions) != len(actions_for_human):
-            msg = (
-                f"Mismatch: {len(decisions)} decisions vs "
-                f"{len(actions_for_human)} human-review calls."
-            )
-            raise ValueError(msg)
-
-        # ---- rebuild tool calls ----
-        revised_tool_calls: list[ToolCall] = []
-        synthetic_tool_msgs: list[ToolMessage] = []
-
-        decision_iter = iter(decisions)
-        for idx, tool_call in enumerate(last_ai_msg.tool_calls):
-            if idx in auto_approved:
-                revised_tool_calls.append(tool_call)
-            elif idx in human_indices:
-                config = self._interrupt_on[tool_call["name"]]
-                decision = next(decision_iter)
-                revised_call, tool_msg = self._process_decision(
-                    decision, tool_call, config,
-                )
-                if revised_call is not None:
-                    revised_tool_calls.append(revised_call)
-                if tool_msg is not None:
-                    synthetic_tool_msgs.append(tool_msg)
-            else:
-                revised_tool_calls.append(tool_call)
-
-        last_ai_msg.tool_calls = revised_tool_calls
-        return {"messages": [last_ai_msg, *synthetic_tool_msgs]}
+        last_ai_msg.tool_calls = revised_calls
+        return {"messages": [last_ai_msg, *tool_msgs]}
 
     # ------------------------------------------------------------------
     # aafter_model — async passthrough
@@ -958,5 +1015,5 @@ class AutoSecurityReviewMiddleware(
         state: AgentState[Any],
         runtime: Runtime[ContextT],
     ) -> dict[str, Any] | None:
-        """Async variant delegates to ``after_model`` (no additional async work)."""
+        """Async variant delegates to ``after_model``."""
         return self.after_model(state, runtime)

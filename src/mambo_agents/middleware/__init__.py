@@ -16,6 +16,11 @@ from mambo_agents.middleware.planning import (
     Plan,
     WritePlansInput,
 )
+from mambo_agents.middleware.review_agent import (
+    FinalReviewResult,
+    create_review_agent,
+    run_review_sync,
+)
 from mambo_agents.middleware.security_review import (
     AutoSecurityReviewMiddleware,
     DEFAULT_SECURITY_REVIEW_SYSTEM_PROMPT,
@@ -52,6 +57,7 @@ __all__ = [
     "DEFAULT_MAMBO_SUMMARY_PROMPT",
     "DEFAULT_SECURITY_REVIEW_SYSTEM_PROMPT",
     "EventGranularity",
+    "FinalReviewResult",
     "MamboMemoryMiddleware",
     "MamboPlanMiddleware",
     "MamboSummarizationMiddleware",
@@ -70,4 +76,6 @@ __all__ = [
     "SummaryHook",
     "SummaryHookContext",
     "WritePlansInput",
+    "create_review_agent",
+    "run_review_sync",
 ]

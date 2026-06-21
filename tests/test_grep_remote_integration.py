@@ -59,7 +59,8 @@ def backend():
 # Helpers
 # ---------------------------------------------------------------------------
 
-_TEST_DIR = "/workspace/_test_grep_remote"
+_WORKER_ID = os.environ.get("PYTEST_XDIST_WORKER", "gw0")
+_TEST_DIR = f"/workspace/_test_grep_remote_{_WORKER_ID}"
 _FILE_A = f"{_TEST_DIR}/a.txt"
 _FILE_B = f"{_TEST_DIR}/b.txt"
 _FILE_C = f"{_TEST_DIR}/sub/c.txt"
@@ -114,6 +115,7 @@ def _cleanup(be: SshBackend) -> None:
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.integration
 def test_connection_ok(backend: SshBackend):
     """Verify we can connect."""
     assert backend.is_connected, "SSH connection is not active"
@@ -127,6 +129,7 @@ def test_connection_ok(backend: SshBackend):
 # ============================================================================
 
 
+@pytest.mark.integration
 def test_diagnostic_files_exist(backend: SshBackend):
     """Verify test files are actually written AND readable on the remote."""
     _setup_files(backend)
@@ -204,6 +207,7 @@ class TestGrepBasic:
     # Happy path: simple match
     # ------------------------------------------------------------------
 
+    @pytest.mark.integration
     def test_simple_match(self, backend: SshBackend):
         """Search for a word that appears in a single file."""
         result = backend.grep("file A", path=_TEST_DIR)
@@ -218,6 +222,7 @@ class TestGrepBasic:
         for m in result.matches:
             print(f"     {m.path}:{m.line}: {m.text}")
 
+    @pytest.mark.integration
     def test_multi_file_match(self, backend: SshBackend):
         """Search for a word that appears in multiple files."""
         result = backend.grep("hello", path=_TEST_DIR)
@@ -234,6 +239,7 @@ class TestGrepBasic:
         for m in result.matches:
             print(f"     {m.path}:{m.line}: {m.text}")
 
+    @pytest.mark.integration
     def test_no_match(self, backend: SshBackend):
         """Search for a string that doesn't exist."""
         result = backend.grep("xyz_nonexistent_abc", path=_TEST_DIR)
@@ -244,6 +250,7 @@ class TestGrepBasic:
         )
         print(f"\n  ✅ no_match: correctly returned 0 matches")
 
+    @pytest.mark.integration
     def test_nested_subdirectory_search(self, backend: SshBackend):
         """Verify grep searches recursively into subdirectories."""
         result = backend.grep("nested file", path=_TEST_DIR)
@@ -262,6 +269,7 @@ class TestGrepBasic:
     # Unicode / emoji
     # ------------------------------------------------------------------
 
+    @pytest.mark.integration
     def test_unicode_chinese(self, backend: SshBackend):
         """Search for Chinese characters."""
         result = backend.grep("你好", path=_TEST_DIR)
@@ -274,6 +282,7 @@ class TestGrepBasic:
             assert "你好" in m.text, f"Match text should contain '你好': {m.text}"
         print(f"\n  ✅ unicode_chinese: {len(result.matches)} match(es)")
 
+    @pytest.mark.integration
     def test_emoji(self, backend: SshBackend):
         """Search for emoji characters."""
         result = backend.grep("🎉", path=_TEST_DIR)
@@ -286,6 +295,7 @@ class TestGrepBasic:
             assert "🎉" in m.text, f"Match text should contain 🎉: {m.text}"
         print(f"\n  ✅ emoji: {len(result.matches)} match(es)")
 
+    @pytest.mark.integration
     def test_japanese(self, backend: SshBackend):
         """Search for Japanese characters."""
         result = backend.grep("こんにちは", path=_TEST_DIR)
@@ -311,6 +321,7 @@ class TestGrepSpecialChars:
         yield
         _cleanup(backend)
 
+    @pytest.mark.integration
     def test_pattern_with_space(self, backend: SshBackend):
         """Search for a pattern containing spaces."""
         result = backend.grep("hello world", path=_TEST_DIR)
@@ -323,6 +334,7 @@ class TestGrepSpecialChars:
             assert "hello world" in m.text, f"Match text should contain 'hello world': {m.text}"
         print(f"\n  ✅ pattern_with_space: {len(result.matches)} match(es)")
 
+    @pytest.mark.integration
     def test_pattern_with_dot_regex_char(self, backend: SshBackend):
         """Search for a literal dot – grep without -F treats '.' as regex (any char).
         This test verifies whether the backend treats the pattern as literal or regex.
@@ -335,6 +347,7 @@ class TestGrepSpecialChars:
         )
         print(f"\n  ✅ dot_in_pattern: {len(result.matches)} match(es)")
 
+    @pytest.mark.integration
     def test_pattern_with_bracket(self, backend: SshBackend):
         """Search for a literal bracket character."""
         # Write a file with brackets
@@ -352,6 +365,7 @@ class TestGrepSpecialChars:
             for m in result.matches:
                 print(f"     {m.path}:{m.line}: {m.text}")
 
+    @pytest.mark.integration
     def test_pattern_with_asterisk(self, backend: SshBackend):
         """Search for a literal asterisk."""
         star_file = f"{_TEST_DIR}/star.txt"
@@ -367,6 +381,7 @@ class TestGrepSpecialChars:
             for m in result.matches[:5]:
                 print(f"     {m.path}:{m.line}: {m.text}")
 
+    @pytest.mark.integration
     def test_pattern_with_question_mark(self, backend: SshBackend):
         """Search for a literal question mark."""
         q_file = f"{_TEST_DIR}/question.txt"
@@ -382,6 +397,7 @@ class TestGrepSpecialChars:
             for m in result.matches:
                 print(f"     {m.path}:{m.line}: {m.text}")
 
+    @pytest.mark.integration
     def test_pattern_with_parenthesis(self, backend: SshBackend):
         """Search for parentheses."""
         paren_file = f"{_TEST_DIR}/paren.txt"
@@ -412,6 +428,7 @@ class TestGrepGlob:
         yield
         _cleanup(backend)
 
+    @pytest.mark.integration
     def test_glob_txt_only(self, backend: SshBackend):
         """Filter by *.txt glob – should only search text files."""
         result = backend.grep("hello", path=_TEST_DIR, glob="*.txt")
@@ -427,6 +444,7 @@ class TestGrepGlob:
             )
         print(f"\n  ✅ glob_txt_only: {len(result.matches)} matches (all .txt)")
 
+    @pytest.mark.integration
     def test_glob_py_no_match(self, backend: SshBackend):
         """Filter by *.py – should find no matches since there are no .py files."""
         result = backend.grep("hello", path=_TEST_DIR, glob="*.py")
@@ -452,6 +470,7 @@ class TestGrepPathHandling:
         yield
         _cleanup(backend)
 
+    @pytest.mark.integration
     def test_search_workspace_root(self, backend: SshBackend):
         """Search from workspace root – should still find files."""
         result = backend.grep("hello", path="/workspace")
@@ -463,6 +482,7 @@ class TestGrepPathHandling:
         for m in result.matches[:5]:
             print(f"     {m.path}:{m.line}: {m.text}")
 
+    @pytest.mark.integration
     def test_search_specific_file(self, backend: SshBackend):
         """Search within a specific file path."""
         # Diagnostic: verify file content and raw grep
@@ -486,6 +506,7 @@ class TestGrepPathHandling:
             assert m.path == _FILE_A, f"Match should only be in {_FILE_A}"
         print(f"  ✅ search_specific_file: {len(result.matches)} matches in single file")
 
+    @pytest.mark.integration
     def test_nonexistent_path(self, backend: SshBackend):
         """Search a non-existent path."""
         result = backend.grep("hello", path="/workspace/_nonexistent_dir_xyz")
@@ -494,6 +515,7 @@ class TestGrepPathHandling:
         print(f"\n  ✅ nonexistent_path: error={result.error}")
         print(f"     matches={result.matches}")
 
+    @pytest.mark.integration
     def test_outside_workspace_rejected(self, backend: SshBackend):
         """Search outside /workspace should be rejected."""
         result = backend.grep("hello", path="/etc")
@@ -516,6 +538,7 @@ class TestGrepHiddenFiles:
         yield
         _cleanup(backend)
 
+    @pytest.mark.integration
     def test_hidden_file_search(self, backend: SshBackend):
         """Search should find content in hidden files."""
         result = backend.grep("hidden file", path=_TEST_DIR)
@@ -534,6 +557,7 @@ class TestGrepHiddenFiles:
 # ============================================================================
 
 
+@pytest.mark.integration
 def test_cleanup(backend: SshBackend):
     """Remove all test files."""
     _cleanup(backend)

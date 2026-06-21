@@ -1482,3 +1482,91 @@ class TestAsyncReverseTranslation:
             assert m.path.startswith("/.mambo/skills/"), (
                 f"Match path {m.path} not in external namespace"
             )
+
+
+# ============================================================================
+# Out-of-workspace path errors — graceful error results, not exceptions
+# ============================================================================
+
+
+class TestOutOfWorkspacePaths:
+    """Paths outside all valid prefixes must return error results, not throw."""
+
+    @pytest.fixture
+    def hws(self, tmp_path: Path) -> HybridWorkspaceBackend:
+        skills_be = StateBackend()
+        return HybridWorkspaceBackend(
+            real_backend=LocalBackend(root_dir=str(tmp_path)),
+            virtual_workspaces={"skills": skills_be},
+        )
+
+    # -- _route still throws ValueError for invalid paths -------------------
+
+    def test_route_raises_for_outside_path(self, hws: HybridWorkspaceBackend):
+        with pytest.raises(ValueError, match="Cannot rewrite path"):
+            hws._route("/home/ramenl")
+
+    def test_route_raises_for_absolute_root(self, hws: HybridWorkspaceBackend):
+        with pytest.raises(ValueError, match="Cannot rewrite path"):
+            hws._route("/etc/passwd")
+
+    # -- Operation methods catch ValueError and return error results --------
+
+    def test_ls_outside_workspace_returns_error(self, hws: HybridWorkspaceBackend):
+        r = hws.ls("/home/ramenl")
+        assert r.error is not None
+        assert "无效" in r.error
+        assert hws.workspace_root in r.error
+
+    def test_read_outside_workspace_returns_error(self, hws: HybridWorkspaceBackend):
+        r = hws.read("/home/ramenl/.bashrc")
+        assert r.error is not None
+        assert "无效" in r.error
+
+    def test_read_raw_outside_workspace_returns_error(self, hws: HybridWorkspaceBackend):
+        r = hws.read_raw("/home/ramenl/.bashrc")
+        assert r.error is not None
+        assert "无效" in r.error
+
+    def test_grep_outside_workspace_returns_error(self, hws: HybridWorkspaceBackend):
+        r = hws.grep("password", path="/home")
+        assert r.error is not None
+        assert "无效" in r.error
+
+    def test_glob_outside_workspace_returns_error(self, hws: HybridWorkspaceBackend):
+        r = hws.glob("*", path="/home")
+        assert r.error is not None
+        assert "无效" in r.error
+
+    # -- Error message content ------------------------------------------------
+
+    def test_error_includes_workspace_root(self, hws: HybridWorkspaceBackend):
+        r = hws.ls("/tmp")
+        assert hws.workspace_root in r.error
+
+    def test_error_includes_mambo_prefix(self, hws: HybridWorkspaceBackend):
+        r = hws.read("/root/.profile")
+        assert hws._prefix in r.error
+
+    def test_error_includes_named_virtual_workspaces(self, hws: HybridWorkspaceBackend):
+        r = hws.glob("*", path="/opt")
+        assert "/.mambo/skills/" in r.error
+
+    def test_error_includes_real_backend_mapping(self, hws: HybridWorkspaceBackend):
+        r = hws.ls("/home/ramenl")
+        assert "映射至真实路径" in r.error
+        assert hws._real.workspace_root in r.error
+
+    # -- _valid_paths_description --------------------------------------------
+
+    def test_valid_paths_description_structure(self, hws: HybridWorkspaceBackend):
+        desc = hws._valid_paths_description()
+        assert hws.workspace_root in desc
+        assert hws._prefix in desc
+        assert "映射至真实路径" in desc
+        assert hws._real.workspace_root in desc
+
+    def test_valid_paths_description_includes_named(self, hws: HybridWorkspaceBackend):
+        desc = hws._valid_paths_description()
+        assert "/.mambo/skills/" in desc
+        assert "虚拟工作区" in desc

@@ -227,7 +227,7 @@ class TestBuildReviewMessages:
 
 
 # =============================================================================
-# 3. Constructor & config resolution
+# 2. Constructor & config resolution
 # =============================================================================
 
 

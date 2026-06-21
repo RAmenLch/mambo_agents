@@ -24,6 +24,7 @@ from langgraph.store.base import BaseStore
 
 from mambo_agents._version import __version__
 from mambo_agents.backends.protocol import BackendProtocol
+from mambo_agents.backends.readonly import ReadOnlyBackend
 from mambo_agents.backends.state import StateBackend
 from mambo_agents.middleware.backend_tools import (
     BackendToolsMiddleware,
@@ -179,12 +180,27 @@ def create_mambo_agent(
             ``AutoSecurityReviewMiddleware`` replaces the default
             ``HumanInTheLoopMiddleware``.
 
+            Two review modes are supported:
+
+            - **llm** (default): single LLM call with structured output
+              for each tool call.  Fast and cheap.
+            - **agent**: a dedicated review agent with read-only backend
+              tools (``ls``/``read``/``grep``/``glob``) that can inspect
+              the workspace before delivering a verdict.  Backend tools
+              get agent review; non-backend tools fall back to llm review.
+
             .. code-block:: python
 
                 from mambo_agents.middleware import SecurityReviewConfig
 
-                # Enable AI review for all interrupt_on tools
+                # Default — llm-mode for all tools
                 security_review=SecurityReviewConfig()
+
+                # Agent-mode — backend tools reviewed by agent
+                security_review=SecurityReviewConfig(
+                    review_mode="agent",
+                    agent_max_steps=5,
+                )
 
                 # Custom: cheaper model + selective tool review
                 security_review=SecurityReviewConfig(
@@ -197,6 +213,9 @@ def create_mambo_agent(
             - ``system_prompt``: custom security review prompt.
             - ``review_tools``: ``"all"`` (default) or ``frozenset[str]``.
               Tools not in the set get direct HITL (no AI review).
+            - ``review_mode``: ``"llm"`` (default) or ``"agent"``.
+            - ``agent_max_steps``: max steps for the review agent
+              (default 5, only used when ``review_mode="agent"``).
 
             Default: ``None`` (no AI pre-screening, classic HITL).
         checkpointer: Optional LangGraph checkpointer.  Required when using
@@ -347,6 +366,61 @@ def create_mambo_agent(
     if middleware:
         mw.extend(middleware)
 
+    # ---- Pre-calculate security review parameters (needed for subagents) ---
+    _security_review_middleware: AutoSecurityReviewMiddleware | None = None
+    if interrupt_on is not None:
+        if checkpointer is None:
+            raise ValueError(
+                "interrupt_on requires a checkpointer (e.g. MemorySaver()). "
+                "Pass `checkpointer=MemorySaver()` to create_mambo_agent."
+            )
+        if security_review is not None:
+            # ---- AI-assisted security pre-screening ----
+            _review_model: str | BaseChatModel = security_review.model or model
+            _review_tools = security_review.review_tools
+            _review_mode = security_review.review_mode
+            _agent_max_steps = security_review.agent_max_steps
+            _agent_tools_whitelist = security_review.agent_tools
+
+            _tool_descriptions = build_tool_descriptions(
+                backend, tools=tools,
+            )
+
+            _backend_tool_names: frozenset[str] = frozenset(
+                ["ls", "read", "write", "edit", "grep", "glob"]
+                + [t.name for t in backend.tools]
+            )
+
+            _agent_backend: ReadOnlyBackend | None = None
+            if _review_mode == "agent":
+                _readonly_extras = (
+                    _agent_tools_whitelist if _agent_tools_whitelist is not None
+                    else frozenset()
+                )
+                _agent_backend = ReadOnlyBackend(
+                    backend, allowed_extra_tools=_readonly_extras,
+                )
+
+            _security_review_middleware = AutoSecurityReviewMiddleware(
+                interrupt_on=interrupt_on,
+                model=_review_model,
+                review_tools=_review_tools,
+                security_review_system_prompt=security_review.system_prompt,
+                review_mode=_review_mode,
+                agent_max_steps=_agent_max_steps,
+                agent_backend=_agent_backend,
+                agent_tools=_agent_tools_whitelist,
+                tool_descriptions=_tool_descriptions,
+                backend_tool_names=_backend_tool_names,
+            )
+        else:
+            # ---- Classic HITL (no AI review) ----
+            _security_review_middleware = AutoSecurityReviewMiddleware(
+                interrupt_on=interrupt_on,
+                model=model,
+                review_tools=frozenset(),
+            )
+
     # ---- Subagents ----------------------------------------------------------
     inline_subagents = list(subagents or [])
 
@@ -355,19 +429,17 @@ def create_mambo_agent(
         == GENERAL_PURPOSE_NAME
         for s in inline_subagents
     ):
-        # Build general-purpose subagent with main model + backend tools.
-        # BackendToolsMiddleware provides:
-        #   - FilesystemState (state_schema) → files channel → subagent
-        #     can read/write files and propagate them back to the parent.
-        #   - Core tools (build_core_tools + backend.tools).
-        # Extra user tools are passed via the ``tools`` field.
+        gp_middleware: list[AgentMiddleware] = [BackendToolsMiddleware(backend)]
+        if _security_review_middleware is not None:
+            gp_middleware.append(_security_review_middleware)
+
         gp_spec: SubAgent = {
             "name": GENERAL_PURPOSE_NAME,
             "description": DEFAULT_GENERAL_PURPOSE_DESCRIPTION,
             "system_prompt": DEFAULT_SUBAGENT_PROMPT,
             "model": model,
             "tools": list(tools or []),
-            "middleware": [BackendToolsMiddleware(backend)],
+            "middleware": gp_middleware,
         }
         inline_subagents.insert(0, gp_spec)
 
@@ -390,41 +462,9 @@ def create_mambo_agent(
             )
         )
 
-    if interrupt_on is not None:
-        if checkpointer is None:
-            raise ValueError(
-                "interrupt_on requires a checkpointer (e.g. MemorySaver()). "
-                "Pass `checkpointer=MemorySaver()` to create_mambo_agent."
-            )
-        if security_review is not None:
-            # ---- AI-assisted security pre-screening ----
-            _review_model: str | BaseChatModel = security_review.model or model
-            _review_tools = security_review.review_tools
-            _descs = build_tool_descriptions(backend, tools=tools)
-            mw.append(
-                AutoSecurityReviewMiddleware(
-                    interrupt_on=interrupt_on,
-                    model=_review_model,
-                    backend=backend,
-                    review_tools=_review_tools,
-                    security_review_system_prompt=security_review.system_prompt,
-                    tool_descriptions=_descs,
-                )
-            )
-        else:
-            # ---- Classic HITL (no AI review) ----
-            # Use AutoSecurityReviewMiddleware with empty review_tools to get
-            # tool_call_id in interrupt payloads (same behaviour as upstream
-            # HumanInTheLoopMiddleware, but with proper tool_call linking).
-            mw.append(
-                AutoSecurityReviewMiddleware(
-                    interrupt_on=interrupt_on,
-                    model=model,
-                    backend=backend,
-                    review_tools=frozenset(),
-                    tool_descriptions=build_tool_descriptions(backend, tools=tools),
-                )
-            )
+    # ---- Security review (main agent) --------------------------------------
+    if _security_review_middleware is not None:
+        mw.append(_security_review_middleware)
 
     # ---- Safety net (always on) -------------------------------------------
     # Patch first to fill dangling ToolMessages, then reorder to match

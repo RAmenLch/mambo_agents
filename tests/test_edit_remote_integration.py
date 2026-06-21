@@ -61,7 +61,8 @@ def backend():
 # ---------------------------------------------------------------------------
 
 
-_TEST_FILE = "/workspace/_test_edit_remote.txt"
+_WORKER_ID = os.environ.get("PYTEST_XDIST_WORKER", "gw0")
+_TEST_FILE = f"/workspace/_test_edit_remote_{_WORKER_ID}.txt"
 
 
 def _write_test_data(be: SshBackend, content: str) -> None:
@@ -91,6 +92,7 @@ def _cleanup(be: SshBackend) -> None:
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.integration
 def test_connection_ok(backend: SshBackend):
     """Verify we can connect and python3 is available (required for _edit_remote)."""
     assert backend.is_connected, "SSH connection is not active"
@@ -108,6 +110,7 @@ def test_connection_ok(backend: SshBackend):
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.integration
 def test_edit_single_occurrence(backend: SshBackend):
     """Replace a string that appears exactly once in the file."""
     _write_test_data(backend, "line-A\nline-B\nline-C\n")
@@ -133,6 +136,7 @@ def test_edit_single_occurrence(backend: SshBackend):
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.integration
 def test_edit_multiple_without_replace_all(backend: SshBackend):
     """Edit a string that appears twice – should fail without replace_all=True."""
     _write_test_data(backend, "apple\nbanana\napple\n")
@@ -165,6 +169,7 @@ def test_edit_multiple_without_replace_all(backend: SshBackend):
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.integration
 def test_edit_replace_all(backend: SshBackend):
     """Replace all occurrences of a string with replace_all=True."""
     _write_test_data(backend, "apple\nbanana\napple\n")
@@ -190,6 +195,7 @@ def test_edit_replace_all(backend: SshBackend):
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.integration
 def test_edit_not_found(backend: SshBackend):
     """Search for a string that isn't in the file."""
     _write_test_data(backend, "hello world\n")
@@ -210,6 +216,7 @@ def test_edit_not_found(backend: SshBackend):
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.integration
 def test_edit_with_unicode_and_emoji(backend: SshBackend):
     """Verify edit works with Chinese characters and emoji (the bug report case)."""
     _write_test_data(backend, "- 测试 edit ✅\n")
@@ -234,6 +241,7 @@ def test_edit_with_unicode_and_emoji(backend: SshBackend):
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.integration
 def test_cleanup(backend: SshBackend):
     """Remove the test file."""
     _cleanup(backend)

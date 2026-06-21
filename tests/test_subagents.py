@@ -99,6 +99,7 @@ class TestSubAgentMiddlewareInit:
         with pytest.raises(ValueError, match="At least one subagent"):
             SubAgentMiddleware(backend=backend, subagents=[])
 
+    @pytest.mark.integration
     def test_basic_initialization(self):
         """SubAgentMiddleware initializes with a valid SubAgent spec."""
         backend = StateBackend()
@@ -150,6 +151,7 @@ class TestSubAgentMiddlewareInit:
         assert mw is not None
         assert len(mw.tools) == 1
 
+    @pytest.mark.integration
     def test_mixed_subagents(self):
         """Mixed SubAgent and CompiledSubAgent specs."""
         backend = StateBackend()
@@ -175,6 +177,7 @@ class TestSubAgentMiddlewareInit:
 
 
 class TestEventGranularity:
+    @pytest.mark.integration
     def test_default_granularity_is_updates(self):
         """Default event_granularity is 'updates'."""
         backend = StateBackend()
@@ -188,6 +191,7 @@ class TestEventGranularity:
         mw = SubAgentMiddleware(backend=backend, subagents=[subagent])
         assert mw._event_granularity == "updates"
 
+    @pytest.mark.integration
     def test_explicit_granularity_messages(self):
         """event_granularity='messages' is accepted."""
         backend = StateBackend()
@@ -205,6 +209,7 @@ class TestEventGranularity:
         )
         assert mw._event_granularity == "messages"
 
+    @pytest.mark.integration
     def test_explicit_granularity_values(self):
         """event_granularity='values' is accepted."""
         backend = StateBackend()
@@ -222,6 +227,7 @@ class TestEventGranularity:
         )
         assert mw._event_granularity == "values"
 
+    @pytest.mark.integration
     def test_granularity_passed_to_task_tool(self):
         """Granularity is plumbed into the task tool builder."""
         with patch(
@@ -251,6 +257,7 @@ class TestEventGranularity:
 
 
 class TestSystemPrompt:
+    @pytest.mark.integration
     def test_default_system_prompt_includes_agents(self):
         """System prompt includes available subagent types."""
         backend = StateBackend()
@@ -266,6 +273,7 @@ class TestSystemPrompt:
         assert "researcher" in mw._system_prompt
         assert "Research topics thoroughly" in mw._system_prompt
 
+    @pytest.mark.integration
     def test_custom_system_prompt(self):
         """Custom system_prompt is used."""
         backend = StateBackend()
@@ -284,6 +292,7 @@ class TestSystemPrompt:
         )
         assert custom in mw._system_prompt
 
+    @pytest.mark.integration
     def test_none_system_prompt(self):
         """system_prompt=None suppresses injection."""
         backend = StateBackend()
@@ -308,6 +317,7 @@ class TestSystemPrompt:
 
 
 class TestInterruptOn:
+    @pytest.mark.integration
     def test_interrupt_on_adds_human_in_the_loop(self):
         """interrupt_on triggers HumanInTheLoopMiddleware (no crash)."""
         backend = StateBackend()
@@ -329,6 +339,7 @@ class TestInterruptOn:
 
 
 class TestCreateMamboAgentSubagents:
+    @pytest.mark.integration
     def test_create_with_subagents(self):
         """create_mambo_agent accepts subagents parameter."""
         backend = StateBackend()
@@ -352,6 +363,7 @@ class TestCreateMamboAgentSubagents:
             "task tool should be registered when subagents are provided"
         )
 
+    @pytest.mark.integration
     def test_create_with_compiled_subagent(self):
         """create_mambo_agent accepts CompiledSubAgent."""
         backend = StateBackend()
@@ -369,6 +381,7 @@ class TestCreateMamboAgentSubagents:
         assert agent is not None
         assert _graph_has_task_tool(agent)
 
+    @pytest.mark.integration
     def test_include_general_purpose_default_false(self):
         """By default, general-purpose subagent is NOT auto-added."""
         backend = StateBackend()
@@ -379,6 +392,7 @@ class TestCreateMamboAgentSubagents:
             "include_general_purpose=False"
         )
 
+    @pytest.mark.integration
     def test_include_general_purpose_true(self):
         """include_general_purpose=True auto-adds general-purpose subagent."""
         backend = StateBackend()
@@ -392,6 +406,7 @@ class TestCreateMamboAgentSubagents:
             "task tool should be present when include_general_purpose=True"
         )
 
+    @pytest.mark.integration
     def test_general_purpose_not_duplicated(self):
         """general-purpose is not added twice if already in subagents list."""
         backend = StateBackend()
@@ -412,6 +427,7 @@ class TestCreateMamboAgentSubagents:
         assert agent is not None
         assert _graph_has_task_tool(agent)
 
+    @pytest.mark.integration
     def test_event_granularity_plumbed(self):
         """event_granularity is passed through to the middleware (no crash)."""
         backend = StateBackend()
@@ -432,6 +448,7 @@ class TestCreateMamboAgentSubagents:
         assert agent is not None
         assert _graph_has_task_tool(agent)
 
+    @pytest.mark.integration
     def test_subagent_middleware_position(self):
         """SubAgentMiddleware works alongside HITL."""
         backend = StateBackend()

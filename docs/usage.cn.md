@@ -566,6 +566,11 @@ agent = create_mambo_agent(
 
 **功能：** 在实际执行工具（或暂停人工审批）之前，用廉价模型审查工具调用的安全性。
 
+两种审查模式：
+
+- **llm**（默认）：每次工具调用单次结构化输出 LLM 调用——快速且低成本。
+- **agent**：专用审查 agent，带有只读后端工具，可在提交审查结论前检查工作区。Backend 工具（核心 6 个 + ``backend.tools``）使用 agent 审查；非 backend 用户工具回退到 llm 审查。
+
 ```python
 # 经典 HITL（无 AI 预审）
 agent = create_mambo_agent(
@@ -573,13 +578,23 @@ agent = create_mambo_agent(
     interrupt_on={"write": True, "edit": True},
 )
 
-# AI 预审 — 所有 interrupt_on 工具
+# AI 预审 — llm 模式（默认）
 from mambo_agents.middleware.security_review import SecurityReviewConfig
 
 agent = create_mambo_agent(
     "gpt-4o",
     interrupt_on={"write": True, "edit": True, "delete": True},
     security_review=SecurityReviewConfig(),
+)
+
+# agent 模式 — backend 工具由审查 agent 审核（带只读工作区）
+agent = create_mambo_agent(
+    "gpt-4o",
+    interrupt_on={"write": True, "edit": True, "delete": True},
+    security_review=SecurityReviewConfig(
+        review_mode="agent",
+        agent_max_steps=5,
+    ),
 )
 
 # 自定义预审 — 仅审查特定工具，使用独立模型
@@ -933,6 +948,18 @@ SecurityReviewConfig(
     system_prompt: str | None = None,
     # None = 使用内置安全审查提示词
     # 自定义 = 覆盖审查提示词
+
+    review_mode: Literal["llm", "agent"] = "llm",
+    # "llm" = 每次工具调用单次 LLM 调用（快速，默认）
+    # "agent" = 专用审查 agent，带只读后端工具
+    #           Backend 工具 → agent 审查；用户工具 → llm 审查
+
+    agent_max_steps: int = 5,
+    # 审查 agent 的最大步数（仅在 agent 模式下使用）
+
+    agent_tools: frozenset[str] | None = None,
+    # agent 模式下暴露给审查 agent 的后端工具名列表
+    # None = 所有已注册后端工具均可用
 )
 ```
 

@@ -230,6 +230,11 @@ class HybridWorkspaceBackend(ThreadAwareWorkspace):
         Always rewrites: strip the prefix, prepend the target backend's
         ``workspace_root``.  No special cases — predictable regardless of
         what directory names the user chooses.
+
+        Raises
+        ------
+        ValueError
+            If *normalized_path* is not under *strip_prefix*.
         """
         if normalized_path == strip_prefix:
             rel = ""
@@ -331,12 +336,25 @@ class HybridWorkspaceBackend(ThreadAwareWorkspace):
             return virtual_prefix
         return virtual_prefix + "/" + rel
 
+    def _valid_paths_description(self) -> str:
+        """Build a human-readable description of all valid path prefixes,
+        including the mapping from AI-facing workspace to real backend root.
+        """
+        parts = [f"'{self.workspace_root}/'（映射至真实路径 '{self._real.workspace_root}/'）"]
+        parts.append(f"'{self._prefix}/'（虚拟临时工作区）")
+        for name in sorted(self._virtual):
+            parts.append(f"'{self._prefix}/{name}/'（虚拟工作区）")
+        return "、".join(parts)
+
     # ------------------------------------------------------------------
     # Core file operations — prefix-routed
     # ------------------------------------------------------------------
 
     def ls(self, path: str) -> LsResult:
-        target, p = self._route(path)
+        try:
+            target, p = self._route(path)
+        except ValueError:
+            return LsResult(error=f"路径 '{path}' 无效，仅可访问：{self._valid_paths_description()}")
         result = target.ls(p)
 
         entries: list[FileInfo] = []
@@ -370,7 +388,10 @@ class HybridWorkspaceBackend(ThreadAwareWorkspace):
         *,
         _apply_max_chars: bool = True,
     ) -> ReadResult:
-        target, p = self._route(file_path)
+        try:
+            target, p = self._route(file_path)
+        except ValueError:
+            return ReadResult(error=f"路径 '{file_path}' 无效，仅可访问：{self._valid_paths_description()}")
         return target.read(p, offset, limit, include_line_numbers, _apply_max_chars=_apply_max_chars)
 
     def read_raw(
@@ -380,7 +401,10 @@ class HybridWorkspaceBackend(ThreadAwareWorkspace):
         limit: int = 2000,
         include_line_numbers: bool = False,
     ) -> ReadResult:
-        target, p = self._route(file_path)
+        try:
+            target, p = self._route(file_path)
+        except ValueError:
+            return ReadResult(error=f"路径 '{file_path}' 无效，仅可访问：{self._valid_paths_description()}")
         return target.read_raw(p, offset, limit, include_line_numbers)
 
     def write(
@@ -410,7 +434,10 @@ class HybridWorkspaceBackend(ThreadAwareWorkspace):
         if path.rstrip("/") == self._prefix:
             return self._grep_all_virtual(pattern, glob)
 
-        target, p = self._route(path)
+        try:
+            target, p = self._route(path)
+        except ValueError:
+            return GrepResult(error=f"路径 '{path}' 无效，仅可访问：{self._valid_paths_description()}")
         result = target.grep(pattern, p, glob)
         if result.matches:
             vprefix = self._get_virtual_prefix(path)
@@ -431,7 +458,10 @@ class HybridWorkspaceBackend(ThreadAwareWorkspace):
         if path.rstrip("/") == self._prefix:
             return self._glob_all_virtual(pattern)
 
-        target, p = self._route(path)
+        try:
+            target, p = self._route(path)
+        except ValueError:
+            return GlobResult(error=f"路径 '{path}' 无效，仅可访问：{self._valid_paths_description()}")
         result = target.glob(pattern, p)
         if result.matches:
             vprefix = self._get_virtual_prefix(path)
