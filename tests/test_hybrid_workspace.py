@@ -8,6 +8,7 @@ from pathlib import Path, PurePosixPath
 import pytest
 import yaml
 from langchain_core.tools import StructuredTool
+from pydantic import Field, create_model
 
 from mambo_agents.backends.hybrid_workspace import HybridWorkspaceBackend
 from mambo_agents.backends.local import LocalBackend
@@ -88,16 +89,20 @@ class _FakeBackend(BackendProtocol):
         self._files[file_path] = c.replace(old_str, new_str)
         return EditResult(path=file_path, occurrences=c.count(old_str))
 
-    def grep(self, pattern: str, path="/", glob=None):
+    def grep(self, pattern: str, path="/", glob=None, regex=False, offset=0, limit=None):
         from mambo_agents.backends.protocol import GrepResult, GrepMatch
 
         prefix = path.rstrip("/") + "/" if path != "/" else "/"
         matches: list[GrepMatch] = []
+        if regex:
+            compiled = __import__("re").compile(pattern)
+        else:
+            compiled = __import__("re").compile(__import__("re").escape(pattern))
         for fp, c in sorted(self._files.items()):
             if prefix != "/" and not fp.startswith(prefix):
                 continue
             for li, line in enumerate(c.split("\n"), 1):
-                if pattern in line:
+                if compiled.search(line):
                     matches.append(GrepMatch(path=fp, line=li, text=line))
         return GrepResult(matches=matches)
 
@@ -174,16 +179,20 @@ class _FakeThreadAwareBackend(ThreadAwareWorkspace):
         self._files[file_path] = c.replace(old_str, new_str)
         return EditResult(path=file_path, occurrences=c.count(old_str))
 
-    def grep(self, pattern: str, path="/", glob=None):
+    def grep(self, pattern: str, path="/", glob=None, regex=False, offset=0, limit=None):
         from mambo_agents.backends.protocol import GrepResult, GrepMatch
 
         prefix = path.rstrip("/") + "/" if path != "/" else "/"
         matches: list[GrepMatch] = []
+        if regex:
+            compiled = __import__("re").compile(pattern)
+        else:
+            compiled = __import__("re").compile(__import__("re").escape(pattern))
         for fp, c in sorted(self._files.items()):
             if prefix != "/" and not fp.startswith(prefix):
                 continue
             for li, line in enumerate(c.split("\n"), 1):
-                if pattern in line:
+                if compiled.search(line):
                     matches.append(GrepMatch(path=fp, line=li, text=line))
         return GrepResult(matches=matches)
 
@@ -520,6 +529,16 @@ _DUMMY_DELETE = StructuredTool(
     func=lambda **kw: "deleted",
 )
 
+_DUMMY_DELETE_WITH_PATH = StructuredTool(
+    name="delete",
+    description="Delete files",
+    args_schema=create_model(
+        "DeleteSchema",
+        path=(str, Field(description="Absolute file path to delete")),
+    ),
+    func=lambda **kw: f"deleted {kw.get('path', '?')}",
+)
+
 
 class TestToolsDelegation:
     """tools property delegates to real_backend + includes copy."""
@@ -539,6 +558,67 @@ class TestToolsDelegation:
         hws = HybridWorkspaceBackend(real_backend=fake)
         tool_names = {t.name for t in hws.tools}
         assert tool_names == {"copy"}
+
+    def test_tool_without_path_param_not_wrapped(self):
+        """Tool without path param (args_schema=None) is left untouched."""
+        fake = _FakeBackend(extra_tools=[_DUMMY_DELETE])
+        hws = HybridWorkspaceBackend(real_backend=fake)
+        tools = hws.tools
+        delete_tool = [t for t in tools if t.name == "delete"][0]
+        # Should still be the same func reference (no wrapping)
+        assert delete_tool.func is _DUMMY_DELETE.func
+
+    def test_tool_with_path_param_is_wrapped(self):
+        """Tool with a 'path' field in args_schema gets wrapped."""
+        fake = _FakeBackend(extra_tools=[_DUMMY_DELETE_WITH_PATH])
+        hws = HybridWorkspaceBackend(real_backend=fake)
+        tools = hws.tools
+        delete_tool = [t for t in tools if t.name == "delete"][0]
+        # Wrapped func should differ from original
+        assert delete_tool.func is not _DUMMY_DELETE_WITH_PATH.func
+
+    def test_path_translated_when_routing_to_real(self):
+        """Path is rewritten when it falls under Hybrid's workspace_root."""
+        fake = _FakeBackend(extra_tools=[_DUMMY_DELETE_WITH_PATH])
+        # Hybrid ws_root=/workspace, fake ws_root=/workspace
+        hws = HybridWorkspaceBackend(real_backend=fake)
+        delete_tool = [t for t in hws.tools if t.name == "delete"][0]
+        result = delete_tool.invoke({"path": "/workspace/some/file.txt"})
+        assert "deleted /workspace/some/file.txt" in result
+
+    def test_path_not_rewritten_for_virtual_prefix(self):
+        """Path routing to /.mambo/ is left unchanged so real backend errors clearly."""
+        fake = _FakeBackend(extra_tools=[_DUMMY_DELETE_WITH_PATH])
+        hws = HybridWorkspaceBackend(real_backend=fake)
+        delete_tool = [t for t in hws.tools if t.name == "delete"][0]
+        result = delete_tool.invoke({"path": "/.mambo/some_file"})
+        # Original /.mambo/ path passes through (not rewritten)
+        assert "deleted /.mambo/some_file" in result
+
+    def test_path_wrapping_with_different_ws_roots(self):
+        """When ws_roots differ, the path is translated from Hybrid namespace to real namespace."""
+        # Use a real LocalBackend with a different workspace_root
+        with tempfile.TemporaryDirectory() as tmpdir:
+            real = LocalBackend(root_dir=tmpdir, workspace_root="/real")
+            real.write("/real/hello.txt", "hello", overwrite=True)
+
+            hws = HybridWorkspaceBackend(
+                real_backend=real,
+                workspace_root="/workspace",  # AI-facing
+            )
+            # Verify file exists on disk via real backend (using real ws_root)
+            read_result = real.read("/real/hello.txt")
+            assert "hello" in str(read_result)
+
+            # Invoke delete through Hybrid's wrapper — path should be translated
+            delete_tool = [t for t in hws.tools if t.name == "delete"][0]
+            result = delete_tool.invoke({"path": "/workspace/hello.txt"})
+            # Delete succeeded (without error message)
+            assert "Error" not in result
+
+            # Verify file is actually gone
+            check = real.read("/real/hello.txt")
+            assert check.error is not None
 
 
 # ============================================================================
@@ -569,7 +649,9 @@ class TestDescription:
         assert "edit" in desc
         assert "grep" in desc
         assert "glob" in desc
-        assert "delete" not in desc or "must NOT target" in desc
+        # tree / delete now appear in description as having path translation;
+        # execute is the only extra tool that still gets the "NOT target" warning
+        assert "do NOT target" in desc
 
 
 # ============================================================================

@@ -53,6 +53,7 @@ class ReadOnlyBackend(BackendProtocol):
         super().__init__(
             max_read_chars=backend._max_read_chars,
             summarizer=backend._summarizer,
+            tool_timeouts=backend._tool_timeouts,
         )
         self._backend = backend
         self._allowed = frozenset(allowed_extra_tools)
@@ -86,9 +87,12 @@ class ReadOnlyBackend(BackendProtocol):
         pattern: str,
         path: str = "/workspace",
         glob: str | None = None,
+        regex: bool = False,
+        offset: int = 0,
+        limit: int | None = None,
     ) -> GrepResult:
         try:
-            return self._backend.grep(pattern, path, glob)
+            return self._backend.grep(pattern, path, glob, regex, offset, limit)
         except Exception as exc:
             return GrepResult(error=f"{type(exc).__name__}: {exc}")
 

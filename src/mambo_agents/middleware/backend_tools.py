@@ -29,7 +29,7 @@ from langgraph.types import Command
 from langgraph.typing import ContextT
 from pydantic import BaseModel, Field
 
-from mambo_agents.backends.protocol import BackendProtocol, ReadResult
+from mambo_agents.backends.protocol import BackendProtocol, ReadResult, ToolTimeoutError
 from mambo_agents.backends.state_schema import FilesystemState
 
 
@@ -228,15 +228,21 @@ _CORE_TOOLS = [
     {
         "name": "grep",
         "description": (
-            "Search for a literal text pattern in files. "
-            "Performs exact substring matching (NOT regex). "
-            "Optionally restrict by path prefix and/or glob filename pattern."
+            "Search for a text pattern in files. "
+            "By default performs exact substring matching (literal mode). "
+            "Set regex=True for regex patterns with alternation (|), "
+            "wildcards (.*), anchors (^, $), character classes, etc. "
+            "Use the glob parameter to filter by filename pattern (e.g., '*.py'). "
+            "Results are capped at 1000 matches. Use offset and limit for pagination."
         ),
         "method": "grep",
         "fields": {
-            "pattern": (str, Field(description="Literal substring to find")),
+            "pattern": (str, Field(description="Text substring or regex pattern to find")),
             "path": (str, Field(description="Base directory to search")),
-            "glob": (str | None, Field(default=None, description="Optional glob to filter filenames")),
+            "glob": (str | None, Field(default=None, description="Optional glob to filter filenames, e.g. '*.py'")),
+            "regex": (bool, Field(default=False, description="If True, interpret pattern as regex. Default False (literal match).")),
+            "offset": (int, Field(default=0, description="0-based index to start from (for pagination)")),
+            "limit": (int | None, Field(default=None, description="Max matches to return. None means up to the hard cap (1000).")),
         },
     },
     {
@@ -295,6 +301,8 @@ def _build_sync_read_tool(backend: BackendProtocol) -> StructuredTool:
     ``runtime.tool_call_id``.
     """
 
+    _wrapped_read_sync = backend._wrap_sync_with_timeout("read", backend.read)
+
     def sync_read(
         file_path: Annotated[str, Field(description="Absolute file path")],
         offset: Annotated[int, Field(default=0, description="Line offset from start")],
@@ -312,9 +320,12 @@ def _build_sync_read_tool(backend: BackendProtocol) -> StructuredTool:
         ] = False,
         runtime: ToolRuntime = None,
     ) -> ToolMessage | str:
-        result: ReadResult = backend.read(
-            file_path, offset, limit, include_line_numbers,
-        )
+        try:
+            result: ReadResult = _wrapped_read_sync(
+                file_path, offset, limit, include_line_numbers,
+            )
+        except ToolTimeoutError as e:
+            return str(e)
         if result.is_multimodal and result.content is not None:
             tool_call_id = (runtime.tool_call_id or "") if runtime is not None else ""
             return ToolMessage(
@@ -335,6 +346,8 @@ def _build_sync_read_tool(backend: BackendProtocol) -> StructuredTool:
             )
         return str(result)
 
+    _wrapped_aread = backend._wrap_tool_coroutine("read", backend.aread)
+
     async def async_read(
         file_path: Annotated[str, Field(description="Absolute file path")],
         offset: Annotated[int, Field(default=0, description="Line offset from start")],
@@ -352,9 +365,12 @@ def _build_sync_read_tool(backend: BackendProtocol) -> StructuredTool:
         ] = False,
         runtime: ToolRuntime = None,
     ) -> ToolMessage | str:
-        result: ReadResult = await backend.aread(
-            file_path, offset, limit, include_line_numbers,
-        )
+        try:
+            result: ReadResult = await _wrapped_aread(
+                file_path, offset, limit, include_line_numbers,
+            )
+        except ToolTimeoutError as e:
+            return str(e)
         if result.is_multimodal and result.content is not None:
             tool_call_id = (runtime.tool_call_id or "") if runtime is not None else ""
             return ToolMessage(
@@ -407,19 +423,29 @@ def build_core_tools(backend: BackendProtocol) -> list[StructuredTool]:
     """
 
     def _make_func(method_name: str):
+        sync_method = getattr(backend, method_name)
+        wrapped_sync = backend._wrap_sync_with_timeout(method_name, sync_method)
+
         def tool_func(**kwargs):
-            m = getattr(backend, method_name)
             if method_name == "grep":
                 kwargs = {k: v for k, v in kwargs.items() if v is not None}
-            return str(m(**kwargs))
+            try:
+                return str(wrapped_sync(**kwargs))
+            except ToolTimeoutError as e:
+                return str(e)
         return tool_func
 
     def _make_coro(method_name: str):
+        async_method = getattr(backend, _ASYNC_METHOD_MAP[method_name])
+        wrapped = backend._wrap_tool_coroutine(method_name, async_method)
+
         async def tool_coro(**kwargs):
-            async_m = getattr(backend, _ASYNC_METHOD_MAP[method_name])
             if method_name == "grep":
                 kwargs = {k: v for k, v in kwargs.items() if v is not None}
-            return str(await async_m(**kwargs))
+            try:
+                return str(await wrapped(**kwargs))
+            except ToolTimeoutError as e:
+                return str(e)
         return tool_coro
 
     tools: list[StructuredTool] = [_build_sync_read_tool(backend)]

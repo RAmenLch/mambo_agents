@@ -189,14 +189,15 @@ class TestLocalBackend:
         assert "Deleted:" in r
         assert not (tmp_root / "deleteme.txt").exists()
 
-    def test_delete_directory_recursive(self, tmp_root):
-        """delete removes non-empty directories (recursively by default)."""
+    def test_delete_rejects_directory(self, tmp_root):
+        """delete rejects directories — only single files can be removed."""
         backend = LocalBackend(root_dir=str(tmp_root))
         (tmp_root / "fulldir").mkdir()
         (tmp_root / "fulldir" / "file.txt").write_text("hi")
         r = backend.delete(f"{_W}/fulldir")
-        assert "Deleted:" in r
-        assert not (tmp_root / "fulldir").exists()
+        assert "is a directory" in r
+        assert (tmp_root / "fulldir").exists()
+        assert (tmp_root / "fulldir" / "file.txt").exists()
 
     def test_delete_not_found(self, tmp_root):
         backend = LocalBackend(root_dir=str(tmp_root))

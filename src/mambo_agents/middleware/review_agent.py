@@ -17,6 +17,7 @@ from typing import Any, Literal
 
 from langchain.agents.factory import create_agent as _langchain_create_agent
 from langchain.agents.middleware.types import AgentMiddleware
+from langchain_core.callbacks.manager import CallbackManager
 from langchain_core.language_models import BaseChatModel
 from langchain_core.messages import AIMessage, HumanMessage
 from langchain_core.tools import StructuredTool
@@ -226,9 +227,15 @@ def run_review_sync(
     # Isolate from parent graph's config (checkpointer, thread_id,
     # callbacks) so review agent messages don't leak into the main
     # agent's message stream.
+    #
+    # IMPORTANT: Do NOT use "callbacks": [] — langgraph's ensure_config
+    # (langgraph/_internal/_config.py) uses _is_not_empty() which
+    # treats [] as empty (len([])==0), so the parent CallbackManager
+    # (including StreamMessagesHandler) leaks through.  An empty
+    # CallbackManager bypasses this filter since it's not a list/dict.
     _isolated_config: dict[str, Any] = {
         "configurable": {"thread_id": str(uuid.uuid4())},
-        "callbacks": [],
+        "callbacks": CallbackManager(handlers=[]),
     }
 
     final_result: FinalReviewResult | None = None
@@ -240,6 +247,80 @@ def run_review_sync(
     ):
         # "updates" mode yields either a bare dict {node: {channel: [...]}}
         # or a (mode, payload) tuple when called as a subgraph.
+        if isinstance(event, tuple) and len(event) == 2:
+            _, payload = event
+        else:
+            payload = event
+
+        for node_output in (payload or {}).values():
+            if not isinstance(node_output, dict):
+                continue
+            messages = node_output.get("messages") or []
+            for msg in reversed(messages):
+                if isinstance(msg, AIMessage) and msg.tool_calls:
+                    for tc in msg.tool_calls:
+                        if tc.get("name") == _FINAL_TOOL_NAME:
+                            args = tc.get("args", {})
+                            try:
+                                final_result = FinalReviewResult(**args)
+                            except Exception:
+                                final_result = _parse_legacy_result(args)
+                            break
+                    if final_result is not None:
+                        break
+            if final_result is not None:
+                break
+        if final_result is not None:
+            break
+
+    if final_result is None:
+        raise _ReviewIncompleteError(
+            "Review agent completed without calling submit_review_verdict. "
+            "The audit is inconclusive — escalating to human review."
+        )
+
+    return final_result
+
+
+async def run_review_async(
+    agent: CompiledStateGraph,
+    review_prompt: str,
+) -> FinalReviewResult:
+    """Run the review agent **asynchronously** — safe to call from an async context.
+
+    Uses ``astream()`` instead of ``stream()`` so the asyncio event loop is
+    **not** blocked while the review agent runs.  The event format and early-exit
+    logic are identical to :func:`run_review_sync`.
+
+    Parameters
+    ----------
+    agent:
+        A compiled review agent (from :func:`create_review_agent`).
+    review_prompt:
+        The review task description (tool call details to audit).
+
+    Returns
+    -------
+    FinalReviewResult
+        The structured verdict.
+
+    Raises
+    ------
+    _ReviewIncompleteError
+        If the agent finishes without ever calling ``submit_review_verdict``.
+    """
+    _isolated_config: dict[str, Any] = {
+        "configurable": {"thread_id": str(uuid.uuid4())},
+        "callbacks": CallbackManager(handlers=[]),
+    }
+
+    final_result: FinalReviewResult | None = None
+
+    async for event in agent.astream(
+        {"messages": [HumanMessage(content=review_prompt)]},
+        stream_mode=["updates"],
+        config=_isolated_config,
+    ):
         if isinstance(event, tuple) and len(event) == 2:
             _, payload = event
         else:

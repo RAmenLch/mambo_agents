@@ -13,6 +13,8 @@ import base64
 import json
 import re
 import shlex
+import socket
+import threading
 from datetime import datetime, timezone
 from pathlib import PurePosixPath
 from types import TracebackType
@@ -33,6 +35,8 @@ from mambo_agents.backends.protocol import (
     LsResult,
     ReadResult,
     ReadSummarizer,
+    ToolTimeoutError,
+    ToolTimeouts,
     UploadFileResult,
     WorkspacePathError,
     WriteResult,
@@ -120,9 +124,16 @@ class SshBackend(BackendProtocol):
         edit_blacklist: frozenset[str] | None = None,
         ignore_dirs: frozenset[str] | None = None,
         max_read_chars: int = 100_000,
+        max_grep_matches: int = 1000,
         summarizer: "ReadSummarizer | None" = None,
+        tool_timeouts: ToolTimeouts | None = None,
     ) -> None:
-        super().__init__(max_read_chars=max_read_chars, summarizer=summarizer)
+        super().__init__(
+            max_read_chars=max_read_chars,
+            max_grep_matches=max_grep_matches,
+            summarizer=summarizer,
+            tool_timeouts=tool_timeouts,
+        )
         if password is None and key_filename is None:
             raise ValueError(
                 "Either 'password' or 'key_filename' must be provided for SSH authentication."
@@ -268,14 +279,62 @@ class SshBackend(BackendProtocol):
     ) -> tuple[str, str, int]:
         """Execute *command* on the remote server via SSH.
 
+        Sets a real timeout on the channel so ``recv_exit_status()`` does
+        not block indefinitely.  Reads stdout and stderr concurrently in
+        background threads to avoid pipe-buffer deadlocks (where the
+        remote process blocks on a full stderr pipe while we are still
+        waiting for stdout EOF).
+
         Returns:
             ``(stdout, stderr, exit_code)`` tuple.
         """
         t = timeout if timeout is not None else self._execute_timeout
         _stdin, stdout, stderr = self._client.exec_command(command, timeout=t)
-        exit_code = stdout.channel.recv_exit_status()
-        out = stdout.read().decode(errors="replace")
-        err = stderr.read().decode(errors="replace")
+
+        channel = stdout.channel
+        channel.settimeout(t)
+
+        # Read stdout / stderr in background threads to prevent pipe-
+        # buffer deadlock: if the remote process writes a lot to stderr
+        # we must drain it even while we are still reading stdout.
+        out_chunks: list[bytes] = []
+        err_chunks: list[bytes] = []
+
+        def _drain(stream: object, chunks: list[bytes]) -> None:
+            try:
+                while True:
+                    data = stream.read(65536)  # type: ignore[attr-defined]
+                    if not data:
+                        break
+                    chunks.append(data)
+            except Exception:
+                pass
+
+        out_thread = threading.Thread(target=_drain, args=(stdout, out_chunks), daemon=True)
+        err_thread = threading.Thread(target=_drain, args=(stderr, err_chunks), daemon=True)
+        out_thread.start()
+        err_thread.start()
+
+        try:
+            exit_code = channel.recv_exit_status()
+        except socket.timeout:
+            channel.close()
+            # Give drain threads a brief window to collect partial data
+            out_thread.join(timeout=3)
+            err_thread.join(timeout=3)
+            partial_out = b"".join(out_chunks).decode(errors="replace")
+            partial_err = b"".join(err_chunks).decode(errors="replace")
+            hint = f"\n(stderr) {partial_err}" if partial_err.strip() else ""
+            return (partial_out, f"Command timed out after {t}s.{hint}", -1)
+        except Exception as exc:
+            channel.close()
+            return ("", f"Command execution error: {exc}", -1)
+
+        out_thread.join(timeout=5)
+        err_thread.join(timeout=5)
+
+        out = b"".join(out_chunks).decode(errors="replace")
+        err = b"".join(err_chunks).decode(errors="replace")
         return out, err, exit_code
 
     # ------------------------------------------------------------------
@@ -297,21 +356,22 @@ class SshBackend(BackendProtocol):
                     path=(str, Field(default=wr, description="Root directory to display")),
                     depth=(int, Field(default=3, description="Maximum recursion depth")),
                 ),
-                func=lambda **kwargs: self.tree(**kwargs),
-                coroutine=lambda **kwargs: self.atree(**kwargs),
+                func=self._safe_tool_func("tree", self.tree),
+                coroutine=self._safe_tool_coroutine("tree", self.atree),
             ),
             StructuredTool(
                 name="delete",
                 description=(
-                    "Delete a file or directory. "
-                    "For directories, removes the directory and all its contents recursively."
+                    "Delete a single file. "
+                    "Directories are NOT supported — remove files inside the "
+                    "directory first, then the empty directory disappears naturally."
                 ),
                 args_schema=create_model(
                     "DeleteSchema",
-                    path=(str, Field(description="Absolute path to delete")),
+                    path=(str, Field(description="Absolute file path to delete")),
                 ),
-                func=lambda **kwargs: self.delete(**kwargs),
-                coroutine=lambda **kwargs: self.adelete(**kwargs),
+                func=self._safe_tool_func("delete", self.delete),
+                coroutine=self._safe_tool_coroutine("delete", self.adelete),
             ),
         ]
 
@@ -321,15 +381,25 @@ class SshBackend(BackendProtocol):
                     name="execute",
                     description=(
                         "Execute a shell command on the remote server via SSH. "
-                        "Returns combined stdout and stderr output."
+                        "Returns combined stdout and stderr output.\n\n"
+                        "**CRITICAL — Real vs. virtual path mapping:** "
+                        f"The workspace root `{wr}` is a virtual path "
+                        f"that maps to the remote directory `{self._remote_root}`. "
+                        f"File tools (ls/read/write/edit/grep/glob) accept "
+                        f"`{wr}/...` virtual paths, but shell commands "
+                        f"in **execute** run directly on the remote filesystem. "
+                        f"You MUST use real remote filesystem paths (e.g. "
+                        f"`{self._remote_root}/src/main.py`) in commands — "
+                        f"virtual paths like `{wr}/src/main.py` do NOT "
+                        f"exist on the remote filesystem and will fail."
                     ),
                     args_schema=create_model(
                         "ExecuteSchema",
                         command=(str, Field(description="Shell command to execute")),
                         timeout=(int | None, Field(default=None, description="Optional timeout in seconds")),
                     ),
-                    func=lambda **kwargs: self.execute(**kwargs),
-                    coroutine=lambda **kwargs: self.aexecute(**kwargs),
+                    func=self._safe_tool_func("execute", self.execute),
+                    coroutine=self._safe_tool_coroutine("execute", self.aexecute),
                 )
             )
 
@@ -754,15 +824,33 @@ class SshBackend(BackendProtocol):
         pattern: str,
         path: str = "/workspace",
         glob: str | None = None,
+        regex: bool = False,
+        offset: int = 0,
+        limit: int | None = None,
     ) -> GrepResult:
-        """Search for a literal pattern in files under *path*.
+        """Search for a text pattern in files under *path*.
 
         Execution order:
-        1. ``rg --json -F`` (ripgrep, fastest)
+        1. ``rg --json`` (ripgrep, fastest)
         2. ``grep -rnIsH`` (fast C fallback)
         3. ``python3`` os.walk (portable last resort, used when
            GNU grep fails e.g. BSD/macOS with ``--include`` glob)
         """
+        # Delegate to the internal collector which returns raw full matches,
+        # then apply limit at this level.
+        raw = self._grep_raw(pattern, path, glob, regex)
+        if raw.error and not raw.matches:
+            return raw  # fatal error, no matches
+        return self._apply_grep_limit(raw.matches or [], offset, limit)
+
+    def _grep_raw(
+        self,
+        pattern: str,
+        path: str = "/workspace",
+        glob: str | None = None,
+        regex: bool = False,
+    ) -> GrepResult:
+        """Collect raw grep matches without offset/limit truncation."""
         if not pattern:
             return GrepResult(error="pattern must not be empty")
         try:
@@ -773,22 +861,18 @@ class SshBackend(BackendProtocol):
         pattern_escaped = shlex.quote(pattern)
 
         # 1) Try ripgrep on the remote (fastest)
-        matches = self._rg_remote(pattern_escaped, remote, glob)
+        matches = self._rg_remote(pattern_escaped, remote, glob, regex)
         if matches is not None:
             return GrepResult(matches=matches)
 
         # 2) GNU grep (fast C program, handles most cases)
-        result = self._grep_remote(pattern_escaped, remote_escaped, glob)
-        # If grep succeeded (even with no matches) we're done;
-        # only fall through to python3 on actual grep errors
-        # e.g. --include not supported on BSD/macOS grep.
+        result = self._grep_remote(pattern_escaped, remote_escaped, glob, regex)
         if result.error is None:
             return result
 
-        # 3) python3 last resort (portable but slower; used when GNU
-        #    grep fails e.g. on BSD/macOS with --include glob)
+        # 3) python3 last resort
         if self._has_python3:
-            return self._grep_python(pattern, remote, glob)
+            return self._grep_python(pattern, remote, glob, regex)
 
         return result
 
@@ -797,9 +881,12 @@ class SshBackend(BackendProtocol):
         pattern_escaped: str,
         remote: str,
         glob: str | None,
+        regex: bool = False,
     ) -> list[GrepMatch] | None:
         """Run ripgrep on the remote server.  Returns ``None`` if unavailable."""
-        cmd = f"rg --json -F"
+        cmd = "rg --json"
+        if not regex:
+            cmd += " -F"
         if glob:
             cmd += f" --glob {shlex.quote(glob)}"
         cmd += f" -- {pattern_escaped} {shlex.quote(remote)}"
@@ -842,6 +929,7 @@ class SshBackend(BackendProtocol):
         pattern: str,
         remote: str,
         glob: str | None,
+        regex: bool = False,
     ) -> GrepResult:
         """Portable grep via remote ``python3`` using :func:`os.walk` +
         :func:`fnmatch.fnmatch`.
@@ -857,6 +945,7 @@ class SshBackend(BackendProtocol):
 
         pattern_b64 = base64.b64encode(pattern.encode()).decode()
         glob_b64 = base64.b64encode((glob or "").encode()).decode()
+        regex_b64 = base64.b64encode(str(regex).encode()).decode()
         remote_repr = repr(remote)
 
         # Convert virtual ignore_dirs → relative names for remote os.walk
@@ -869,7 +958,7 @@ class SshBackend(BackendProtocol):
         ).decode()
 
         script = (
-            f"import base64, os, fnmatch, json\n"
+            f"import base64, os, fnmatch, json, re\n"
             f"SKIP_DIRS = set(json.loads("
             f"base64.b64decode({ignore_names_b64!r}).decode()))\n"
             f"BINARY_EXTS = {{'.pyc', '.pyo', '.so', '.o', '.a', '.bin',\n"
@@ -879,6 +968,11 @@ class SshBackend(BackendProtocol):
             f"MAX_SIZE = 1_048_576\n"  # 1 MB
             f"pat = base64.b64decode({pattern_b64!r}).decode()\n"
             f"gpat = base64.b64decode({glob_b64!r}).decode() or None\n"
+            f"use_regex = base64.b64decode({regex_b64!r}).decode() == 'True'\n"
+            f"if use_regex:\n"
+            f"    _regex = re.compile(pat)\n"
+            f"else:\n"
+            f"    _regex = re.compile(re.escape(pat))\n"
             f"d = {remote_repr}\n"
             f"res = []\n"
             f"for root, dirs, files in os.walk(d):\n"
@@ -897,7 +991,7 @@ class SshBackend(BackendProtocol):
             f"                continue\n"
             f"            with open(fp, 'r', encoding='utf-8', errors='ignore') as f:\n"
             f"                for li, line in enumerate(f, 1):\n"
-            f"                    if pat in line:\n"
+            f"                    if _regex.search(line):\n"
             f"                        res.append({{'p': fp, 'l': li,"
             f" 't': line.rstrip(chr(10))}})\n"
             f"        except Exception:\n"
@@ -932,6 +1026,7 @@ class SshBackend(BackendProtocol):
         pattern_escaped: str,
         remote_escaped: str,
         glob: str | None,
+        regex: bool = False,
     ) -> GrepResult:
         """Fallback grep using ``grep -rnIsH`` on the remote.
 
@@ -939,7 +1034,10 @@ class SshBackend(BackendProtocol):
         ``-s`` suppress error messages, ``-H`` always print filename
         (needed for single-file searches where grep would otherwise omit it).
         """
-        base_flags = "grep -rnIsH"
+        if regex:
+            base_flags = "grep -rnIsHE"
+        else:
+            base_flags = "grep -rnIsHF"
         if glob:
             cmd = f"{base_flags} --include={shlex.quote(glob)} -- {pattern_escaped} {remote_escaped}"
         else:
@@ -1392,10 +1490,10 @@ class SshBackend(BackendProtocol):
     # ------------------------------------------------------------------
 
     def delete(self, path: str) -> str:
-        """Delete a file or directory on the remote server.
+        """Delete a single **file** on the remote server.
 
-        Uses ``rm -rf`` on the remote side.  Refuses to delete the
-        remote root directory.
+        Directories are rejected — the agent must remove files inside
+        the directory individually before the directory can be deleted.
         """
         if not self._check_edit_allowed(path):
             return (
@@ -1407,12 +1505,23 @@ class SshBackend(BackendProtocol):
         except WorkspacePathError as e:
             return str(e)
 
-        # Safety: refuse to delete the root dir
+        # Safety: refuse to delete the remote root
         if remote.rstrip("/") == self._remote_root.rstrip("/"):
             return "Error: cannot delete root working directory."
 
+        # Reject directories
+        try:
+            st_mode = self._sftp.stat(remote).st_mode
+            if self._attr_is_dir_maybe(st_mode):
+                return (
+                    f"Error: '{path}' is a directory. "
+                    f"The delete tool only removes single files. "
+                )
+        except FileNotFoundError:
+            return f"Error: path '{path}' does not exist."
+
         remote_escaped = shlex.quote(remote)
-        out, err, exit_code = self._exec(f"rm -rf {remote_escaped}")
+        out, err, exit_code = self._exec(f"rm -f {remote_escaped}")
 
         if exit_code != 0:
             return f"Error deleting '{path}': {err or out}"
@@ -1522,9 +1631,12 @@ class SshBackend(BackendProtocol):
         pattern: str,
         path: str = "/workspace",
         glob: str | None = None,
+        regex: bool = False,
+        offset: int = 0,
+        limit: int | None = None,
     ) -> GrepResult:
         async with self._async_lock:
-            return await asyncio.to_thread(self.grep, pattern, path, glob)
+            return await asyncio.to_thread(self.grep, pattern, path, glob, regex, offset, limit)
 
     async def aglob(self, pattern: str, path: str = "/workspace") -> GlobResult:
         async with self._async_lock:

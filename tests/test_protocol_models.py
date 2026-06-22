@@ -284,7 +284,7 @@ class TestBackendProtocol:
             def edit(self, file_path, old_str, new_str, *, replace_all=False):
                 return EditResult(path=file_path)
 
-            def grep(self, pattern, path="/", glob=None):
+            def grep(self, pattern, path="/", glob=None, **kwargs):
                 return GrepResult(matches=[])
 
             def glob(self, pattern, path="/"):
@@ -314,7 +314,7 @@ class TestBackendProtocol:
             def edit(self, file_path, old_str, new_str, *, replace_all=False):
                 return EditResult(path=file_path)
 
-            def grep(self, pattern, path="/", glob=None):
+            def grep(self, pattern, path="/", glob=None, **kwargs):
                 return GrepResult(matches=[])
 
             def glob(self, pattern, path="/"):
@@ -361,7 +361,7 @@ class TestThreadAwareWorkspace:
             def edit(self, file_path, old_str, new_str, *, replace_all=False):
                 return EditResult(path=file_path)
 
-            def grep(self, pattern, path="/", glob=None):
+            def grep(self, pattern, path="/", glob=None, **kwargs):
                 return GrepResult(matches=[])
 
             def glob(self, pattern, path="/"):
@@ -390,7 +390,7 @@ class TestThreadAwareWorkspace:
             def edit(self, file_path, old_str, new_str, *, replace_all=False):
                 return EditResult(path=file_path)
 
-            def grep(self, pattern, path="/", glob=None):
+            def grep(self, pattern, path="/", glob=None, **kwargs):
                 return GrepResult(matches=[])
 
             def glob(self, pattern, path="/"):
@@ -436,7 +436,7 @@ class TestThreadAwareWorkspace:
             def edit(self, file_path, old_str, new_str, *, replace_all=False):
                 return EditResult(path=file_path)
 
-            def grep(self, pattern, path="/", glob=None):
+            def grep(self, pattern, path="/", glob=None, **kwargs):
                 return GrepResult(matches=[])
 
             def glob(self, pattern, path="/"):

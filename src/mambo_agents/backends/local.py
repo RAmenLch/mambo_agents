@@ -33,6 +33,8 @@ from mambo_agents.backends.protocol import (
     LsResult,
     ReadResult,
     ReadSummarizer,
+    ToolTimeoutError,
+    ToolTimeouts,
     UploadFileResult,
     WorkspacePathError,
     WriteResult,
@@ -121,9 +123,16 @@ class LocalBackend(BackendProtocol):
         edit_blacklist: frozenset[str] | None = None,
         ignore_dirs: frozenset[str] | None = None,
         max_read_chars: int = 100_000,
+        max_grep_matches: int = 1000,
         summarizer: "ReadSummarizer | None" = None,
+        tool_timeouts: ToolTimeouts | None = None,
     ) -> None:
-        super().__init__(max_read_chars=max_read_chars, summarizer=summarizer)
+        super().__init__(
+            max_read_chars=max_read_chars,
+            max_grep_matches=max_grep_matches,
+            summarizer=summarizer,
+            tool_timeouts=tool_timeouts,
+        )
         if timeout <= 0:
             msg = f"timeout must be positive, got {timeout}"
             raise ValueError(msg)
@@ -171,21 +180,22 @@ class LocalBackend(BackendProtocol):
                     path=(str, Field(default=wr, description="Root directory to display")),
                     depth=(int, Field(default=3, description="Maximum recursion depth")),
                 ),
-                func=lambda **kwargs: self.tree(**kwargs),
-                coroutine=lambda **kwargs: self.atree(**kwargs),
+                func=self._safe_tool_func("tree", self.tree),
+                coroutine=self._safe_tool_coroutine("tree", self.atree),
             ),
             StructuredTool(
                 name="delete",
                 description=(
-                    "Delete a file or directory. "
-                    "For directories, removes the directory and all its contents recursively."
+                    "Delete a single file. "
+                    "Directories are NOT supported — remove files inside the "
+                    "directory first, then the empty directory disappears naturally."
                 ),
                 args_schema=create_model(
                     "DeleteSchema",
-                    path=(str, Field(description="Absolute path to delete")),
+                    path=(str, Field(description="Absolute file path to delete")),
                 ),
-                func=lambda **kwargs: self.delete(**kwargs),
-                coroutine=lambda **kwargs: self.adelete(**kwargs),
+                func=self._safe_tool_func("delete", self.delete),
+                coroutine=self._safe_tool_coroutine("delete", self.adelete),
             ),
         ]
 
@@ -197,15 +207,25 @@ class LocalBackend(BackendProtocol):
                         "Execute a shell command on the local system. "
                         "On Windows, commands run via cmd /c. "
                         "On Linux/macOS, commands run via sh -c. "
-                        "Returns combined stdout and stderr output."
+                        "Returns combined stdout and stderr output.\n\n"
+                        "**CRITICAL — Real vs. virtual path mapping:** "
+                        f"The workspace root `{wr}` is a virtual path "
+                        f"that maps to the real directory `{self._cwd}`. "
+                        f"File tools (ls/read/write/edit/grep/glob) accept "
+                        f"`{wr}/...` virtual paths, but shell commands "
+                        f"in **execute** run directly on the real filesystem. "
+                        f"You MUST use real filesystem paths (e.g. "
+                        f"`{self._cwd}/src/main.py`) in commands — "
+                        f"virtual paths like `{wr}/src/main.py` do NOT "
+                        f"exist on the real filesystem and will fail."
                     ),
                     args_schema=create_model(
                         "ExecuteSchema",
                         command=(str, Field(description="Shell command to execute")),
                         timeout=(int | None, Field(default=None, description="Optional timeout in seconds")),
                     ),
-                    func=lambda **kwargs: self.execute(**kwargs),
-                    coroutine=lambda **kwargs: self.aexecute(**kwargs),
+                    func=self._safe_tool_func("execute", self.execute),
+                    coroutine=self._safe_tool_coroutine("execute", self.aexecute),
                 )
             )
 
@@ -551,6 +571,9 @@ class LocalBackend(BackendProtocol):
         pattern: str,
         path: str = "/workspace",
         glob: str | None = None,
+        regex: bool = False,
+        offset: int = 0,
+        limit: int | None = None,
     ) -> GrepResult:
         if not pattern:
             return GrepResult(error="pattern must not be empty")
@@ -569,43 +592,55 @@ class LocalBackend(BackendProtocol):
 
         # 1) Try ripgrep (handles files and dirs equally; skip glob filter for files)
         rg_glob = glob if is_dir else None
-        results = self._ripgrep_grep(pattern, resolved, rg_glob)
+        results = self._ripgrep_grep(pattern, resolved, rg_glob, regex)
         if results is not None:
             # ripgrep paths are physical → convert to virtual
             matches: list[GrepMatch] = []
             for fpath, items in results.items():
+                if len(matches) >= self._max_grep_matches:
+                    break
                 try:
                     rel = str(Path(fpath).relative_to(self._cwd)).replace("\\", "/")
                     virt = f"{wr}/{rel}"
                 except ValueError:
                     continue
                 for li, text in items:
+                    if len(matches) >= self._max_grep_matches:
+                        break
                     matches.append(GrepMatch(path=virt, line=li, text=text))
-            return GrepResult(matches=matches)
+            return self._apply_grep_limit(matches, offset, limit)
 
         # 2) Python fallback with file-size guard
         import fnmatch as _fnmatch
 
         matches: list[GrepMatch] = []
         skipped: int = 0
-        regex = re.compile(re.escape(pattern))
+        if regex:
+            compiled = re.compile(pattern)
+        else:
+            compiled = re.compile(re.escape(pattern))
 
         if not is_dir:
             # Single-file search
             try:
                 lines = resolved.read_text(encoding="utf-8").split("\n")
             except (UnicodeDecodeError, OSError):
-                return GrepResult(matches=[])
+                return self._apply_grep_limit([], offset, limit)
             for li, line in enumerate(lines, start=1):
-                if regex.search(line):
+                if len(matches) >= self._max_grep_matches:
+                    break
+                if compiled.search(line):
                     rel = str(resolved.relative_to(self._cwd)).replace("\\", "/")
                     virt_path = f"{wr}/{rel}"
                     matches.append(GrepMatch(path=virt_path, line=li, text=line))
-            return GrepResult(matches=matches)
+            return self._apply_grep_limit(matches, offset, limit)
 
         search_dir = resolved
+        error_msg: str | None = None
         try:
             for fp in search_dir.rglob("*"):
+                if len(matches) >= self._max_grep_matches:
+                    break
                 try:
                     if not fp.is_file():
                         continue
@@ -631,24 +666,36 @@ class LocalBackend(BackendProtocol):
                     continue
 
                 for li, line in enumerate(lines, start=1):
-                    if regex.search(line):
+                    if len(matches) >= self._max_grep_matches:
+                        break
+                    if compiled.search(line):
                         rel = str(fp.relative_to(self._cwd)).replace("\\", "/")
                         virt_path = f"{wr}/{rel}"
                         matches.append(GrepMatch(path=virt_path, line=li, text=line))
         except OSError as e:
+            result = self._apply_grep_limit(matches, offset, limit)
             return GrepResult(
                 error=f"Error during grep: {e}",
-                matches=matches,
+                matches=result.matches,
+                truncated=result.truncated,
+                total_matches=result.total_matches,
             )
 
-        error_msg: str | None = None
         if skipped:
             error_msg = (
                 f"Skipped {skipped} file(s) exceeding "
                 f"{self._max_file_size_bytes // (1024 * 1024)} MB size limit"
             )
 
-        return GrepResult(error=error_msg, matches=matches)
+        result = self._apply_grep_limit(matches, offset, limit)
+        if error_msg:
+            result = GrepResult(
+                error=error_msg,
+                matches=result.matches,
+                truncated=result.truncated,
+                total_matches=result.total_matches,
+            )
+        return result
 
     # ------------------------------------------------------------------
     # ripgrep helper
@@ -659,8 +706,9 @@ class LocalBackend(BackendProtocol):
         pattern: str,
         base_dir: Path,
         include_glob: str | None,
+        regex: bool = False,
     ) -> dict[str, list[tuple[int, str]]] | None:
-        """Search with ripgrep (literal mode, JSON output).
+        """Search with ripgrep (JSON output).
 
         Returns:
             Dict mapping physical file paths → list of (line, text), or
@@ -669,7 +717,9 @@ class LocalBackend(BackendProtocol):
         if not shutil.which("rg"):
             return None
 
-        cmd = ["rg", "--json", "-F"]
+        cmd = ["rg", "--json"]
+        if not regex:
+            cmd.append("-F")
         if include_glob:
             cmd.extend(["--glob", include_glob])
         cmd.extend(["--", pattern, str(base_dir)])
@@ -780,9 +830,10 @@ class LocalBackend(BackendProtocol):
         return format_tree_entries(entries)
 
     def delete(self, path: str) -> str:
-        """Delete a file or directory.
+        """Delete a single **file**.
 
-        For directories, removes recursively (like ``rm -rf``).
+        Directories are rejected — the agent must remove files inside
+        the directory individually before the directory can be deleted.
 
         Args:
             path: Virtual path to delete.
@@ -807,11 +858,14 @@ class LocalBackend(BackendProtocol):
         if not resolved.exists():
             return f"Error: path '{path}' does not exist."
 
+        if resolved.is_dir():
+            return (
+                f"Error: '{path}' is a directory. "
+                f"The delete tool only removes single files. "
+            )
+
         try:
-            if resolved.is_dir():
-                shutil.rmtree(resolved)
-            else:
-                resolved.unlink()
+            resolved.unlink()
         except OSError as e:
             return f"Error deleting '{path}': {e}"
 

@@ -78,6 +78,7 @@ from mambo_agents.backends.protocol import BackendProtocol
 from mambo_agents.middleware.review_agent import (
     FinalReviewResult,
     create_review_agent,
+    run_review_async,
     run_review_sync,
 )
 
@@ -700,6 +701,104 @@ class AutoSecurityReviewMiddleware(
             )
 
     # ------------------------------------------------------------------
+    # Async AI review methods — non-blocking for asyncio event loop
+    # ------------------------------------------------------------------
+
+    async def _ai_review_llm_async(self, tool_call: ToolCall) -> SecurityReviewResult:
+        """LLM-mode review — async, does NOT block the event loop."""
+        tool_desc = self._tool_descriptions.get(tool_call["name"])
+        messages = _build_review_messages(
+            self._review_system_prompt, tool_call,
+            tool_description=tool_desc,
+        )
+
+        _isolated_config: RunnableConfig = {"callbacks": []}
+
+        try:
+            structured_model = self._review_model.with_structured_output(
+                SecurityReviewResult,
+                method="function_calling",
+            )
+            response: SecurityReviewResult = await structured_model.ainvoke(
+                messages, config=_isolated_config,
+            )
+            return response
+        except Exception as exc:
+            exc_info = f"{type(exc).__name__}: {exc}"
+
+        raw_excerpt = ""
+        try:
+            raw = await self._review_model.ainvoke(messages, config=_isolated_config)
+            raw_content = raw.content if hasattr(raw, "content") else str(raw)
+            if isinstance(raw_content, str) and len(raw_content) > 500:
+                raw_excerpt = raw_content[:500] + "..."
+            elif isinstance(raw_content, str):
+                raw_excerpt = raw_content
+        except Exception:
+            raw_excerpt = "(unable to retrieve raw response)"
+
+        return SecurityReviewResult(
+            is_safe=False,
+            reason=(
+                f"Security review unavailable: structured output failed. "
+                f"Exception: {exc_info} | "
+                f"Raw response: {raw_excerpt}"
+            ),
+            risk_level="high",
+        )
+
+    async def _ai_review_agent_async(self, tool_call: ToolCall) -> SecurityReviewResult:
+        """Agent-mode review — async, does NOT block the event loop."""
+        if self._cached_review_agent is None:
+            self._init_review_agent()
+
+        agent = self._cached_review_agent
+        if agent is None:
+            return SecurityReviewResult(
+                is_safe=False,
+                reason="Review agent unavailable — agent not initialised.",
+                risk_level="high",
+            )
+
+        tool_name = tool_call["name"]
+        tool_args = tool_call["args"]
+        tool_desc = ""
+        if self._tool_descriptions and tool_name in self._tool_descriptions:
+            tool_desc = f"\n**Tool description:** {self._tool_descriptions[tool_name]}"
+
+        review_prompt = (
+            f"Please review the following tool call for security risks:\n\n"
+            f"**Tool name:** `{tool_name}`\n"
+            f"**Arguments:**\n```json\n{tool_args}\n```"
+            f"{tool_desc}\n\n"
+            f"You may use read-only tools (ls, read, grep, glob) to inspect "
+            f"the workspace if needed.  When done, call `最终审核结果`."
+        )
+
+        try:
+            result: FinalReviewResult = await run_review_async(agent, review_prompt)
+            return SecurityReviewResult(
+                is_safe=result.is_safe,
+                reason=result.reason,
+                risk_level=result.risk_level,
+            )
+        except Exception as exc:
+            return SecurityReviewResult(
+                is_safe=False,
+                reason=(
+                    f"Review agent failed: {type(exc).__name__}: {exc}. "
+                    f"Escalating to human review."
+                ),
+                risk_level="high",
+            )
+
+    async def _ai_review_async(self, tool_call: ToolCall) -> SecurityReviewResult:
+        """Async dispatcher — routes to agent or llm review without blocking."""
+        if self._review_mode == "agent" and self._should_agent_review(tool_call):
+            return await self._ai_review_agent_async(tool_call)
+        return await self._ai_review_llm_async(tool_call)
+
+    # ------------------------------------------------------------------
     # Emit pass notification (custom stream event — no LLM context pollution)
     # ------------------------------------------------------------------
 
@@ -979,6 +1078,58 @@ class AutoSecurityReviewMiddleware(
         }
         return self._rebuild_tool_calls(last_ai_msg.tool_calls, by_id)
 
+    async def _ahandle_first_run(
+        self, last_ai_msg: AIMessage
+    ) -> tuple[list[ToolCall], list[ToolMessage]] | None:
+        """Async variant of :meth:`_handle_first_run`.
+
+        Uses :meth:`_ai_review_async` so the event loop is NOT blocked
+        during AI review (critical for agent mode where the review agent
+        may run multi-step tool-calling loops).
+        """
+        actions_for_human: list[ActionRequest] = []
+        configs_for_human: list[ReviewConfig] = []
+
+        for tc in last_ai_msg.tool_calls:
+            config = self._interrupt_on.get(tc["name"])
+            if config is None:
+                continue
+
+            if self._should_ai_review(tc["name"]):
+                review = await self._ai_review_async(tc)
+                if review.is_safe:
+                    if self._notify_on_pass:
+                        self._emit_pass_notification(tc, review)
+                    continue
+                self._emit_fail_notification(tc, review)
+
+            action_req, review_cfg = self._build_action_and_config(tc, config)
+            actions_for_human.append(action_req)
+            configs_for_human.append(review_cfg)
+
+        if not actions_for_human:
+            return None
+
+        hitl_request = HITLRequest(
+            action_requests=actions_for_human,
+            review_configs=configs_for_human,
+        )
+        decisions: list[dict[str, Any]] = interrupt(
+            hitl_request.model_dump(exclude_none=True)
+        )["decisions"]
+
+        if len(decisions) != len(actions_for_human):
+            raise ValueError(
+                f"Mismatch: {len(decisions)} decisions vs "
+                f"{len(actions_for_human)} human-review calls."
+            )
+
+        by_id: dict[str, dict[str, Any]] = {
+            actions_for_human[i].tool_call_id: d
+            for i, d in enumerate(decisions)
+        }
+        return self._rebuild_tool_calls(last_ai_msg.tool_calls, by_id)
+
     def after_model(
         self,
         state: AgentState[Any],
@@ -1015,5 +1166,24 @@ class AutoSecurityReviewMiddleware(
         state: AgentState[Any],
         runtime: Runtime[ContextT],
     ) -> dict[str, Any] | None:
-        """Async variant delegates to ``after_model``."""
-        return self.after_model(state, runtime)
+        """Async variant with async AI review — does NOT block the event loop.
+
+        Uses :meth:`_ahandle_first_run` + :meth:`_ai_review_async` so the
+        review agent runs via ``astream()`` without blocking the asyncio
+        event loop thread.  See :meth:`after_model` for the synchronous
+        equivalent (used by ``RunnableCallable`` fallback paths).
+        """
+        last_ai_msg = self._get_last_ai_message(state)
+        if last_ai_msg is None:
+            return None
+
+        if self._detect_replay():
+            revised_calls, tool_msgs = self._handle_replay(last_ai_msg)
+        else:
+            result = await self._ahandle_first_run(last_ai_msg)
+            if result is None:
+                return None
+            revised_calls, tool_msgs = result
+
+        last_ai_msg.tool_calls = revised_calls
+        return {"messages": [last_ai_msg, *tool_msgs]}

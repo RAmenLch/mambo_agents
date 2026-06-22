@@ -9,8 +9,10 @@ import abc
 import asyncio
 import base64
 import mimetypes
+import threading
+from dataclasses import dataclass
 from pathlib import PurePosixPath
-from typing import Callable, Literal
+from typing import Any, Awaitable, Callable, Literal, TypeVar
 
 from langchain_core.tools import StructuredTool
 from pydantic import BaseModel, ConfigDict
@@ -95,6 +97,73 @@ Args:
 Returns:
     A short summary string to replace the oversized content.
 """
+
+
+# ============================================================================
+# Tool timeout configuration
+# ============================================================================
+
+
+@dataclass(frozen=True)
+class ToolTimeouts:
+    """Per-tool timeout configuration (seconds).
+
+    Each field maps to a tool name.  Pass an instance to any backend's
+    constructor via the ``tool_timeouts`` parameter to customise limits.
+
+    Defaults are chosen conservatively — actual values should be tuned
+    per deployment based on repository size and network latency.
+    """
+
+    ls: float = 20.0
+    """``ls`` — directory listing (synchronous SFTP / filesystem call)."""
+
+    read: float = 60.0
+    """``read`` — single-file read (SFTP transfer with optional line-number formatting)."""
+
+    write: float = 60.0
+    """``write`` — single-file create / overwrite."""
+
+    edit: float = 60.0
+    """``edit`` — text replacement in an existing file (remote python3 or local)."""
+
+    grep: float = 120.0
+    """``grep`` — recursive text search (may fall back to remote ``os.walk``)."""
+
+    glob: float = 60.0
+    """``glob`` — recursive pattern match (remote ``glob.glob`` or ``find``)."""
+
+    tree: float = 60.0
+    """``tree`` — directory tree render (remote ``os.walk`` or ``find``)."""
+
+    delete: float = 30.0
+    """``delete`` — single-file removal (directories are rejected)."""
+
+    execute: float = 180.0
+    """``execute`` — arbitrary shell command on the remote server."""
+
+    upload: float = 60.0
+    """``upload_files`` — bulk file upload."""
+
+    download: float = 60.0
+    """``download_files`` — bulk file download."""
+
+
+class ToolTimeoutError(Exception):
+    """Raised when a backend tool exceeds its configured timeout.
+
+    Caught by the agent runtime and presented as a tool error, giving
+    the LLM a chance to retry with narrower scope.
+    """
+
+    def __init__(self, tool_name: str, timeout_seconds: float) -> None:
+        self.tool_name = tool_name
+        self.timeout_seconds = timeout_seconds
+        super().__init__(
+            f"Tool '{tool_name}' timed out after {timeout_seconds:.0f}s. "
+            f"Try narrowing the scope — use a more specific path, glob "
+            f"pattern, or read limit."
+        )
 
 
 # ============================================================================
@@ -224,6 +293,10 @@ class GrepResult(BaseModel):
 
     error: str | None = None
     matches: list[GrepMatch] | None = None
+    truncated: bool = False
+    """``True`` when the result was truncated by ``max_grep_matches`` or offset/limit."""
+    total_matches: int = 0
+    """Total number of matches found before offset/limit slicing."""
 
     def __str__(self) -> str:
         lines: list[str] = []
@@ -233,6 +306,13 @@ class GrepResult(BaseModel):
             lines.extend(f"{m.path}:{m.line}: {m.text}" for m in self.matches)
         if not lines:
             return "No matches found."
+        if self.truncated:
+            shown = len(self.matches) if self.matches else 0
+            total = self.total_matches
+            lines.append(
+                f"\n[Truncated: showing {shown} of {total} matches. "
+                f"Use a narrower pattern/path/glob or adjust offset/limit to paginate.]"
+            )
         return "\n".join(lines)
 
 
@@ -373,12 +453,143 @@ class BackendProtocol(abc.ABC):
         self,
         *,
         max_read_chars: int = 100_000,
+        max_grep_matches: int = 1000,
         summarizer: ReadSummarizer | None = None,
+        tool_timeouts: ToolTimeouts | None = None,
     ) -> None:
         if max_read_chars < 1:
             raise ValueError(f"max_read_chars must be >= 1, got {max_read_chars}")
+        if max_grep_matches < 1:
+            raise ValueError(f"max_grep_matches must be >= 1, got {max_grep_matches}")
         self._max_read_chars = max_read_chars
+        self._max_grep_matches = max_grep_matches
         self._summarizer: ReadSummarizer = summarizer or self._default_summarizer
+        self._tool_timeouts = tool_timeouts or ToolTimeouts()
+
+    def _timeout_for(self, tool_name: str) -> float:
+        """Return the timeout (seconds) configured for *tool_name*.
+
+        Falls back to 60 s for unknown tool names.
+        """
+        return getattr(self._tool_timeouts, tool_name, 60.0)
+
+    _T = TypeVar("_T")
+
+    async def _await_with_timeout(
+        self, tool_name: str, coro: Awaitable[_T],
+    ) -> _T:
+        """Await *coro* with the timeout configured for *tool_name*.
+
+        Raises :class:`ToolTimeoutError` when the configured time limit
+        is exceeded.
+        """
+        timeout = self._timeout_for(tool_name)
+        try:
+            return await asyncio.wait_for(coro, timeout=timeout)
+        except asyncio.TimeoutError:
+            raise ToolTimeoutError(tool_name, timeout)
+
+    def _wrap_tool_coroutine(
+        self, tool_name: str, async_method: Callable[..., Awaitable[Any]],
+    ) -> Callable[..., Awaitable[Any]]:
+        """Return an async wrapper that applies timeout to *async_method*.
+
+        Intended for use when building ``StructuredTool`` instances so
+        that timeout enforcement happens at the tool boundary rather
+        than inside each async method.  Backend implementors write
+        plain async methods; the framework wraps them here.
+
+        Usage::
+
+            StructuredTool(
+                name="grep",
+                coroutine=backend._wrap_tool_coroutine("grep", backend.agrep),
+                ...
+            )
+        """
+        async def _wrapped(*args: Any, **kwargs: Any) -> Any:
+            return await self._await_with_timeout(
+                tool_name, async_method(*args, **kwargs),
+            )
+        _wrapped.__name__ = f"_timeout_wrapped_{tool_name}"
+        return _wrapped
+
+    def _wrap_sync_with_timeout(
+        self, tool_name: str, sync_method: Callable[..., Any],
+    ) -> Callable[..., Any]:
+        """Return a sync wrapper that applies timeout to *sync_method* via threading.
+
+        Runs *sync_method* in a daemon thread and joins with the configured
+        timeout.  Raises :class:`ToolTimeoutError` if the thread does not
+        finish within the limit.
+
+        Intended for use when building ``StructuredTool`` sync functions so
+        that timeout enforcement works for both ``invoke()`` and ``ainvoke()``.
+        """
+        timeout = self._timeout_for(tool_name)
+
+        def _wrapped(*args: Any, **kwargs: Any) -> Any:
+            result_holder: list[Any] = []
+            error_holder: list[BaseException] = []
+
+            def _target() -> None:
+                try:
+                    result_holder.append(sync_method(*args, **kwargs))
+                except Exception as exc:
+                    error_holder.append(exc)
+
+            t = threading.Thread(target=_target, daemon=True)
+            t.start()
+            t.join(timeout=timeout)
+
+            if t.is_alive():
+                raise ToolTimeoutError(tool_name, timeout)
+            if error_holder:
+                raise error_holder[0]
+            return result_holder[0]
+
+        _wrapped.__name__ = f"_timeout_wrapped_sync_{tool_name}"
+        return _wrapped
+
+    def _safe_tool_coroutine(
+        self, tool_name: str, async_method: Callable[..., Awaitable[Any]],
+    ) -> Callable[..., Awaitable[str]]:
+        """Return an async coroutine that catches :class:`ToolTimeoutError`.
+
+        Wraps the timeout-protected coroutine from :meth:`_wrap_tool_coroutine`
+        and converts :class:`ToolTimeoutError` to an error string so the LLM
+        sees a graceful timeout message instead of a crashed run.
+        """
+        wrapped = self._wrap_tool_coroutine(tool_name, async_method)
+
+        async def _safe(*args: Any, **kwargs: Any) -> str:
+            try:
+                return await wrapped(*args, **kwargs)
+            except ToolTimeoutError as e:
+                return str(e)
+
+        _safe.__name__ = f"_safe_wrapped_{tool_name}"
+        return _safe
+
+    def _safe_tool_func(
+        self, tool_name: str, sync_method: Callable[..., Any],
+    ) -> Callable[..., str]:
+        """Return a sync func that catches :class:`ToolTimeoutError`.
+
+        Wraps the timeout-protected func from :meth:`_wrap_sync_with_timeout`
+        and converts :class:`ToolTimeoutError` to an error string so the LLM
+        sees a graceful timeout message instead of a crashed run.
+        """
+        wrapped = self._wrap_sync_with_timeout(tool_name, sync_method)
+
+        def _safe(*args: Any, **kwargs: Any) -> str:
+            try:
+                return wrapped(*args, **kwargs)
+            except ToolTimeoutError as e:
+                return str(e)
+
+        _safe.__name__ = f"_safe_wrapped_sync_{tool_name}"
+        return _safe
 
     @staticmethod
     def _default_summarizer(file_path: str, content: str, max_chars: int) -> str:
@@ -405,6 +616,37 @@ class BackendProtocol(abc.ABC):
                 "content": self._summarizer(file_path, result.content, self._max_read_chars),
             })
         return result
+
+    def _apply_grep_limit(
+        self,
+        matches: list[GrepMatch],
+        offset: int,
+        limit: int | None,
+    ) -> GrepResult:
+        """Apply offset / limit slicing and ``max_grep_matches`` cap to grep results.
+
+        Args:
+            matches: All collected matches (up to ``max_grep_matches + 1``
+                to detect truncation).
+            offset: 0-based starting index into *matches*.
+            limit: Max number of matches to return.  ``None`` means
+                "use ``max_grep_matches``".
+
+        Returns:
+            A ``GrepResult`` with ``truncated`` and ``total_matches`` set.
+        """
+        total = len(matches)
+        effective_limit = limit if limit is not None else self._max_grep_matches
+        effective_limit = min(effective_limit, self._max_grep_matches)
+        if offset < 0:
+            offset = 0
+        sliced = matches[offset : offset + effective_limit]
+        truncated = (offset + effective_limit) < total
+        return GrepResult(
+            matches=sliced if sliced else None,
+            truncated=truncated,
+            total_matches=total,
+        )
 
     # ------------------------------------------------------------------
     # Core file operations (abstract — every backend MUST implement
@@ -499,8 +741,22 @@ class BackendProtocol(abc.ABC):
         pattern: str,
         path: str = "/workspace",
         glob: str | None = None,
+        regex: bool = False,
+        offset: int = 0,
+        limit: int | None = None,
     ) -> GrepResult:
-        """Search for a literal substring in files under *path*."""
+        """Search for a text pattern in files under *path*.
+
+        When *regex* is ``False`` (default), performs exact substring
+        matching (literal mode, fast and safe).  Set *regex* to ``True``
+        to interpret *pattern* as a Python regex with alternation,
+        character classes, quantifiers, etc.
+
+        Args:
+            offset: 0-based index into matches to start from (for pagination).
+            limit: Max matches to return.  ``None`` means up to
+                ``max_grep_matches`` (default 1000).
+        """
         ...
 
     @abc.abstractmethod
@@ -558,9 +814,12 @@ class BackendProtocol(abc.ABC):
         pattern: str,
         path: str = "/workspace",
         glob: str | None = None,
+        regex: bool = False,
+        offset: int = 0,
+        limit: int | None = None,
     ) -> GrepResult:
-        """Async: Search for a literal substring in files under *path*."""
-        return await asyncio.to_thread(self.grep, pattern, path, glob)
+        """Async: Search for a text pattern in files under *path*."""
+        return await asyncio.to_thread(self.grep, pattern, path, glob, regex, offset, limit)
 
     async def aglob(self, pattern: str, path: str = "/workspace") -> GlobResult:
         """Async: Find files matching a glob pattern under *path*."""

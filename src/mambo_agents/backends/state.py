@@ -31,6 +31,7 @@ from mambo_agents.backends.protocol import (
     ReadResult,
     ReadSummarizer,
     ThreadAwareWorkspace,
+    ToolTimeouts,
     UploadFileResult,
     WriteResult,
     _get_file_type,
@@ -76,8 +77,9 @@ class StateBackend(ThreadAwareWorkspace):
         *,
         max_read_chars: int = 100_000,
         summarizer: "ReadSummarizer | None" = None,
+        tool_timeouts: ToolTimeouts | None = None,
     ) -> None:
-        super().__init__(max_read_chars=max_read_chars, summarizer=summarizer)
+        super().__init__(max_read_chars=max_read_chars, summarizer=summarizer, tool_timeouts=tool_timeouts)
         self._lock = threading.RLock()
 
         # --- Per-thread channel mirrors (full-replaced on every _read_files) ---
@@ -496,11 +498,15 @@ class StateBackend(ThreadAwareWorkspace):
         pattern: str,
         path: str = "/",
         glob: str | None = None,
+        regex: bool = False,
+        offset: int = 0,
+        limit: int | None = None,
     ) -> GrepResult:
         if not pattern:
             return GrepResult(error="pattern must not be empty")
         files = self._read_files()
-        return _grep_in_memory(files, pattern, path, glob)
+        raw_matches = _grep_in_memory(files, pattern, path, glob, regex, self._max_grep_matches)
+        return self._apply_grep_limit(raw_matches, offset, limit)
 
     def glob(self, pattern: str, path: str = "/") -> GlobResult:
         files = self._read_files()
@@ -645,11 +651,26 @@ def _grep_in_memory(
     pattern: str,
     path: str = "/",
     file_glob: str | None = None,
-) -> GrepResult:
+    regex: bool = False,
+    max_matches: int = 1000,
+) -> list[GrepMatch]:
+    """Collect grep matches from in-memory files.
+
+    Returns:
+        Raw list of matches collected up to *max_matches* (no offset/limit applied).
+    """
+    import re as _re
+    if regex:
+        compiled = _re.compile(pattern)
+    else:
+        compiled = _re.compile(_re.escape(pattern))
+
     path_prefix = path.rstrip("/") if path != "/" else "/"
 
     matches: list[GrepMatch] = []
     for fpath, fd in sorted(files.items()):
+        if len(matches) >= max_matches:
+            break
         if path_prefix != "/" and not fpath.startswith(path_prefix):
             continue
         if file_glob and not fnmatch.fnmatch(fpath, file_glob):
@@ -658,10 +679,12 @@ def _grep_in_memory(
             continue
         content = fd.get("content", "")
         for li, line in enumerate(content.split("\n"), start=1):
-            if pattern in line:
+            if len(matches) >= max_matches:
+                break
+            if compiled.search(line):
                 matches.append(GrepMatch(path=fpath, line=li, text=line))
 
-    return GrepResult(matches=matches)
+    return matches
 
 
 def _glob_in_memory(

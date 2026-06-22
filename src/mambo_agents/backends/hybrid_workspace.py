@@ -39,6 +39,7 @@ from mambo_agents.backends.protocol import (
     ReadResult,
     ReadSummarizer,
     ThreadAwareWorkspace,
+    ToolTimeouts,
     UploadFileResult,
     WriteResult,
 )
@@ -69,6 +70,42 @@ class CopyResult(BaseModel):
         if self.error is not None:
             return f"Error: {self.error}"
         return f"Copied: {self.source} -> {self.destination}"
+
+
+# ============================================================================
+# Path-translation helper for extra tools
+# ============================================================================
+
+
+def _translate_path_kwarg(
+    hybrid: "HybridWorkspaceBackend",
+    kwargs: dict,
+) -> None:
+    """Rewrite ``kwargs["path"]`` via :meth:`HybridWorkspaceBackend._route`
+    when the path routes to the real backend.
+
+    Only modifies the dict when all of these hold:
+
+    - ``"path"`` is in *kwargs*
+    - The value is a non-empty string
+    - ``_route()`` succeeds and returns ``self._real`` as the target
+
+    Paths that route to a virtual backend or fail validation are left
+    unchanged — the real backend's own ``_resolve()`` will return a
+    descriptive error.
+    """
+    if "path" not in kwargs:
+        return
+    raw_path = kwargs["path"]
+    if not isinstance(raw_path, str) or not raw_path:
+        return
+    try:
+        target, rewritten = hybrid._route(raw_path)
+    except (ValueError, TypeError):
+        return
+    if target is not hybrid._real:
+        return
+    kwargs["path"] = rewritten
 
 
 # ============================================================================
@@ -119,8 +156,9 @@ class HybridWorkspaceBackend(ThreadAwareWorkspace):
         workspace_root: str = "/workspace",
         max_read_chars: int = 100_000,
         summarizer: "ReadSummarizer | None" = None,
+        tool_timeouts: ToolTimeouts | None = None,
     ) -> None:
-        super().__init__(max_read_chars=max_read_chars, summarizer=summarizer)
+        super().__init__(max_read_chars=max_read_chars, summarizer=summarizer, tool_timeouts=tool_timeouts)
 
         self.workspace_root = validate_canonical_path(workspace_root, "workspace_root")
         self._real = real_backend
@@ -135,7 +173,7 @@ class HybridWorkspaceBackend(ThreadAwareWorkspace):
             self._default_mambo = vw.pop(".")
         else:
             self._default_mambo = StateBackend(
-                max_read_chars=max_read_chars, summarizer=summarizer,
+                max_read_chars=max_read_chars, summarizer=summarizer, tool_timeouts=tool_timeouts,
             )
 
         # Remaining entries → /.mambo/<name>/ namespaces
@@ -157,12 +195,13 @@ class HybridWorkspaceBackend(ThreadAwareWorkspace):
             self._virtual[name] = be
 
     # ------------------------------------------------------------------
-    # tools — real_backend extras + copy
+    # tools — real_backend extras (path-translated) + copy
     # ------------------------------------------------------------------
 
     @property
     def tools(self) -> list[StructuredTool]:
-        return self._real.tools + [
+        wrapped = [self._wrap_extra_tool(t) for t in self._real.tools]
+        wrapped.append(
             StructuredTool(
                 name="copy",
                 description=(
@@ -177,10 +216,56 @@ class HybridWorkspaceBackend(ThreadAwareWorkspace):
                     source=(str, Field(description="Absolute source file path")),
                     destination=(str, Field(description="Absolute destination file path")),
                 ),
-                func=lambda source, destination: self.copy(source, destination),
-                coroutine=lambda source, destination: self.acopy(source, destination),
+                func=self._safe_tool_func("copy", self.copy),
+                coroutine=self._safe_tool_coroutine("copy", self.acopy),
             ),
-        ]
+        )
+        return wrapped
+
+    @staticmethod
+    def _tool_has_path_param(tool: StructuredTool) -> bool:
+        """Return ``True`` if *tool*'s args_schema declares a ``path`` field."""
+        schema = tool.args_schema
+        if schema is None:
+            return False
+        return "path" in schema.model_fields
+
+    def _wrap_extra_tool(self, tool: StructuredTool) -> StructuredTool:
+        """Wrap a real-backend tool so that its ``path`` argument is
+        translated through :meth:`_route` before delegation.
+
+        Only rewrites when ``_route`` maps to ``self._real`` — paths
+        that route to a virtual backend are left unchanged so the real
+        backend's own ``_resolve()`` returns a clear error.
+        """
+        if not self._tool_has_path_param(tool):
+            return tool
+
+        original_func = tool.func
+        original_coroutine = tool.coroutine
+
+        def wrapped_func(*args, **kwargs):
+            _translate_path_kwarg(self, kwargs)
+            if original_func is not None:
+                return original_func(*args, **kwargs)
+            return None
+
+        async def wrapped_coroutine(*args, **kwargs):
+            _translate_path_kwarg(self, kwargs)
+            if original_coroutine is not None:
+                return await original_coroutine(*args, **kwargs)
+            if original_func is not None:
+                return await asyncio.to_thread(original_func, *args, **kwargs)
+            return None
+
+        return StructuredTool(
+            name=tool.name,
+            description=tool.description,
+            args_schema=tool.args_schema,
+            func=wrapped_func,
+            coroutine=wrapped_coroutine,
+            return_direct=tool.return_direct,
+        )
 
     # ------------------------------------------------------------------
     # description — system-prompt injection
@@ -201,8 +286,10 @@ class HybridWorkspaceBackend(ThreadAwareWorkspace):
             f"{core_tools}.  "
             f"`copy` can move files between the virtual workspace and the real "
             f"filesystem.  "
-            f"Other tools (tree, delete, execute, etc.) must NOT target "
-            f"**{self._prefix}/** paths."
+            f"`tree` and `delete` automatically translate paths through the "
+            f"workspace namespace.  "
+            f"`execute` must use real filesystem paths — do NOT target "
+            f"**{self._prefix}/** paths with shell commands."
         )
 
         delegate_desc = self._real.description
@@ -429,16 +516,22 @@ class HybridWorkspaceBackend(ThreadAwareWorkspace):
         pattern: str,
         path: str = "/",
         glob: str | None = None,
+        regex: bool = False,
+        offset: int = 0,
+        limit: int | None = None,
     ) -> GrepResult:
         # Fan-out to all virtual backends when searching /.mambo root
         if path.rstrip("/") == self._prefix:
-            return self._grep_all_virtual(pattern, glob)
+            return self._apply_grep_limit(
+                self._grep_all_virtual(pattern, glob, regex),
+                offset, limit,
+            )
 
         try:
             target, p = self._route(path)
         except ValueError:
             return GrepResult(error=f"路径 '{path}' 无效，仅可访问：{self._valid_paths_description()}")
-        result = target.grep(pattern, p, glob)
+        result = target.grep(pattern, p, glob, regex, offset, limit)
         if result.matches:
             vprefix = self._get_virtual_prefix(path)
             twsr = target.workspace_root
@@ -450,6 +543,8 @@ class HybridWorkspaceBackend(ThreadAwareWorkspace):
                     })
                     for m in result.matches
                 ],
+                truncated=result.truncated,
+                total_matches=result.total_matches,
             )
         return result
 
@@ -548,13 +643,17 @@ class HybridWorkspaceBackend(ThreadAwareWorkspace):
         pattern: str,
         path: str = "/",
         glob: str | None = None,
+        regex: bool = False,
+        offset: int = 0,
+        limit: int | None = None,
     ) -> GrepResult:
         # Fan-out to all virtual backends when searching /.mambo root
         if path.rstrip("/") == self._prefix:
-            return await self._agrep_all_virtual(pattern, glob)
+            raw_matches = await self._agrep_all_virtual(pattern, glob, regex)
+            return self._apply_grep_limit(raw_matches, offset, limit)
 
         target, p = self._route(path)
-        result = await target.agrep(pattern, p, glob)
+        result = await target.agrep(pattern, p, glob, regex, offset, limit)
         if result.matches:
             vprefix = self._get_virtual_prefix(path)
             twsr = target.workspace_root
@@ -566,6 +665,8 @@ class HybridWorkspaceBackend(ThreadAwareWorkspace):
                     })
                     for m in result.matches
                 ],
+                truncated=result.truncated,
+                total_matches=result.total_matches,
             )
         return result
 
@@ -594,15 +695,13 @@ class HybridWorkspaceBackend(ThreadAwareWorkspace):
     # Fan-out helpers — search across all virtual backends at /.mambo root
     # ------------------------------------------------------------------
 
-    def _grep_all_virtual(self, pattern: str, glob: str | None) -> GrepResult:
+    def _grep_all_virtual(self, pattern: str, glob: str | None, regex: bool = False) -> list[GrepMatch]:
+        """Collect raw grep matches from all virtual backends (no offset/limit)."""
         all_matches: list = []
-        errors: list[str] = []
 
         # Default mambo
         p = self._rewrite(self._prefix, self._prefix, self._default_mambo.workspace_root)
-        result = self._default_mambo.grep(pattern, p, glob)
-        if result.error:
-            errors.append(f"[{self._prefix}]: {result.error}")
+        result = self._default_mambo.grep(pattern, p, glob, regex, offset=0, limit=None)
         if result.matches:
             twsr = self._default_mambo.workspace_root
             all_matches.extend(
@@ -613,9 +712,7 @@ class HybridWorkspaceBackend(ThreadAwareWorkspace):
         # Named virtual workspaces
         for name, be in self._virtual.items():
             vprefix = f"{self._prefix}/{name}"
-            result = be.grep(pattern, be.workspace_root, glob)
-            if result.error:
-                errors.append(f"[{vprefix}]: {result.error}")
+            result = be.grep(pattern, be.workspace_root, glob, regex, offset=0, limit=None)
             if result.matches:
                 twsr = be.workspace_root
                 all_matches.extend(
@@ -623,10 +720,7 @@ class HybridWorkspaceBackend(ThreadAwareWorkspace):
                     for m in result.matches
                 )
 
-        return GrepResult(
-            error=" | ".join(errors) if errors else None,
-            matches=all_matches if all_matches else None,
-        )
+        return all_matches
 
     def _glob_all_virtual(self, pattern: str) -> GlobResult:
         all_matches: list[FileInfo] = []
@@ -662,15 +756,13 @@ class HybridWorkspaceBackend(ThreadAwareWorkspace):
             matches=all_matches if all_matches else None,
         )
 
-    async def _agrep_all_virtual(self, pattern: str, glob: str | None) -> GrepResult:
+    async def _agrep_all_virtual(self, pattern: str, glob: str | None, regex: bool = False) -> list[GrepMatch]:
+        """Collect raw grep matches from all virtual backends (async, no offset/limit)."""
         all_matches: list = []
-        errors: list[str] = []
 
         # Default mambo
         p = self._rewrite(self._prefix, self._prefix, self._default_mambo.workspace_root)
-        result = await self._default_mambo.agrep(pattern, p, glob)
-        if result.error:
-            errors.append(f"[{self._prefix}]: {result.error}")
+        result = await self._default_mambo.agrep(pattern, p, glob, regex, offset=0, limit=None)
         if result.matches:
             twsr = self._default_mambo.workspace_root
             all_matches.extend(
@@ -681,9 +773,7 @@ class HybridWorkspaceBackend(ThreadAwareWorkspace):
         # Named virtual workspaces
         for name, be in self._virtual.items():
             vprefix = f"{self._prefix}/{name}"
-            result = await be.agrep(pattern, be.workspace_root, glob)
-            if result.error:
-                errors.append(f"[{vprefix}]: {result.error}")
+            result = await be.agrep(pattern, be.workspace_root, glob, regex, offset=0, limit=None)
             if result.matches:
                 twsr = be.workspace_root
                 all_matches.extend(
@@ -691,10 +781,7 @@ class HybridWorkspaceBackend(ThreadAwareWorkspace):
                     for m in result.matches
                 )
 
-        return GrepResult(
-            error=" | ".join(errors) if errors else None,
-            matches=all_matches if all_matches else None,
-        )
+        return all_matches
 
     async def _aglob_all_virtual(self, pattern: str) -> GlobResult:
         all_matches: list[FileInfo] = []
