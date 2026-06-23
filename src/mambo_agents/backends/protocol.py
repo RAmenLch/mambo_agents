@@ -183,6 +183,8 @@ class FileInfo(BaseModel):
     """Size in bytes (0 for directories)."""
     modified_at: str = ""
     """ISO-8601 timestamp or empty string."""
+    desc: str = ""
+    """Optional human-readable description / summary for the file or directory."""
 
 
 class GrepMatch(BaseModel):
@@ -215,10 +217,11 @@ class LsResult(BaseModel):
             lines.append(f"Warning: {self.error}")
         if self.entries is not None:
             for fi in self.entries:
+                desc_part = f"  -- {fi.desc.replace(chr(10), ' ')}" if fi.desc else ""
                 if fi.is_dir:
-                    lines.append(f"{fi.path}/")
+                    lines.append(f"{fi.path}/{desc_part}")
                 else:
-                    lines.append(f"{fi.path}  ({human_size(fi.size)})")
+                    lines.append(f"{fi.path}({human_size(fi.size)}){desc_part}")
         if not lines:
             return "(empty directory)"
         return "\n".join(lines)
@@ -327,7 +330,9 @@ class GlobResult(BaseModel):
         if self.error is not None:
             lines.append(f"Warning: {self.error}")
         if self.matches:
-            lines.extend(fi.path for fi in self.matches)
+            for fi in self.matches:
+                desc_part = f"  -- {fi.desc.replace(chr(10), ' ')}" if fi.desc else ""
+                lines.append(f"{fi.path}({human_size(fi.size)}){desc_part}")
         if not lines:
             return "No files found."
         return "\n".join(lines)

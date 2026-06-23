@@ -31,6 +31,7 @@ class TestFileInfo:
         assert fi.is_dir is False
         assert fi.size == 0
         assert fi.modified_at == ""
+        assert fi.desc == ""
 
     def test_frozen(self):
         fi = FileInfo(path="/a.txt")
@@ -38,11 +39,12 @@ class TestFileInfo:
             fi.path = "/b.txt"  # type: ignore[misc]
 
     def test_serialize(self):
-        fi = FileInfo(path="/a.py", size=1024, is_dir=False)
+        fi = FileInfo(path="/a.py", size=1024, is_dir=False, desc="main script")
         d = fi.model_dump()
         assert d["path"] == "/a.py"
         assert d["size"] == 1024
         assert d["is_dir"] is False
+        assert d["desc"] == "main script"
 
 
 # ============================================================================
@@ -72,8 +74,7 @@ class TestLsResult:
     def test_str_with_entries(self):
         r = LsResult(entries=[FileInfo(path="/a.txt", size=100)])
         s = str(r)
-        assert "/a.txt" in s
-        assert "100 B" in s
+        assert "/a.txt(100 B)" in s
 
     def test_str_with_directories(self):
         r = LsResult(entries=[FileInfo(path="/sub", is_dir=True)])
@@ -98,6 +99,27 @@ class TestLsResult:
         s = str(r)
         assert "Warning: Partial listing" in s
         assert "/ok.txt" in s
+
+    def test_str_file_with_desc(self):
+        r = LsResult(entries=[FileInfo(path="/a.py", size=2048, desc="主入口")])
+        s = str(r)
+        assert s == "/a.py(2 KB)  -- 主入口"
+
+    def test_str_dir_with_desc(self):
+        r = LsResult(entries=[FileInfo(path="/lib", is_dir=True, desc="工具库")])
+        s = str(r)
+        assert s == "/lib/  -- 工具库"
+
+    def test_str_desc_newline_replaced(self):
+        r = LsResult(entries=[FileInfo(path="/note.txt", size=10, desc="第一行\n第二行")])
+        s = str(r)
+        assert s == "/note.txt(10 B)  -- 第一行 第二行"
+
+    def test_str_empty_desc_not_shown(self):
+        r = LsResult(entries=[FileInfo(path="/a.txt", size=50, desc="")])
+        s = str(r)
+        assert "  -- " not in s
+        assert s == "/a.txt(50 B)"
 
 
 # ============================================================================
@@ -201,7 +223,37 @@ class TestGlobResult:
     def test_str_with_matches(self):
         fi = FileInfo(path="/a.py")
         r = GlobResult(matches=[fi])
-        assert str(r) == "/a.py"
+        assert str(r) == "/a.py(0 B)"
+
+    def test_str_with_size(self):
+        fi = FileInfo(path="/b.py", size=4096)
+        r = GlobResult(matches=[fi])
+        assert str(r) == "/b.py(4 KB)"
+
+    def test_str_with_desc(self):
+        fi = FileInfo(path="/main.py", size=512, desc="启动脚本")
+        r = GlobResult(matches=[fi])
+        assert str(r) == "/main.py(512 B)  -- 启动脚本"
+
+    def test_str_desc_newline_replaced(self):
+        fi = FileInfo(path="/readme.md", size=100, desc="项目说明\n请阅读")
+        r = GlobResult(matches=[fi])
+        assert str(r) == "/readme.md(100 B)  -- 项目说明 请阅读"
+
+    def test_str_empty_desc_not_shown(self):
+        fi = FileInfo(path="/a.py", size=42, desc="")
+        r = GlobResult(matches=[fi])
+        assert "  -- " not in str(r)
+        assert str(r) == "/a.py(42 B)"
+
+    def test_str_multiple_matches(self):
+        r = GlobResult(matches=[
+            FileInfo(path="/a.py", size=100),
+            FileInfo(path="/b.py", size=200),
+        ])
+        lines = str(r).split("\n")
+        assert lines[0] == "/a.py(100 B)"
+        assert lines[1] == "/b.py(200 B)"
 
     def test_str_no_matches(self):
         r = GlobResult(matches=[])

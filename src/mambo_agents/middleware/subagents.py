@@ -427,11 +427,20 @@ def _build_task_tool(
 
     # We always stream with "values" to capture the final state, plus the
     # user-selected granularity for custom events.
-    _stream_modes: list[str] = ["values", event_granularity]
+    # "custom" is always included so that subagent middleware events
+    # (e.g. AutoSecurityReviewMiddleware's pass/fail notifications) are
+    # captured and nested into ``subagent_event.chunk`` so consumers get
+    # everything through a single event type.
+    _stream_modes: list[str] = ["values", "custom", event_granularity]
 
-    # Deduplicate in case user chose "values"
-    if len(set(_stream_modes)) < len(_stream_modes):
-        _stream_modes = [event_granularity]
+    # Deduplicate preserving order (in case user chose "values" or "custom")
+    _seen: set[str] = set()
+    _deduped: list[str] = []
+    for m in _stream_modes:
+        if m not in _seen:
+            _seen.add(m)
+            _deduped.append(m)
+    _stream_modes = _deduped
 
     def _validate_and_prepare_state(
         subagent_type: str,
@@ -504,6 +513,10 @@ def _build_task_tool(
                     _emit_custom_event(
                         runtime.tool_call_id, subagent_type, data
                     )
+                elif mode == "custom":
+                    _emit_custom_event(
+                        runtime.tool_call_id, subagent_type, data
+                    )
                 if mode == "values":
                     final_state = cast(dict, data)
             else:
@@ -550,6 +563,10 @@ def _build_task_tool(
             if isinstance(chunk, tuple) and len(chunk) == 2:
                 mode, data = chunk
                 if mode == event_granularity:
+                    _emit_custom_event(
+                        runtime.tool_call_id, subagent_type, data
+                    )
+                elif mode == "custom":
                     _emit_custom_event(
                         runtime.tool_call_id, subagent_type, data
                     )
