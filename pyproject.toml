@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "mambo-agents"
-version = "0.2.0a35"
+version = "0.2.0a36"
 description = "AI Agent framework on LangChain/LangGraph — multi-backend filesystem, sub-agent scheduling, conversation summarization, security review, and skills system out of the box."
 readme = "README.md"
 license = { file = "LICENSE" }
