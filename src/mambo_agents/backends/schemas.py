@@ -223,6 +223,30 @@ class VirtualPath(BaseModel):
         )
         return VirtualPath(new)
 
+    def as_dir(self) -> VirtualPath:
+        """Return a copy with trailing ``"/"`` to mark as a directory."""
+        if self.value.endswith("/"):
+            return self
+        return VirtualPath(self.value + "/")
+
+    @property
+    def name(self) -> str:
+        """Final path component (like :attr:`pathlib.PurePosixPath.name`)."""
+        return self.normalized.rsplit("/", 1)[-1]
+
+    @property
+    def parent(self) -> VirtualPath:
+        """Parent directory (like :attr:`pathlib.PurePosixPath.parent`).
+
+        Returns *self* when already at workspace root (``VirtualPath("/")``
+        is not valid in this system)."""
+        normalized = self.normalized
+        parent_str = normalized.rsplit("/", 1)[0]
+        if not parent_str:
+            # "/workspace" → parent would be "/" → return self
+            return self
+        return VirtualPath(parent_str)
+
 
 # ============================================================================
 # File type classification

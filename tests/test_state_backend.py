@@ -386,8 +386,8 @@ class TestStateBackendLs:
         backend = StateBackend()
         with _simulate_graph(backend):
             result = backend.ls(VirtualPath("/workspace"))
-        assert result.entries is not None
-        assert len(result.entries) == 0
+        assert result.error is not None
+        assert "not found" in result.error
 
 
 # ============================================================================

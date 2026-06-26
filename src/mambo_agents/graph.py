@@ -163,7 +163,8 @@ def create_mambo_agent(
 
             **Example**::
 
-                memory_sources=["/.mambo/memory/AGENTS.md"]
+                from mambo_agents.backends.schemas import VirtualPath
+                memory_sources=[VirtualPath("/.mambo/memory/AGENTS.md")]
 
             Default: ``None`` (memory disabled).
         tools: Additional (non-file-system) tools.

@@ -344,6 +344,9 @@ class StateBackend(ThreadAwareWorkspace):
                     FileInfo(path=fpath, is_dir=False, size=len(content))
                 )
 
+        if not infos and not subdirs:
+            return LsResult(error=f"Path '{path}' not found")
+
         for sd in sorted(subdirs):
             infos.append(FileInfo(path=sd, is_dir=True, size=0))
 
@@ -504,6 +507,12 @@ class StateBackend(ThreadAwareWorkspace):
     ) -> GrepResult:
         if not pattern:
             return GrepResult(error="pattern must not be empty")
+        if regex:
+            import re as _re
+            try:
+                _re.compile(pattern)
+            except _re.error as e:
+                return GrepResult(error=f"Invalid regex pattern: {e}")
         files = self._read_files()
         raw_matches = _grep_in_memory(files, pattern, path.normalized, glob, regex, self._max_grep_matches)
         return self._apply_grep_limit(raw_matches, offset, limit)

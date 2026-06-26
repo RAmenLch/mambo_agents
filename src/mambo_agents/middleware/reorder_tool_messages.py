@@ -35,6 +35,7 @@ from langgraph.runtime import Runtime
 from langgraph.types import Overwrite
 from langgraph.typing import ContextT
 
+from mambo_agents.diagnostics import get_tracker, is_enabled
 from mambo_agents.middleware.patch_tool_calls import _unwrap_overwrite
 
 
@@ -60,13 +61,32 @@ class ReorderToolMessagesMiddleware(AgentMiddleware[AgentState, ContextT, Respon
         self, state: AgentState, runtime: Runtime,
     ) -> dict[str, Any] | None:
         """Reorder ToolMessages before each model call (sync)."""
-        messages = _unwrap_overwrite(state.get("messages"))
+        raw_messages = state.get("messages")
+        messages = _unwrap_overwrite(raw_messages)
+
+        # ---- 诊断：检查 state["messages"] 是否已经是 Overwrite（异常信号） ----
+        if is_enabled() and isinstance(raw_messages, Overwrite):
+            get_tracker().log_state_messages_type_mismatch(
+                source="reorder_tool_messages.before_model",
+                runtime=runtime,
+                value=raw_messages,
+            )
+
         if not messages or len(messages) < 2:
             return None
 
         reordered = _reorder(messages)
         if reordered is None:
             return None
+
+        # ---- 诊断：记录 Overwrite 被产生 ----
+        if is_enabled():
+            get_tracker().log_overwrite_produced(
+                source="reorder_tool_messages.before_model",
+                runtime=runtime,
+                original_count=len(messages),
+                reordered_count=len(reordered),
+            )
 
         return {"messages": Overwrite(value=reordered)}
 

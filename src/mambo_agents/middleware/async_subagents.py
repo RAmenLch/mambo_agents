@@ -42,10 +42,11 @@ from langchain_core.language_models import BaseChatModel
 from langchain_core.messages import HumanMessage, ToolMessage
 from langchain_core.runnables import Runnable, RunnableConfig
 from langchain_core.tools import StructuredTool
-from langgraph.types import Command
+from langgraph.types import Command, Overwrite
 from pydantic import BaseModel, ConfigDict, Field
 
 from mambo_agents.backends.protocol import BackendProtocol
+from mambo_agents.diagnostics import get_tracker, is_enabled
 from mambo_agents.middleware.subagents import CompiledSubAgent, SubAgent, _SubagentSpec
 
 # ---------------------------------------------------------------------------
@@ -434,6 +435,14 @@ def _build_async_task_tool(
                 "ls_agent_type": "async_subagent",
             }
         }
+
+        # ---- 诊断：记录子代理 checkpoint 命名空间继承 ----
+        if is_enabled():
+            get_tracker().log_subagent_config_inherited(
+                source="async_subagents._validate_and_prepare_state",
+                runtime=runtime,
+                subagent_type=subagent_type,
+            )
 
         runnable = subagent_graphs[subagent_type]
 
@@ -1051,6 +1060,15 @@ class AsyncSubAgentMiddleware(AgentMiddleware[AgentState, ContextT, ResponseT]):
     def tools(self) -> list[BaseTool]:
         return self._tools  # type: ignore[return-value]
 
+    def _check_request_messages(self, request: ModelRequest[ContextT]) -> None:
+        """诊断：检查 ModelRequest.messages 是否被 Overwrite 污染。"""
+        if is_enabled() and isinstance(request.messages, Overwrite):
+            get_tracker().log_request_messages_is_overwrite(
+                source="async_subagents.wrap_model_call",
+                runtime=None,
+                value=request.messages,
+            )
+
     def wrap_model_call(
         self,
         request: ModelRequest[ContextT],
@@ -1059,6 +1077,7 @@ class AsyncSubAgentMiddleware(AgentMiddleware[AgentState, ContextT, ResponseT]):
         ],
     ) -> ModelResponse[ResponseT]:
         """Inject async subagent instructions into system prompt."""
+        self._check_request_messages(request)
         if self._system_prompt is not None:
             request = _append_to_system_message(request, self._system_prompt)
         return handler(request)
@@ -1071,6 +1090,7 @@ class AsyncSubAgentMiddleware(AgentMiddleware[AgentState, ContextT, ResponseT]):
         ],
     ) -> ModelResponse[ResponseT]:
         """(async) Inject async subagent instructions into system prompt."""
+        self._check_request_messages(request)
         if self._system_prompt is not None:
             request = _append_to_system_message(request, self._system_prompt)
         return await handler(request)

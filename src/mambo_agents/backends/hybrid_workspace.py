@@ -318,11 +318,22 @@ class HybridWorkspaceBackend(ThreadAwareWorkspace):
             f"{core_tools}.  "
             f"`copy` can move files between the virtual workspace and the real "
             f"filesystem.  "
-            f"`tree` and `delete` automatically translate paths through the "
-            f"workspace namespace.  "
-            f"`execute` must use real filesystem paths — do NOT target "
-            f"**{self._prefix.normalized}/** paths with shell commands."
         )
+
+        # Dynamically detect which extra tools the real backend provides
+        real_tool_names = {t.name for t in self._real.tools}
+        auto_translate_tools = [n for n in ("tree", "delete") if n in real_tool_names]
+        if auto_translate_tools:
+            quoted = ", ".join(f"`{n}`" for n in auto_translate_tools)
+            base += (
+                f"{quoted} automatically translate paths through the "
+                f"workspace namespace.  "
+            )
+        if "execute" in real_tool_names:
+            base += (
+                f"`execute` must use real filesystem paths — do NOT target "
+                f"**{self._prefix.normalized}/** paths with shell commands."
+            )
 
         delegate_desc = self._real.description
         if delegate_desc:

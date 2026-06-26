@@ -495,11 +495,12 @@ class SshBackend(BackendProtocol):
             if attr.st_mtime is not None:
                 modified_at = datetime.fromtimestamp(attr.st_mtime, tz=timezone.utc).isoformat()
 
-            pp = PurePosixPath(path) / attr.filename
-            virtual_path = str(pp) + ("/" if is_dir else "")
+            vp = path.join(attr.filename)
+            if is_dir:
+                vp = vp.as_dir()
 
             infos.append(FileInfo(
-                path=virtual_path,
+                path=vp,
                 is_dir=is_dir,
                 size=size,
                 modified_at=modified_at,
@@ -1102,7 +1103,7 @@ class SshBackend(BackendProtocol):
 
         return GrepResult(matches=matches)
 
-    def _physical_to_virtual(self, physical_path: str) -> str:
+    def _physical_to_virtual(self, physical_path: str) -> VirtualPath:
         """Convert a remote absolute path to the virtual path scheme.
 
         Example: ``/home/user/project/src/main.py`` → ``/workspace/src/main.py``
@@ -1114,9 +1115,9 @@ class SshBackend(BackendProtocol):
         if physical_path.startswith(self._remote_root):
             suffix = physical_path[len(self._remote_root):]
             rel = suffix if suffix.startswith("/") else ("/" + suffix if suffix else "")
-            return f"{wr}{rel}"
+            return VirtualPath(f"{wr}{rel}")
         # If the path doesn't start with remote_root, return as-is
-        return physical_path
+        return VirtualPath(physical_path)
 
     def _check_edit_allowed(self, path: VirtualPath) -> bool:
         """Check whether *path* is allowed for edit/write/delete."""
@@ -1391,8 +1392,7 @@ class SshBackend(BackendProtocol):
         entries: list[TreeEntry] = []
 
         # Add path root itself
-        pp = PurePosixPath(path)
-        root_name = pp.name or remote.split("/")[-1] or "/"
+        root_name = path.name
         entries.append(TreeEntry(name=root_name + "/", depth=0))
 
         # Sort dirs by depth then name
@@ -1706,13 +1706,13 @@ class SshBackend(BackendProtocol):
                 self._ensure_remote_dir(str(PurePosixPath(remote).parent))
                 with self._sftp.open(remote, "wb") as f:
                     f.write(raw_content)
-                results.append(UploadFileResult(path=path.value))
+                results.append(UploadFileResult(path=path))
             except OSError as e:
-                results.append(UploadFileResult(path=path.value, error=str(e)))
+                results.append(UploadFileResult(path=path, error=str(e)))
             except Exception as e:
                 results.append(
                     UploadFileResult(
-                        path=path.value, error=f"{type(e).__name__}: {e}"
+                        path=path, error=f"{type(e).__name__}: {e}"
                     )
                 )
         return results
@@ -1731,7 +1731,7 @@ class SshBackend(BackendProtocol):
                 except FileNotFoundError:
                     results.append(
                         DownloadFileResult(
-                            path=path.value, content=None, error="file_not_found"
+                            path=path, content=None, error="file_not_found"
                         )
                     )
                     continue
@@ -1739,7 +1739,7 @@ class SshBackend(BackendProtocol):
                 if self._attr_is_dir_maybe(attr.st_mode):
                     results.append(
                         DownloadFileResult(
-                            path=path.value, content=None, error="is_directory"
+                            path=path, content=None, error="is_directory"
                         )
                     )
                     continue
@@ -1747,7 +1747,7 @@ class SshBackend(BackendProtocol):
                 with self._sftp.open(remote, "rb") as f:
                     raw = f.read()
                 results.append(
-                    DownloadFileResult(path=path.value, content=raw)
+                    DownloadFileResult(path=path, content=raw)
                 )
             except OSError as e:
                 results.append(
@@ -1756,7 +1756,7 @@ class SshBackend(BackendProtocol):
             except Exception as e:
                 results.append(
                     DownloadFileResult(
-                        path=path.value,
+                        path=path,
                         content=None,
                         error=f"{type(e).__name__}: {e}",
                     )

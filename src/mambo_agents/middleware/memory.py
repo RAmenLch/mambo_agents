@@ -18,7 +18,7 @@ from mambo_agents.middleware.memory import MamboMemoryMiddleware
 
 middleware = MamboMemoryMiddleware(
     backend=StateBackend(),
-    sources=["/.mambo/memory/AGENTS.md"],
+    sources=[VirtualPath("/.mambo/memory/AGENTS.md")],
 )
 ```
 
@@ -272,7 +272,7 @@ class MamboMemoryMiddleware(AgentMiddleware[MemoryState, ContextT, ResponseT]):
 
         middleware = MamboMemoryMiddleware(
             backend=StateBackend(),
-            sources=["/.mambo/memory/AGENTS.md"],
+            sources=[VirtualPath("/.mambo/memory/AGENTS.md")],
         )
         ```
     """
@@ -300,7 +300,7 @@ class MamboMemoryMiddleware(AgentMiddleware[MemoryState, ContextT, ResponseT]):
                 Default: :func:`_default_format_prompt`.
         """
         self._backend = backend
-        self.sources = sources
+        self.sources = [VirtualPath(s) for s in sources]
         self._format_prompt: MemoryFormatHook = format_prompt or _default_format_prompt
 
     def _get_backend(

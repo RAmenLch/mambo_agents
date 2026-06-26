@@ -619,10 +619,13 @@ class LocalBackend(BackendProtocol):
 
         matches: list[GrepMatch] = []
         skipped: int = 0
-        if regex:
-            compiled = re.compile(pattern)
-        else:
-            compiled = re.compile(re.escape(pattern))
+        try:
+            if regex:
+                compiled = re.compile(pattern)
+            else:
+                compiled = re.compile(re.escape(pattern))
+        except re.error as e:
+            return GrepResult(error=f"Invalid regex pattern: {e}")
 
         if not is_dir:
             # Single-file search

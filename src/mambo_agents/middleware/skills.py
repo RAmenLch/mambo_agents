@@ -512,8 +512,7 @@ def _list_skills_with_errors(
     # Build SKILL.md paths
     skill_md_paths = []
     for skill_dir_path in skill_dirs:
-        skill_dir = PurePosixPath(to_posix_path(skill_dir_path))
-        skill_md_path = str(skill_dir / "SKILL.md")
+        skill_md_path = skill_dir_path.join("SKILL.md")
         skill_md_paths.append((skill_dir_path, skill_md_path))
 
     paths_to_download = [p for _, p in skill_md_paths]
@@ -540,7 +539,7 @@ async def _alist_skills_with_errors(
 
     skills: list[SkillMetadata] = []
     source_error: str | None = None
-    ls_result = await asyncio.to_thread(backend.ls, source_path)
+    ls_result = await asyncio.to_thread(backend.ls, VirtualPath(source_path))
     if ls_result.error:
         msg = f"Cannot load skills from '{source_path}': {ls_result.error}"
         logger.warning("%s", msg)
@@ -559,8 +558,7 @@ async def _alist_skills_with_errors(
 
     skill_md_paths = []
     for skill_dir_path in skill_dirs:
-        skill_dir = PurePosixPath(to_posix_path(skill_dir_path))
-        skill_md_path = str(skill_dir / "SKILL.md")
+        skill_md_path = skill_dir_path.join("SKILL.md")
         skill_md_paths.append((skill_dir_path, skill_md_path))
 
     paths_to_download = [p for _, p in skill_md_paths]
