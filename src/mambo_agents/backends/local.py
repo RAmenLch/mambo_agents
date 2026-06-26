@@ -46,10 +46,10 @@ from mambo_agents.backends.utils import (
     check_path_allowed,
     detect_trailing_newline_mismatch,
     format_tree_entries,
+    format_validation_error,
     format_with_line_numbers,
-    human_size,
-    validate_canonical_path,
 )
+from mambo_agents.backends.schemas import VirtualPath,human_size
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -108,11 +108,14 @@ class LocalBackend(BackendProtocol):
             an ``/(ignore)`` marker but its content is not expanded.
     """
 
+    # Default per-tool timeout values specific to this backend (overridable via __init__).
+    _BACKEND_DEFAULT_TIMEOUTS = ToolTimeouts(tree=60.0, delete=30.0, execute=180.0)
+
     def __init__(
         self,
         root_dir: str | Path | None = None,
         *,
-        workspace_root: str = "/workspace",
+        workspace_root: VirtualPath = VirtualPath("/workspace"),
         timeout: int = _DEFAULT_EXECUTE_TIMEOUT,
         max_output_bytes: int = _MAX_OUTPUT_BYTES,
         env: dict[str, str] | None = None,
@@ -127,11 +130,14 @@ class LocalBackend(BackendProtocol):
         summarizer: "ReadSummarizer | None" = None,
         tool_timeouts: ToolTimeouts | None = None,
     ) -> None:
+        # Merge backend-specific timeout defaults with user overrides.
+        _user = tool_timeouts.model_dump() if tool_timeouts else {}
+        _merged = ToolTimeouts(**{**self._BACKEND_DEFAULT_TIMEOUTS.model_dump(), **_user})
         super().__init__(
             max_read_chars=max_read_chars,
             max_grep_matches=max_grep_matches,
             summarizer=summarizer,
-            tool_timeouts=tool_timeouts,
+            tool_timeouts=_merged,
         )
         if timeout <= 0:
             msg = f"timeout must be positive, got {timeout}"
@@ -143,7 +149,7 @@ class LocalBackend(BackendProtocol):
                 "Provide at most one of them."
             )
 
-        self.workspace_root = validate_canonical_path(workspace_root, "workspace_root")
+        self.workspace_root = VirtualPath(workspace_root)
         self._cwd = Path(root_dir).resolve() if root_dir else Path.cwd()
         self._default_timeout = timeout
         self._max_output_bytes = max_output_bytes
@@ -167,7 +173,7 @@ class LocalBackend(BackendProtocol):
 
     @property
     def tools(self) -> list[StructuredTool]:
-        wr = self.workspace_root
+        wr = self.workspace_root.value
         tools: list[StructuredTool] = [
             StructuredTool(
                 name="tree",
@@ -177,11 +183,12 @@ class LocalBackend(BackendProtocol):
                 ),
                 args_schema=create_model(
                     "TreeSchema",
-                    path=(str, Field(default=wr, description="Root directory to display")),
+                    path=(VirtualPath, Field(default=VirtualPath(wr), description="Root directory to display")),
                     depth=(int, Field(default=3, description="Maximum recursion depth")),
                 ),
                 func=self._safe_tool_func("tree", self.tree),
                 coroutine=self._safe_tool_coroutine("tree", self.atree),
+                handle_validation_error=format_validation_error,
             ),
             StructuredTool(
                 name="delete",
@@ -192,10 +199,11 @@ class LocalBackend(BackendProtocol):
                 ),
                 args_schema=create_model(
                     "DeleteSchema",
-                    path=(str, Field(description="Absolute file path to delete")),
+                    path=(VirtualPath, Field(description="Absolute file path to delete")),
                 ),
                 func=self._safe_tool_func("delete", self.delete),
                 coroutine=self._safe_tool_coroutine("delete", self.adelete),
+                handle_validation_error=format_validation_error,
             ),
         ]
 
@@ -233,7 +241,7 @@ class LocalBackend(BackendProtocol):
 
     @property
     def description(self) -> str:
-        wr = self.workspace_root
+        wr = self.workspace_root.value
         os_label = {"win32": "Windows", "darwin": "macOS"}.get(sys.platform, "Unix")
         shell = "cmd /c" if sys.platform == "win32" else "sh -c"
         desc = (
@@ -257,32 +265,28 @@ class LocalBackend(BackendProtocol):
     # Core file operations
     # ------------------------------------------------------------------
 
-    def _resolve(self, path: str) -> Path:
+    def _resolve(self, path: VirtualPath) -> Path:
         """Resolve a virtual absolute path to a real filesystem path under ``_cwd``.
 
         Validates that *path* is under :attr:`workspace_root` and strips
         the prefix before resolving against ``_cwd``.  Raises
         :class:`WorkspacePathError` for paths outside the workspace.
 
-        Uses ``PurePosixPath`` to parse the virtual path consistently
-        across platforms (Windows, Linux, macOS).  The virtual path
-        scheme uses ``"/"`` separators and treats the workspace root as
-        the anchor for all file operations.
+        VirtualPath already validates on construction (no ``..``, no
+        ``//``, absolute, non-empty), so no additional traversal checks
+        are needed here.
         """
-        from pathlib import PurePosixPath
-
-        pp = PurePosixPath(path)
-        path_str = str(pp)
-        wr = self.workspace_root
+        v = path.value
+        wr = self.workspace_root.value
 
         # Must start with workspace root
-        if path_str != wr and not path_str.startswith(wr + "/"):
+        if v != wr and not v.startswith(wr + "/"):
             raise WorkspacePathError(
                 f"Path '{path}' is outside the workspace. "
                 f"All file paths must be under '{wr}'."
             )
 
-        rel = path_str[len(wr):].lstrip("/")
+        rel = v[len(wr):].lstrip("/")
         if not rel:
             return self._cwd
 
@@ -298,7 +302,7 @@ class LocalBackend(BackendProtocol):
 
         return resolved
 
-    def _check_edit_allowed(self, path: str) -> bool:
+    def _check_edit_allowed(self, path: VirtualPath) -> bool:
         """Check whether *path* is allowed for edit/write/delete.
 
         Delegates to :func:`~mambo_agents.backends.utils.check_path_allowed`
@@ -306,9 +310,9 @@ class LocalBackend(BackendProtocol):
         """
         whitelist = self._edit_whitelist or None
         blacklist = self._edit_blacklist or None
-        return check_path_allowed(path, whitelist=whitelist, blacklist=blacklist)
+        return check_path_allowed(path.value, whitelist=whitelist, blacklist=blacklist)
 
-    def ls(self, path: str) -> LsResult:
+    def ls(self, path: VirtualPath) -> LsResult:
         try:
             resolved = self._resolve(path)
         except WorkspacePathError as e:
@@ -321,7 +325,7 @@ class LocalBackend(BackendProtocol):
         except OSError as e:
             return LsResult(error=f"Cannot access '{path}': {e}")
 
-        wr = self.workspace_root
+        wr = self.workspace_root.value
         infos: list[FileInfo] = []
         errors: list[str] = []
         try:
@@ -357,9 +361,9 @@ class LocalBackend(BackendProtocol):
 
     def read_raw(
         self,
-        file_path: str,
+        file_path: VirtualPath,
         offset: int = 0,
-        limit: int = 2000,
+        limit: int | None = 2000,
         include_line_numbers: bool = False,
     ) -> ReadResult:
         try:
@@ -376,7 +380,7 @@ class LocalBackend(BackendProtocol):
 
         _O_NOFOLLOW = getattr(os, "O_NOFOLLOW", 0)
 
-        if _get_file_type(file_path) != "text":
+        if _get_file_type(file_path.value) != "text":
             try:
                 fd = os.open(resolved, os.O_RDONLY | _O_NOFOLLOW)
                 with os.fdopen(fd, "rb") as f:
@@ -388,8 +392,8 @@ class LocalBackend(BackendProtocol):
                 content=encoded,
                 total_lines=1,
                 encoding="base64",
-                file_type=_get_file_type(file_path),
-                mime_type=_get_mime_type(file_path),
+                file_type=_get_file_type(file_path.value),
+                mime_type=_get_mime_type(file_path.value),
             )
 
         # Text file: attempt UTF-8 read, fallback to base64
@@ -409,8 +413,8 @@ class LocalBackend(BackendProtocol):
                 content=encoded,
                 total_lines=1,
                 encoding="base64",
-                file_type=_get_file_type(file_path),
-                mime_type=_get_mime_type(file_path),
+                file_type=_get_file_type(file_path.value),
+                mime_type=_get_mime_type(file_path.value),
             )
         except OSError as e:
             return ReadResult(error=f"Error reading '{file_path}': {e}")
@@ -423,7 +427,7 @@ class LocalBackend(BackendProtocol):
                 error=f"Line offset {offset} exceeds file length ({total} lines)",
             )
 
-        sliced = lines[offset : offset + limit]
+        sliced = lines[offset : offset + limit] if limit is not None else lines[offset:]
         raw_slice = "".join(sliced)
         content = (
             format_with_line_numbers(raw_slice, start_line=offset + 1)
@@ -437,7 +441,7 @@ class LocalBackend(BackendProtocol):
         )
 
     def write(
-        self, file_path: str, content: str, overwrite: bool = False,
+        self, file_path: VirtualPath, content: str, overwrite: bool = False,
     ) -> WriteResult:
         if not self._check_edit_allowed(file_path):
             return WriteResult(
@@ -476,11 +480,11 @@ class LocalBackend(BackendProtocol):
         except OSError as e:
             return WriteResult(error=f"Error writing '{file_path}': {e}")
 
-        return WriteResult(path=file_path)
+        return WriteResult(path=file_path.value)
 
     def edit(
         self,
-        file_path: str,
+        file_path: VirtualPath,
         old_str: str,
         new_str: str,
         *,
@@ -560,7 +564,7 @@ class LocalBackend(BackendProtocol):
         except OSError as e:
             return EditResult(error=f"Error writing '{file_path}': {e}")
 
-        return EditResult(path=file_path, occurrences=occurrences)
+        return EditResult(path=file_path.value, occurrences=occurrences)
 
     # ------------------------------------------------------------------
     # grep — ripgrep-first with Python fallback and file-size guard
@@ -569,7 +573,7 @@ class LocalBackend(BackendProtocol):
     def grep(
         self,
         pattern: str,
-        path: str = "/workspace",
+        path: VirtualPath = VirtualPath("/workspace"),
         glob: str | None = None,
         regex: bool = False,
         offset: int = 0,
@@ -588,7 +592,7 @@ class LocalBackend(BackendProtocol):
             return GrepResult(error=f"Error accessing '{path}': {e}")
 
         is_dir = resolved.is_dir()
-        wr = self.workspace_root
+        wr = self.workspace_root.value
 
         # 1) Try ripgrep (handles files and dirs equally; skip glob filter for files)
         rg_glob = glob if is_dir else None
@@ -755,7 +759,7 @@ class LocalBackend(BackendProtocol):
 
         return results
 
-    def glob(self, pattern: str, path: str = "/workspace") -> GlobResult:
+    def glob(self, pattern: str, path: VirtualPath = VirtualPath("/workspace")) -> GlobResult:
         try:
             resolved = self._resolve(path)
         except WorkspacePathError as e:
@@ -769,7 +773,7 @@ class LocalBackend(BackendProtocol):
         except OSError as e:
             return GlobResult(error=f"Error accessing '{path}': {e}")
 
-        wr = self.workspace_root
+        wr = self.workspace_root.value
         matches: list[FileInfo] = []
         errors: list[str] = []
         try:
@@ -801,7 +805,7 @@ class LocalBackend(BackendProtocol):
     # Extra operations: tree, delete, execute
     # ------------------------------------------------------------------
 
-    def tree(self, path: str = "/workspace", depth: int = 3) -> str:
+    def tree(self, path: VirtualPath = VirtualPath("/workspace"), depth: int = 3) -> str:
         """Render a directory tree.
 
         Args:
@@ -825,11 +829,11 @@ class LocalBackend(BackendProtocol):
             depth,
             cwd=self._cwd,
             ignore_dirs=self._ignore_dirs,
-            workspace_root=self.workspace_root,
+            workspace_root=self.workspace_root.value,
         )
         return format_tree_entries(entries)
 
-    def delete(self, path: str) -> str:
+    def delete(self, path: VirtualPath) -> str:
         """Delete a single **file**.
 
         Directories are rejected — the agent must remove files inside
@@ -947,12 +951,12 @@ class LocalBackend(BackendProtocol):
     # Async extra operations
     # ------------------------------------------------------------------
 
-    async def atree(self, path: str = "/", depth: int = 3) -> str:
+    async def atree(self, path: VirtualPath = VirtualPath("/workspace"), depth: int = 3) -> str:
         """Async: Render a directory tree."""
         return await asyncio.to_thread(self.tree, path, depth)
 
-    async def adelete(self, path: str) -> str:
-        """Async: Delete a file or directory."""
+    async def adelete(self, path: VirtualPath) -> str:
+        """Async: Delete a file."""
         return await asyncio.to_thread(self.delete, path)
 
     async def aexecute(
@@ -970,7 +974,7 @@ class LocalBackend(BackendProtocol):
 
     def upload_files(
         self,
-        files: list[tuple[str, bytes]],
+        files: list[tuple[VirtualPath, bytes]],
     ) -> list[UploadFileResult]:
         """Upload multiple files as raw bytes directly to the filesystem.
 
@@ -987,20 +991,20 @@ class LocalBackend(BackendProtocol):
                 resolved = self._resolve(path)
                 resolved.parent.mkdir(parents=True, exist_ok=True)
                 resolved.write_bytes(raw_content)
-                results.append(UploadFileResult(path=path))
+                results.append(UploadFileResult(path=path.value))
             except OSError as e:
-                results.append(UploadFileResult(path=path, error=str(e)))
+                results.append(UploadFileResult(path=path.value, error=str(e)))
             except Exception as e:
                 results.append(
                     UploadFileResult(
-                        path=path, error=f"{type(e).__name__}: {e}"
+                        path=path.value, error=f"{type(e).__name__}: {e}"
                     )
                 )
         return results
 
     def download_files(
         self,
-        paths: list[str],
+        paths: list[VirtualPath],
     ) -> list[DownloadFileResult]:
         """Download multiple files as raw bytes from the filesystem.
 
@@ -1019,24 +1023,24 @@ class LocalBackend(BackendProtocol):
                 if not resolved.exists():
                     results.append(
                         DownloadFileResult(
-                            path=path, content=None, error="file_not_found"
+                            path=path.value, content=None, error="file_not_found"
                         )
                     )
                     continue
                 if resolved.is_dir():
                     results.append(
                         DownloadFileResult(
-                            path=path, content=None, error="is_directory"
+                            path=path.value, content=None, error="is_directory"
                         )
                     )
                     continue
                 raw = resolved.read_bytes()
                 results.append(
-                    DownloadFileResult(path=path, content=raw)
+                    DownloadFileResult(path=path.value, content=raw)
                 )
             except OSError as e:
                 results.append(
-                    DownloadFileResult(path=path, content=None, error=str(e))
+                    DownloadFileResult(path=path.value, content=None, error=str(e))
                 )
             except Exception as e:
                 results.append(
@@ -1152,7 +1156,7 @@ def _walk_tree(
     return entries
 
 
-def _virtual_path(child: Path, cwd: Path, workspace_root: str = "/workspace") -> str:
+def _virtual_path(child: Path, cwd: Path, workspace_root: str) -> str:
     """Convert a child Path to a virtual absolute path (POSIX separators)."""
     try:
         return f"{workspace_root}/{str(child.relative_to(cwd)).replace(chr(92), '/')}"

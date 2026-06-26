@@ -90,24 +90,28 @@ class TestSummarizationRouting:
         assert agent is not None
 
     def test_summarization_with_trigger(self):
+        from mambo_agents.middleware.summarization import SummarizationConfig
+
         agent = create_mambo_agent(
             _create_model(),
             backend=StateBackend(),
-            summarization={
-                "trigger": ("tokens", 100000),
-                "keep": ("messages", 20),
-            },
+            summarization=SummarizationConfig(
+                trigger=("tokens", 100000),
+                keep=("messages", 20),
+            ),
         )
         assert agent is not None
 
     def test_summarization_with_backend_offload(self):
+        from mambo_agents.middleware.summarization import SummarizationConfig
+
         agent = create_mambo_agent(
             _create_model(),
             backend=StateBackend(),
-            summarization={
-                "trigger": ("messages", 50),
-                "offload_to_backend": True,
-            },
+            summarization=SummarizationConfig(
+                trigger=("messages", 50),
+                offload_to_backend=True,
+            ),
         )
         assert agent is not None
 
@@ -143,19 +147,20 @@ class TestSubagentsRouting:
         from mambo_agents.middleware.subagents import (
             DEFAULT_SUBAGENT_PROMPT,
             GENERAL_PURPOSE_NAME,
+            SubAgent,
         )
 
         agent = create_mambo_agent(
             _create_model(),
             backend=StateBackend(),
             subagents=[
-                {
-                    "name": GENERAL_PURPOSE_NAME,
-                    "description": "My GP",
-                    "system_prompt": DEFAULT_SUBAGENT_PROMPT,
-                    "model": _create_model(),
-                    "tools": [],
-                }
+                SubAgent(
+                    name=GENERAL_PURPOSE_NAME,
+                    description="My GP",
+                    system_prompt=DEFAULT_SUBAGENT_PROMPT,
+                    model=_create_model(),
+                    tools=[],
+                )
             ],
             include_general_purpose=True,
         )
@@ -163,17 +168,18 @@ class TestSubagentsRouting:
 
     def test_subagents_list(self):
         stub = _make_stub_tool("stub")
+        from mambo_agents.middleware.subagents import SubAgent
         agent = create_mambo_agent(
             _create_model(),
             backend=StateBackend(),
             subagents=[
-                {
-                    "name": "worker",
-                    "description": "Does work",
-                    "system_prompt": "You do work.",
-                    "model": _create_model(),
-                    "tools": [stub],
-                }
+                SubAgent(
+                    name="worker",
+                    description="Does work",
+                    system_prompt="You do work.",
+                    model=_create_model(),
+                    tools=[stub],
+                )
             ],
         )
         assert agent is not None
@@ -253,15 +259,16 @@ class TestMiddlewareRouting:
     def test_plan_middleware_summarization_hook_auto_wired(self):
         """PlanMiddleware hook is auto-detected when summarization is on."""
         from mambo_agents.middleware.planning import MamboPlanMiddleware
+        from mambo_agents.middleware.summarization import SummarizationConfig
 
         agent = create_mambo_agent(
             _create_model(),
             backend=StateBackend(),
             middleware=[MamboPlanMiddleware()],
-            summarization={
-                "trigger": ("tokens", 100000),
-                "keep": ("messages", 20),
-            },
+            summarization=SummarizationConfig(
+                trigger=("tokens", 100000),
+                keep=("messages", 20),
+            ),
         )
         assert agent is not None
 

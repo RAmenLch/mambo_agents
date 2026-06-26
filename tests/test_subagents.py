@@ -103,13 +103,13 @@ class TestSubAgentMiddlewareInit:
     def test_basic_initialization(self):
         """SubAgentMiddleware initializes with a valid SubAgent spec."""
         backend = StateBackend()
-        subagent: SubAgent = {
-            "name": "test-agent",
-            "description": "A test subagent",
-            "system_prompt": "You are a test agent.",
-            "model": _get_model(),
-            "tools": [_make_stub_tool("search")],
-        }
+        subagent = SubAgent(
+            name="test-agent",
+            description="A test subagent",
+            system_prompt="You are a test agent.",
+            model=_get_model(),
+            tools=[_make_stub_tool("search")],
+        )
         mw = SubAgentMiddleware(backend=backend, subagents=[subagent])
         assert mw is not None
         assert len(mw.tools) == 1
@@ -118,35 +118,22 @@ class TestSubAgentMiddlewareInit:
     def test_requires_model_for_subagent(self):
         """SubAgent must specify 'model' — validated before model init."""
         backend = StateBackend()
-        subagent: SubAgent = {
-            "name": "bad-agent",
-            "description": "Missing model",
-            "system_prompt": "...",
-            "tools": [],  # type: ignore
-        }
+        subagent = SubAgent(
+            name="bad-agent",
+            description="Missing model",
+            system_prompt="...",
+        )
         with pytest.raises(ValueError, match="must specify 'model'"):
-            SubAgentMiddleware(backend=backend, subagents=[subagent])
-
-    def test_requires_tools_for_subagent(self):
-        """SubAgent must specify 'tools' — validated before model init."""
-        backend = StateBackend()
-        subagent: SubAgent = {
-            "name": "bad-agent",
-            "description": "Missing tools",
-            "system_prompt": "...",
-            "model": "mock-model",
-        }
-        with pytest.raises(ValueError, match="must specify 'tools'"):
             SubAgentMiddleware(backend=backend, subagents=[subagent])
 
     def test_compiled_subagent(self):
         """CompiledSubAgent works without model/tools fields."""
         backend = StateBackend()
-        compiled: CompiledSubAgent = {
-            "name": "pre-built",
-            "description": "Pre-compiled agent",
-            "runnable": _make_stub_runnable("pre-built"),
-        }
+        compiled = CompiledSubAgent(
+            name="pre-built",
+            description="Pre-compiled agent",
+            runnable=_make_stub_runnable("pre-built"),
+        )
         mw = SubAgentMiddleware(backend=backend, subagents=[compiled])
         assert mw is not None
         assert len(mw.tools) == 1
@@ -155,18 +142,18 @@ class TestSubAgentMiddlewareInit:
     def test_mixed_subagents(self):
         """Mixed SubAgent and CompiledSubAgent specs."""
         backend = StateBackend()
-        compiled: CompiledSubAgent = {
-            "name": "compiled",
-            "description": "Compiled",
-            "runnable": _make_stub_runnable("compiled"),
-        }
-        sub: SubAgent = {
-            "name": "declarative",
-            "description": "Declarative",
-            "system_prompt": "...",
-            "model": _get_model(),
-            "tools": [_make_stub_tool("calc")],
-        }
+        compiled = CompiledSubAgent(
+            name="compiled",
+            description="Compiled",
+            runnable=_make_stub_runnable("compiled"),
+        )
+        sub = SubAgent(
+            name="declarative",
+            description="Declarative",
+            system_prompt="...",
+            model=_get_model(),
+            tools=[_make_stub_tool("calc")],
+        )
         mw = SubAgentMiddleware(backend=backend, subagents=[compiled, sub])
         assert mw is not None
 
@@ -181,13 +168,13 @@ class TestEventGranularity:
     def test_default_granularity_is_updates(self):
         """Default event_granularity is 'updates'."""
         backend = StateBackend()
-        subagent: SubAgent = {
-            "name": "agent",
-            "description": "desc",
-            "system_prompt": "sys",
-            "model": _get_model(),
-            "tools": [_make_stub_tool("t")],
-        }
+        subagent = SubAgent(
+            name="agent",
+            description="desc",
+            system_prompt="sys",
+            model=_get_model(),
+            tools=[_make_stub_tool("t")],
+        )
         mw = SubAgentMiddleware(backend=backend, subagents=[subagent])
         assert mw._event_granularity == "updates"
 
@@ -195,13 +182,13 @@ class TestEventGranularity:
     def test_explicit_granularity_messages(self):
         """event_granularity='messages' is accepted."""
         backend = StateBackend()
-        subagent: SubAgent = {
-            "name": "agent",
-            "description": "desc",
-            "system_prompt": "sys",
-            "model": _get_model(),
-            "tools": [_make_stub_tool("t")],
-        }
+        subagent = SubAgent(
+            name="agent",
+            description="desc",
+            system_prompt="sys",
+            model=_get_model(),
+            tools=[_make_stub_tool("t")],
+        )
         mw = SubAgentMiddleware(
             backend=backend,
             subagents=[subagent],
@@ -213,13 +200,13 @@ class TestEventGranularity:
     def test_explicit_granularity_values(self):
         """event_granularity='values' is accepted."""
         backend = StateBackend()
-        subagent: SubAgent = {
-            "name": "agent",
-            "description": "desc",
-            "system_prompt": "sys",
-            "model": _get_model(),
-            "tools": [_make_stub_tool("t")],
-        }
+        subagent = SubAgent(
+            name="agent",
+            description="desc",
+            system_prompt="sys",
+            model=_get_model(),
+            tools=[_make_stub_tool("t")],
+        )
         mw = SubAgentMiddleware(
             backend=backend,
             subagents=[subagent],
@@ -235,13 +222,13 @@ class TestEventGranularity:
         ) as mock_build:
             mock_build.return_value = _make_stub_tool("task")
             backend = StateBackend()
-            subagent: SubAgent = {
-                "name": "agent",
-                "description": "desc",
-                "system_prompt": "sys",
-                "model": _get_model(),
-                "tools": [_make_stub_tool("t")],
-            }
+            subagent = SubAgent(
+                name="agent",
+                description="desc",
+                system_prompt="sys",
+                model=_get_model(),
+                tools=[_make_stub_tool("t")],
+            )
             SubAgentMiddleware(
                 backend=backend,
                 subagents=[subagent],
@@ -261,13 +248,13 @@ class TestSystemPrompt:
     def test_default_system_prompt_includes_agents(self):
         """System prompt includes available subagent types."""
         backend = StateBackend()
-        subagent: SubAgent = {
-            "name": "researcher",
-            "description": "Research topics thoroughly",
-            "system_prompt": "You are a researcher.",
-            "model": _get_model(),
-            "tools": [_make_stub_tool("search")],
-        }
+        subagent = SubAgent(
+            name="researcher",
+            description="Research topics thoroughly",
+            system_prompt="You are a researcher.",
+            model=_get_model(),
+            tools=[_make_stub_tool("search")],
+        )
         mw = SubAgentMiddleware(backend=backend, subagents=[subagent])
         assert mw._system_prompt is not None
         assert "researcher" in mw._system_prompt
@@ -277,13 +264,13 @@ class TestSystemPrompt:
     def test_custom_system_prompt(self):
         """Custom system_prompt is used."""
         backend = StateBackend()
-        subagent: SubAgent = {
-            "name": "agent",
-            "description": "desc",
-            "system_prompt": "sys",
-            "model": _get_model(),
-            "tools": [_make_stub_tool("t")],
-        }
+        subagent = SubAgent(
+            name="agent",
+            description="desc",
+            system_prompt="sys",
+            model=_get_model(),
+            tools=[_make_stub_tool("t")],
+        )
         custom = "Custom instructions here."
         mw = SubAgentMiddleware(
             backend=backend,
@@ -296,13 +283,13 @@ class TestSystemPrompt:
     def test_none_system_prompt(self):
         """system_prompt=None suppresses injection."""
         backend = StateBackend()
-        subagent: SubAgent = {
-            "name": "agent",
-            "description": "desc",
-            "system_prompt": "sys",
-            "model": _get_model(),
-            "tools": [_make_stub_tool("t")],
-        }
+        subagent = SubAgent(
+            name="agent",
+            description="desc",
+            system_prompt="sys",
+            model=_get_model(),
+            tools=[_make_stub_tool("t")],
+        )
         mw = SubAgentMiddleware(
             backend=backend,
             subagents=[subagent],
@@ -321,14 +308,14 @@ class TestInterruptOn:
     def test_interrupt_on_adds_human_in_the_loop(self):
         """interrupt_on triggers HumanInTheLoopMiddleware (no crash)."""
         backend = StateBackend()
-        subagent: SubAgent = {
-            "name": "agent",
-            "description": "desc",
-            "system_prompt": "sys",
-            "model": _get_model(),
-            "tools": [_make_stub_tool("dangerous")],
-            "interrupt_on": {"dangerous": True},
-        }
+        subagent = SubAgent(
+            name="agent",
+            description="desc",
+            system_prompt="sys",
+            model=_get_model(),
+            tools=[_make_stub_tool("dangerous")],
+            interrupt_on={"dangerous": True},
+        )
         mw = SubAgentMiddleware(backend=backend, subagents=[subagent])
         assert mw is not None
 
@@ -348,13 +335,13 @@ class TestCreateMamboAgentSubagents:
             model,
             backend=backend,
             subagents=[
-                {
-                    "name": "worker",
-                    "description": "A worker agent",
-                    "system_prompt": "You are a worker.",
-                    "model": model,
-                    "tools": [_make_stub_tool("tool")],
-                }
+                SubAgent(
+                    name="worker",
+                    description="A worker agent",
+                    system_prompt="You are a worker.",
+                    model=model,
+                    tools=[_make_stub_tool("tool")],
+                )
             ],
         )
         assert agent is not None
@@ -368,11 +355,11 @@ class TestCreateMamboAgentSubagents:
         """create_mambo_agent accepts CompiledSubAgent."""
         backend = StateBackend()
         model = _get_model()
-        compiled: CompiledSubAgent = {
-            "name": "pre-built",
-            "description": "Pre-built agent",
-            "runnable": _make_stub_runnable("pre-built"),
-        }
+        compiled = CompiledSubAgent(
+            name="pre-built",
+            description="Pre-built agent",
+            runnable=_make_stub_runnable("pre-built"),
+        )
         agent = create_mambo_agent(
             model,
             backend=backend,
@@ -411,13 +398,13 @@ class TestCreateMamboAgentSubagents:
         """general-purpose is not added twice if already in subagents list."""
         backend = StateBackend()
         model = _get_model()
-        gp_spec: SubAgent = {
-            "name": GENERAL_PURPOSE_NAME,
-            "description": "My custom GP",
-            "system_prompt": DEFAULT_SUBAGENT_PROMPT,
-            "model": model,
-            "tools": [_make_stub_tool("t")],
-        }
+        gp_spec = SubAgent(
+            name=GENERAL_PURPOSE_NAME,
+            description="My custom GP",
+            system_prompt=DEFAULT_SUBAGENT_PROMPT,
+            model=model,
+            tools=[_make_stub_tool("t")],
+        )
         agent = create_mambo_agent(
             model,
             backend=backend,
@@ -432,13 +419,13 @@ class TestCreateMamboAgentSubagents:
         """event_granularity is passed through to the middleware (no crash)."""
         backend = StateBackend()
         model = _get_model()
-        subagent: SubAgent = {
-            "name": "worker",
-            "description": "Worker",
-            "system_prompt": "...",
-            "model": model,
-            "tools": [_make_stub_tool("t")],
-        }
+        subagent = SubAgent(
+            name="worker",
+            description="Worker",
+            system_prompt="...",
+            model=model,
+            tools=[_make_stub_tool("t")],
+        )
         agent = create_mambo_agent(
             model,
             backend=backend,
@@ -459,13 +446,13 @@ class TestCreateMamboAgentSubagents:
             model,
             backend=backend,
             subagents=[
-                {
-                    "name": "w",
-                    "description": "d",
-                    "system_prompt": "s",
-                    "model": model,
-                    "tools": [_make_stub_tool("t")],
-                }
+                SubAgent(
+                    name="w",
+                    description="d",
+                    system_prompt="s",
+                    model=model,
+                    tools=[_make_stub_tool("t")],
+                )
             ],
             interrupt_on={"write": True},
             checkpointer=MemorySaver(),
@@ -483,11 +470,11 @@ class TestStreamingStructure:
     def test_task_tool_accepts_granularity(self):
         """_build_task_tool accepts event_granularity kwarg."""
         specs: list[_SubagentSpec] = [
-            {
-                "name": "test",
-                "description": "A test",
-                "runnable": _make_stub_runnable("test"),
-            }
+            _SubagentSpec(
+                name="test",
+                description="A test",
+                runnable=_make_stub_runnable("test"),
+            )
         ]
         tool = _build_task_tool(specs, event_granularity="messages")
         assert tool.name == "task"
@@ -497,11 +484,11 @@ class TestStreamingStructure:
     def test_task_tool_accepts_values_granularity(self):
         """_build_task_tool with 'values' granularity doesn't dup mode."""
         specs: list[_SubagentSpec] = [
-            {
-                "name": "test",
-                "description": "A test",
-                "runnable": _make_stub_runnable("test"),
-            }
+            _SubagentSpec(
+                name="test",
+                description="A test",
+                runnable=_make_stub_runnable("test"),
+            )
         ]
         tool = _build_task_tool(specs, event_granularity="values")
         assert tool is not None
@@ -509,16 +496,16 @@ class TestStreamingStructure:
     def test_task_tool_description_formats_agents(self):
         """Task tool description includes all subagent names and descriptions."""
         specs: list[_SubagentSpec] = [
-            {
-                "name": "agent-a",
-                "description": "Does A",
-                "runnable": _make_stub_runnable("a"),
-            },
-            {
-                "name": "agent-b",
-                "description": "Does B",
-                "runnable": _make_stub_runnable("b"),
-            },
+            _SubagentSpec(
+                name="agent-a",
+                description="Does A",
+                runnable=_make_stub_runnable("a"),
+            ),
+            _SubagentSpec(
+                name="agent-b",
+                description="Does B",
+                runnable=_make_stub_runnable("b"),
+            ),
         ]
         tool = _build_task_tool(specs, event_granularity="updates")
         desc = tool.description
@@ -530,11 +517,11 @@ class TestStreamingStructure:
     def test_task_tool_custom_description(self):
         """Custom task_description with placeholder is formatted."""
         specs: list[_SubagentSpec] = [
-            {
-                "name": "x",
-                "description": "X agent",
-                "runnable": _make_stub_runnable("x"),
-            }
+            _SubagentSpec(
+                name="x",
+                description="X agent",
+                runnable=_make_stub_runnable("x"),
+            )
         ]
         tool = _build_task_tool(
             specs,
@@ -547,11 +534,11 @@ class TestStreamingStructure:
     def test_task_tool_custom_description_no_placeholder(self):
         """Custom task_description without placeholder is used as-is."""
         specs: list[_SubagentSpec] = [
-            {
-                "name": "x",
-                "description": "X",
-                "runnable": _make_stub_runnable("x"),
-            }
+            _SubagentSpec(
+                name="x",
+                description="X",
+                runnable=_make_stub_runnable("x"),
+            )
         ]
         tool = _build_task_tool(
             specs,
@@ -570,11 +557,11 @@ class TestTaskToolInvocation:
     def test_task_rejects_unknown_subagent_type(self):
         """task tool returns error string for unknown subagent_type."""
         specs: list[_SubagentSpec] = [
-            {
-                "name": "known",
-                "description": "Known agent",
-                "runnable": _make_stub_runnable("known"),
-            }
+            _SubagentSpec(
+                name="known",
+                description="Known agent",
+                runnable=_make_stub_runnable("known"),
+            )
         ]
         tool = _build_task_tool(specs, event_granularity="updates")
 
@@ -591,11 +578,11 @@ class TestTaskToolInvocation:
     def test_task_requires_tool_call_id(self):
         """task tool raises ValueError without tool_call_id."""
         specs: list[_SubagentSpec] = [
-            {
-                "name": "agent",
-                "description": "Agent",
-                "runnable": _make_stub_runnable("agent"),
-            }
+            _SubagentSpec(
+                name="agent",
+                description="Agent",
+                runnable=_make_stub_runnable("agent"),
+            )
         ]
         tool = _build_task_tool(specs, event_granularity="updates")
 

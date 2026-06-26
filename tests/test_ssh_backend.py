@@ -14,6 +14,7 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from mambo_agents.backends.protocol import ReadResult, WriteResult, WorkspacePathError
+from mambo_agents.backends.schemas import VirtualPath
 from mambo_agents.backends.ssh import SshBackend
 
 
@@ -53,6 +54,49 @@ def _sftp_file_stat() -> MagicMock:
 # ---------------------------------------------------------------------------
 
 
+def _build_mocked_ssh_client(*, remote_root: str, home_dir: str = "/home/test"):
+    """Build a trio of (mock_client, mock_sftp) with *remote_root* support.
+
+    *home_dir* controls what ``echo $HOME`` returns when ``~`` is expanded.
+    """
+    mock_client = MagicMock()
+    mock_sftp = MagicMock()
+
+    # Simulate ``exec_command("echo $HOME")`` to resolve ~ path
+    mock_home_stdout = MagicMock()
+    mock_home_stdout.read.return_value = (home_dir + "\n").encode("utf-8")
+    mock_home_stderr = MagicMock()
+    mock_home_stderr.read.return_value = b""
+    mock_client.exec_command.return_value = (
+        MagicMock(),  # stdin
+        mock_home_stdout,
+        mock_home_stderr,
+    )
+    mock_client.open_sftp.return_value = mock_sftp
+
+    return mock_client, mock_sftp
+
+
+def _make_ssh_backend(remote_root: str, **kwargs):
+    """Create an SshBackend with mocked paramiko, validating *remote_root*."""
+    with patch("mambo_agents.backends.ssh.paramiko.SSHClient") as mock_client_cls, \
+         patch("mambo_agents.backends.ssh.paramiko.AutoAddPolicy"):
+        mock_client, mock_sftp = _build_mocked_ssh_client(remote_root=remote_root)
+        mock_client_cls.return_value = mock_client
+
+        # _connect() validates remote_root via sftp.stat — we MUST provide
+        # a valid directory stat to avoid a spurious FileNotFoundError.
+        mock_sftp.stat.return_value = _sftp_dir_stat()
+
+        return SshBackend(
+            host="fake-host",
+            username="testuser",
+            password="testpass",
+            remote_root=remote_root,
+            **kwargs,
+        )
+
+
 @pytest.fixture
 def ssh_backend():
     """Create an SshBackend with a fully mocked paramiko layer.
@@ -61,30 +105,7 @@ def ssh_backend():
     Callers can replace ``backend._sftp.open``, ``backend._sftp.stat``,
     etc. on a per-test basis.
     """
-    with patch("mambo_agents.backends.ssh.paramiko.SSHClient") as mock_client_cls, \
-         patch("mambo_agents.backends.ssh.paramiko.AutoAddPolicy"):
-        mock_client = mock_client_cls.return_value
-        mock_sftp = MagicMock()
-
-        # Simulate ``exec_command("echo $HOME")`` to resolve remote_root
-        mock_home_stdout = MagicMock()
-        mock_home_stdout.read.return_value = b"/home/test\n"
-        mock_home_stderr = MagicMock()
-        mock_home_stderr.read.return_value = b""
-        mock_client.exec_command.return_value = (
-            MagicMock(),  # stdin
-            mock_home_stdout,
-            mock_home_stderr,
-        )
-        mock_client.open_sftp.return_value = mock_sftp
-
-        backend = SshBackend(
-            host="fake-host",
-            username="testuser",
-            password="testpass",
-            remote_root="~",
-        )
-        return backend
+    return _make_ssh_backend(remote_root="~")
 
 
 # ============================================================================
@@ -101,7 +122,7 @@ class TestReadRaw:
         text = "line1\nline2\nline3\n"
         ssh_backend._sftp.open.return_value = _sftp_bytes_file(text.encode("utf-8"))
 
-        result = ssh_backend.read_raw(f"{_W}/test.txt")
+        result = ssh_backend.read_raw(VirtualPath(f"{_W}/test.txt"))
 
         assert isinstance(result, ReadResult)
         assert result.content == "line1\nline2\nline3\n"
@@ -115,7 +136,7 @@ class TestReadRaw:
         text = "A\nB\nC\nD\nE\n"
         ssh_backend._sftp.open.return_value = _sftp_bytes_file(text.encode("utf-8"))
 
-        result = ssh_backend.read_raw(f"{_W}/test.txt", offset=1, limit=2)
+        result = ssh_backend.read_raw(VirtualPath(f"{_W}/test.txt"), offset=1, limit=2)
 
         assert result.content == "B\nC\n"
 
@@ -125,7 +146,7 @@ class TestReadRaw:
         text = "hello\nworld\n"
         ssh_backend._sftp.open.return_value = _sftp_bytes_file(text.encode("utf-8"))
 
-        result = ssh_backend.read_raw(f"{_W}/test.txt", include_line_numbers=True)
+        result = ssh_backend.read_raw(VirtualPath(f"{_W}/test.txt"), include_line_numbers=True)
 
         # format_with_line_numbers uses {num:6d}\t{line} style
         assert "     1\thello" in result.content
@@ -137,7 +158,7 @@ class TestReadRaw:
         raw_bytes = b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR"
         ssh_backend._sftp.open.return_value = _sftp_bytes_file(raw_bytes)
 
-        result = ssh_backend.read_raw(f"{_W}/image.png")
+        result = ssh_backend.read_raw(VirtualPath(f"{_W}/image.png"))
 
         assert result.encoding == "base64"
         assert result.file_type == "image"
@@ -147,7 +168,7 @@ class TestReadRaw:
         """Reading a directory should return an error."""
         ssh_backend._sftp.stat.return_value = _sftp_dir_stat()
 
-        result = ssh_backend.read_raw(f"{_W}/some_dir")
+        result = ssh_backend.read_raw(VirtualPath(f"{_W}/some_dir"))
 
         assert result.content is None
         assert result.error is not None
@@ -158,7 +179,7 @@ class TestReadRaw:
         from paramiko import SFTPError
         ssh_backend._sftp.stat.side_effect = FileNotFoundError()
 
-        result = ssh_backend.read_raw(f"{_W}/nonexistent.txt")
+        result = ssh_backend.read_raw(VirtualPath(f"{_W}/nonexistent.txt"))
 
         assert result.content is None
         assert result.error is not None
@@ -171,7 +192,7 @@ class TestReadRaw:
         raw_bytes = b"\x80\x81\x82\x83"
         ssh_backend._sftp.open.return_value = _sftp_bytes_file(raw_bytes)
 
-        result = ssh_backend.read_raw(f"{_W}/broken.txt")
+        result = ssh_backend.read_raw(VirtualPath(f"{_W}/broken.txt"))
 
         assert result.encoding == "base64"
         assert result.content == base64.b64encode(raw_bytes).decode("ascii")
@@ -181,7 +202,7 @@ class TestReadRaw:
         ssh_backend._sftp.stat.return_value = _sftp_file_stat()
         ssh_backend._sftp.open.return_value = _sftp_bytes_file(b"")
 
-        result = ssh_backend.read_raw(f"{_W}/empty.txt")
+        result = ssh_backend.read_raw(VirtualPath(f"{_W}/empty.txt"))
 
         assert result.content == ""
         assert result.total_lines == 0
@@ -189,7 +210,7 @@ class TestReadRaw:
 
     def test_path_outside_workspace_rejected(self, ssh_backend):
         """Paths outside /workspace are rejected even before SFTP access."""
-        result = ssh_backend.read_raw("/etc/passwd")
+        result = ssh_backend.read_raw(VirtualPath("/etc/passwd"))
         assert result.error is not None
         assert "outside the workspace" in (result.error or "")
 
@@ -217,7 +238,7 @@ class TestReadRawBytesRegression:
         text = "content\n"
         ssh_backend._sftp.open.return_value = _sftp_bytes_file(text.encode("utf-8"))
 
-        ssh_backend.read_raw(f"{_W}/test.txt")
+        ssh_backend.read_raw(VirtualPath(f"{_W}/test.txt"))
 
         call_kwargs = ssh_backend._sftp.open.call_args
         assert call_kwargs is not None
@@ -233,7 +254,7 @@ class TestReadRawBytesRegression:
         # Simulate content that would be bytes — our "rb" mode guarantees this
         ssh_backend._sftp.open.return_value = _sftp_bytes_file(b"hello\nworld\n")
 
-        result = ssh_backend.read_raw(f"{_W}/test.txt", include_line_numbers=True)
+        result = ssh_backend.read_raw(VirtualPath(f"{_W}/test.txt"), include_line_numbers=True)
 
         assert "hello" in result.content
         assert "world" in result.content
@@ -258,7 +279,7 @@ class TestWrite:
         mock_file.__exit__.return_value = None
         ssh_backend._sftp.open.return_value = mock_file
 
-        result = ssh_backend.write(f"{_W}/new_file.txt", "hello world")
+        result = ssh_backend.write(VirtualPath(f"{_W}/new_file.txt"), "hello world")
 
         assert isinstance(result, WriteResult)
         assert result.error is None
@@ -269,13 +290,163 @@ class TestWrite:
         ssh_backend._edit_whitelist = frozenset([f"{_W}/allowed"])
         ssh_backend._sftp.stat.side_effect = FileNotFoundError()
 
-        result = ssh_backend.write(f"{_W}/forbidden/file.txt", "data")
+        result = ssh_backend.write(VirtualPath(f"{_W}/forbidden/file.txt"), "data")
 
         assert result.error is not None
         assert "not allowed" in result.error.lower()
 
     def test_write_outside_workspace_rejected(self, ssh_backend):
         """Write to path outside /workspace is rejected."""
-        result = ssh_backend.write("/etc/hosts", "evil")
+        result = ssh_backend.write(VirtualPath("/etc/hosts"), "evil")
         assert result.error is not None
         assert "outside the workspace" in (result.error or "")
+
+
+# ============================================================================
+# _remote_root validation during _connect()
+# ============================================================================
+
+
+class TestRemoteRootValidation:
+    """Tests for _remote_root SSH validation performed during _connect()."""
+
+    # ------------------------------------------------------------------
+    # Happy path
+    # ------------------------------------------------------------------
+
+    def test_valid_absolute_path(self):
+        """Non-tilde absolute path with existing directory → backend created."""
+        backend = _make_ssh_backend(remote_root="/opt/project")
+        assert backend._remote_root == "/opt/project"
+
+    def test_tilde_expands_to_home(self):
+        """~ is expanded to $HOME, then validated via stat."""
+        backend = _make_ssh_backend(remote_root="~")
+        assert backend._remote_root == "/home/test"
+
+    def test_trailing_slash_normalized(self):
+        """Trailing / is stripped after validation."""
+        backend = _make_ssh_backend(remote_root="/opt/project/")
+        assert backend._remote_root == "/opt/project"
+
+    def test_trailing_backslash_normalized(self):
+        """Trailing \\ (Windows remote) is stripped."""
+        with patch("mambo_agents.backends.ssh.paramiko.SSHClient") as mock_cls, \
+             patch("mambo_agents.backends.ssh.paramiko.AutoAddPolicy"):
+            mock_client, mock_sftp = _build_mocked_ssh_client(remote_root="C:\\Users\\admin")
+            mock_cls.return_value = mock_client
+            mock_sftp.stat.return_value = _sftp_dir_stat()
+
+            backend = SshBackend(
+                host="fake-host",
+                username="testuser",
+                password="testpass",
+                remote_root="C:\\Users\\admin\\",
+            )
+            assert backend._remote_root == "C:\\Users\\admin"
+
+    # ------------------------------------------------------------------
+    # Directory does not exist
+    # ------------------------------------------------------------------
+
+    def test_directory_not_found_raises_valueerror(self):
+        """sftp.stat raises FileNotFoundError → ValueError with clear message."""
+        with patch("mambo_agents.backends.ssh.paramiko.SSHClient") as mock_cls, \
+             patch("mambo_agents.backends.ssh.paramiko.AutoAddPolicy"):
+            mock_client, mock_sftp = _build_mocked_ssh_client(
+                remote_root="/nonexistent"
+            )
+            mock_cls.return_value = mock_client
+            mock_sftp.stat.side_effect = FileNotFoundError()
+
+            with pytest.raises(ValueError, match="does not exist"):
+                SshBackend(
+                    host="fake-host",
+                    username="testuser",
+                    password="testpass",
+                    remote_root="/nonexistent",
+                )
+
+    def test_directory_not_found_message_includes_host(self):
+        """Error message includes the host and the path for debugging."""
+        with patch("mambo_agents.backends.ssh.paramiko.SSHClient") as mock_cls, \
+             patch("mambo_agents.backends.ssh.paramiko.AutoAddPolicy"):
+            mock_client, mock_sftp = _build_mocked_ssh_client(
+                remote_root="/bad/path"
+            )
+            mock_cls.return_value = mock_client
+            mock_sftp.stat.side_effect = FileNotFoundError()
+
+            with pytest.raises(ValueError) as exc_info:
+                SshBackend(
+                    host="my-server",
+                    username="testuser",
+                    password="testpass",
+                    remote_root="/bad/path",
+                )
+            msg = str(exc_info.value)
+            assert "/bad/path" in msg
+            assert "my-server" in msg
+
+    # ------------------------------------------------------------------
+    # Permission denied
+    # ------------------------------------------------------------------
+
+    def test_permission_denied_raises_permissionerror(self):
+        """sftp.stat raises PermissionError → PermissionError propagated."""
+        with patch("mambo_agents.backends.ssh.paramiko.SSHClient") as mock_cls, \
+             patch("mambo_agents.backends.ssh.paramiko.AutoAddPolicy"):
+            mock_client, mock_sftp = _build_mocked_ssh_client(
+                remote_root="/root"
+            )
+            mock_cls.return_value = mock_client
+            mock_sftp.stat.side_effect = PermissionError("permission denied")
+
+            with pytest.raises(PermissionError, match="not accessible"):
+                SshBackend(
+                    host="fake-host",
+                    username="testuser",
+                    password="testpass",
+                    remote_root="/root",
+                )
+
+    # ------------------------------------------------------------------
+    # Empty / all-slash values – no fallback to "/"
+    # ------------------------------------------------------------------
+
+    def test_empty_string_raises_valueerror(self):
+        """remote_root="" → empty after strip → ValueError, NOT falling back to /."""
+        with patch("mambo_agents.backends.ssh.paramiko.SSHClient") as mock_cls, \
+             patch("mambo_agents.backends.ssh.paramiko.AutoAddPolicy"):
+            mock_client, mock_sftp = _build_mocked_ssh_client(remote_root="")
+            mock_cls.return_value = mock_client
+            mock_sftp.stat.return_value = _sftp_dir_stat()
+
+            with pytest.raises(ValueError, match="empty path"):
+                SshBackend(
+                    host="fake-host",
+                    username="testuser",
+                    password="testpass",
+                    remote_root="",
+                )
+
+    def test_all_slashes_raises_valueerror(self):
+        """remote_root="///" → all stripped → empty → ValueError, NOT /."""
+        with patch("mambo_agents.backends.ssh.paramiko.SSHClient") as mock_cls, \
+             patch("mambo_agents.backends.ssh.paramiko.AutoAddPolicy"):
+            mock_client, mock_sftp = _build_mocked_ssh_client(remote_root="///")
+            mock_cls.return_value = mock_client
+            mock_sftp.stat.return_value = _sftp_dir_stat()
+
+            with pytest.raises(ValueError, match="empty path"):
+                SshBackend(
+                    host="fake-host",
+                    username="testuser",
+                    password="testpass",
+                    remote_root="///",
+                )
+
+    def test_tilde_only_with_no_trailing_path_works(self):
+        """remote_root="~" → expands to /home/test → validated → ok."""
+        backend = _make_ssh_backend(remote_root="~")
+        assert backend._remote_root == "/home/test"

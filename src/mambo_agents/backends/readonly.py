@@ -23,6 +23,7 @@ from mambo_agents.backends.protocol import (
     ReadResult,
     WriteResult,
 )
+from mambo_agents.backends.schemas import VirtualPath
 
 
 class ReadOnlyBackend(BackendProtocol):
@@ -64,7 +65,7 @@ class ReadOnlyBackend(BackendProtocol):
     # backend so the review agent can recover gracefully.
     # ------------------------------------------------------------------
 
-    def ls(self, path: str) -> LsResult:
+    def ls(self, path: VirtualPath) -> LsResult:
         try:
             return self._backend.ls(path)
         except Exception as exc:
@@ -72,9 +73,9 @@ class ReadOnlyBackend(BackendProtocol):
 
     def read_raw(
         self,
-        file_path: str,
+        file_path: VirtualPath,
         offset: int = 0,
-        limit: int = 2000,
+        limit: int | None = 2000,
         include_line_numbers: bool = False,
     ) -> ReadResult:
         try:
@@ -85,7 +86,7 @@ class ReadOnlyBackend(BackendProtocol):
     def grep(
         self,
         pattern: str,
-        path: str = "/workspace",
+        path: VirtualPath,
         glob: str | None = None,
         regex: bool = False,
         offset: int = 0,
@@ -96,7 +97,7 @@ class ReadOnlyBackend(BackendProtocol):
         except Exception as exc:
             return GrepResult(error=f"{type(exc).__name__}: {exc}")
 
-    def glob(self, pattern: str, path: str = "/workspace") -> GlobResult:
+    def glob(self, pattern: str, path: VirtualPath) -> GlobResult:
         try:
             return self._backend.glob(pattern, path)
         except Exception as exc:
@@ -107,24 +108,24 @@ class ReadOnlyBackend(BackendProtocol):
     # ------------------------------------------------------------------
 
     def write(
-        self, file_path: str, content: str, overwrite: bool = False,
+        self, file_path: VirtualPath, content: str, overwrite: bool = False,
     ) -> WriteResult:
         return WriteResult(
-            error="Write denied: audit backend is read-only.",
-            path=file_path,
+            error="Write denied: backend is read-only.",
+            path=file_path.value,
         )
 
     def edit(
         self,
-        file_path: str,
+        file_path: VirtualPath,
         old_str: str,
         new_str: str,
         *,
         replace_all: bool = False,
     ) -> EditResult:
         return EditResult(
-            error="Edit denied: audit backend is read-only.",
-            path=file_path,
+            error="Edit denied: backend is read-only.",
+            path=file_path.value,
             occurrences=0,
         )
 

@@ -57,6 +57,7 @@ from langchain_core.messages import SystemMessage
 from langgraph.prebuilt import ToolRuntime
 
 from mambo_agents.backends.protocol import BackendProtocol
+from mambo_agents.backends.schemas import VirtualPath
 
 if TYPE_CHECKING:
     from collections.abc import Awaitable
@@ -282,7 +283,7 @@ class MamboMemoryMiddleware(AgentMiddleware[MemoryState, ContextT, ResponseT]):
         self,
         *,
         backend: BackendProtocol,
-        sources: list[str],
+        sources: list[VirtualPath],
         format_prompt: MemoryFormatHook | None = None,
     ) -> None:
         """Initialize the memory middleware.
@@ -374,7 +375,7 @@ class MamboMemoryMiddleware(AgentMiddleware[MemoryState, ContextT, ResponseT]):
                 msg = f"Failed to download {path}: {response.error}"
                 raise ValueError(msg)
             if response.content is not None:
-                contents[path] = response.content.decode("utf-8")
+                contents[str(path)] = response.content.decode("utf-8")
                 logger.debug("Loaded memory from: %s", path)
 
         return MemoryStateUpdate(memory_contents=contents)
@@ -416,7 +417,7 @@ class MamboMemoryMiddleware(AgentMiddleware[MemoryState, ContextT, ResponseT]):
                 msg = f"Failed to download {path}: {response.error}"
                 raise ValueError(msg)
             if response.content is not None:
-                contents[path] = response.content.decode("utf-8")
+                contents[str(path)] = response.content.decode("utf-8")
                 logger.debug("Loaded memory from: %s", path)
 
         return MemoryStateUpdate(memory_contents=contents)

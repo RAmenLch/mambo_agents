@@ -575,10 +575,10 @@ class TestCreateAgentAutoWiring:
             model,
             backend=backend,
             middleware=[MamboPlanMiddleware()],
-            summarization={
-                "trigger": ("tokens", 100000),
-                "keep": ("messages", 20),
-            },
+            summarization=SummarizationConfig(
+                trigger=("tokens", 100000),
+                keep=("messages", 20),
+            ),
         )
         assert agent is not None
 
@@ -590,7 +590,7 @@ class TestCreateAgentAutoWiring:
         agent = create_mambo_agent(
             model,
             backend=backend,
-            summarization={"trigger": ("messages", 50)},
+            summarization=SummarizationConfig(trigger=("messages", 50)),
         )
         assert agent is not None
 
@@ -694,10 +694,10 @@ class TestPlanSummarizationE2E:
             model,
             backend=backend,
             middleware=[plan_mw],
-            summarization={
-                "trigger": ("messages", 8),
-                "keep": ("messages", 3),
-            },
+            summarization=SummarizationConfig(
+                trigger=("messages", 8),
+                keep=("messages", 3),
+            ),
         )
 
         thread_cfg = {"configurable": {"thread_id": "test_plan_e2e_2"}}

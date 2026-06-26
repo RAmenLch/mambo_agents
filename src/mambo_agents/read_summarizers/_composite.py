@@ -7,6 +7,7 @@ result wins.  If none match, the final fallback message is returned.
 from __future__ import annotations
 
 from mambo_agents.backends.protocol import ReadSummarizer
+from mambo_agents.backends.schemas import VirtualPath
 
 
 def composite_summarizer(
@@ -43,7 +44,7 @@ def composite_summarizer(
         backend = LocalBackend(summarizer=multi)
     """
 
-    def _summarize(file_path: str, content: str, max_chars: int) -> str:
+    def _summarize(file_path: VirtualPath, content: str, max_chars: int) -> str:
         for s in summarizers:
             result = s(file_path, content, max_chars)
             # Individual summarizers return fallback messages starting with

@@ -24,6 +24,7 @@ the prompt also explains the virtual-to-real path mapping.
 from __future__ import annotations
 
 import asyncio
+import re
 
 from langchain_core.tools import StructuredTool
 from pydantic import BaseModel, Field, create_model
@@ -43,8 +44,8 @@ from mambo_agents.backends.protocol import (
     UploadFileResult,
     WriteResult,
 )
+from mambo_agents.backends.schemas import check_no_path_traversal, GrepMatch,VirtualPath
 from mambo_agents.backends.state import StateBackend
-from mambo_agents.backends.utils import validate_canonical_path
 
 # ---------------------------------------------------------------------------
 # Default workspace prefix
@@ -73,39 +74,36 @@ class CopyResult(BaseModel):
 
 
 # ============================================================================
-# Path-translation helper for extra tools
+# Virtual workspace name validation
 # ============================================================================
 
+_WORKSPACE_NAME_RE = re.compile(r"^[a-zA-Z0-9_][a-zA-Z0-9_.\-]*$")
+"""Allowed characters for virtual workspace names (single segment, no ``/``)."""
 
-def _translate_path_kwarg(
-    hybrid: "HybridWorkspaceBackend",
-    kwargs: dict,
-) -> None:
-    """Rewrite ``kwargs["path"]`` via :meth:`HybridWorkspaceBackend._route`
-    when the path routes to the real backend.
 
-    Only modifies the dict when all of these hold:
+def _validate_workspace_name(name: str) -> str:
+    """Validate a virtual workspace name (single path segment under ``/.mambo/``).
 
-    - ``"path"`` is in *kwargs*
-    - The value is a non-empty string
-    - ``_route()`` succeeds and returns ``self._real`` as the target
+    Raises :class:`ValueError` if *name*:
+    - contains ``..`` path traversal
+    - contains ``//`` double slashes
+    - contains ``/`` (nested names are forbidden — ``a/b`` is not a valid name)
+    - contains illegal characters outside ``[a-zA-Z0-9_.-]``
+    - starts with a character other than ``[a-zA-Z0-9_]``
 
-    Paths that route to a virtual backend or fail validation are left
-    unchanged — the real backend's own ``_resolve()`` will return a
-    descriptive error.
+    Returns *name* unchanged on success.
     """
-    if "path" not in kwargs:
-        return
-    raw_path = kwargs["path"]
-    if not isinstance(raw_path, str) or not raw_path:
-        return
-    try:
-        target, rewritten = hybrid._route(raw_path)
-    except (ValueError, TypeError):
-        return
-    if target is not hybrid._real:
-        return
-    kwargs["path"] = rewritten
+    check_no_path_traversal(name, name="virtual workspace name")
+    if "/" in name:
+        raise ValueError(
+            f"Virtual workspace name must be a single segment (no '/'), got {name!r}"
+        )
+    if not _WORKSPACE_NAME_RE.match(name):
+        raise ValueError(
+            f"Virtual workspace name must match [a-zA-Z0-9_]"
+            f"[a-zA-Z0-9_.\\-]* but got {name!r}"
+        )
+    return name
 
 
 # ============================================================================
@@ -146,23 +144,29 @@ class HybridWorkspaceBackend(ThreadAwareWorkspace):
             Extra text appended to the system-prompt description.
     """
 
+    # Default per-tool timeout values specific to this backend (overridable via __init__).
+    _BACKEND_DEFAULT_TIMEOUTS = ToolTimeouts(copy=120.0)
+
     def __init__(
         self,
         real_backend: BackendProtocol,
         virtual_workspaces: dict[str, BackendProtocol] | None = None,
-        mambo_prefix: str = DEFAULT_MAMBO_PREFIX,
+        mambo_prefix: VirtualPath = VirtualPath(DEFAULT_MAMBO_PREFIX),
         custom_description: str | None = None,
         *,
-        workspace_root: str = "/workspace",
+        workspace_root: VirtualPath = VirtualPath("/workspace"),
         max_read_chars: int = 100_000,
         summarizer: "ReadSummarizer | None" = None,
         tool_timeouts: ToolTimeouts | None = None,
     ) -> None:
-        super().__init__(max_read_chars=max_read_chars, summarizer=summarizer, tool_timeouts=tool_timeouts)
+        # Merge backend-specific defaults with user overrides (user wins).
+        _user = tool_timeouts.model_dump() if tool_timeouts else {}
+        _merged = ToolTimeouts(**{**self._BACKEND_DEFAULT_TIMEOUTS.model_dump(), **_user})
+        super().__init__(max_read_chars=max_read_chars, summarizer=summarizer, tool_timeouts=_merged)
 
-        self.workspace_root = validate_canonical_path(workspace_root, "workspace_root")
+        self.workspace_root = VirtualPath(workspace_root)
         self._real = real_backend
-        self._prefix = validate_canonical_path(mambo_prefix, "mambo_prefix")  # "/.mambo"
+        self._prefix = VirtualPath(mambo_prefix)  # "/.mambo"
         self._custom_description = custom_description
 
         # --- Build virtual workspaces ---------------------------------
@@ -173,13 +177,13 @@ class HybridWorkspaceBackend(ThreadAwareWorkspace):
             self._default_mambo = vw.pop(".")
         else:
             self._default_mambo = StateBackend(
-                max_read_chars=max_read_chars, summarizer=summarizer, tool_timeouts=tool_timeouts,
+                max_read_chars=max_read_chars, summarizer=summarizer, tool_timeouts=_merged,
             )
 
         # Remaining entries → /.mambo/<name>/ namespaces
         self._virtual: dict[str, BackendProtocol] = {}
         for name, be in vw.items():
-            name = name.strip("/")
+            name = _validate_workspace_name(name.strip("/"))
             if not name:
                 raise ValueError(f"Virtual workspace name must be non-empty, got {name!r}")
             if name == ".":
@@ -207,14 +211,14 @@ class HybridWorkspaceBackend(ThreadAwareWorkspace):
                 description=(
                     "Copy a single file from source to destination. "
                     "Supports cross-backend copies (e.g. from a virtual "
-                    f"**{self._prefix}/** workspace to the real filesystem, "
+                    f"**{self._prefix.normalized}/** workspace to the real filesystem, "
                     "or between virtual workspaces). "
                     "Overwrites the destination if it already exists."
                 ),
                 args_schema=create_model(
                     "CopySchema",
-                    source=(str, Field(description="Absolute source file path")),
-                    destination=(str, Field(description="Absolute destination file path")),
+                    source=(VirtualPath, Field(description="Absolute source file path")),
+                    destination=(VirtualPath, Field(description="Absolute destination file path")),
                 ),
                 func=self._safe_tool_func("copy", self.copy),
                 coroutine=self._safe_tool_coroutine("copy", self.acopy),
@@ -229,6 +233,35 @@ class HybridWorkspaceBackend(ThreadAwareWorkspace):
         if schema is None:
             return False
         return "path" in schema.model_fields
+
+    def _translate_path_kwarg(self, kwargs: dict) -> None:
+        """Rewrite ``kwargs["path"]`` via :meth:`_route`
+        when the path routes to the real backend.
+
+        Only modifies the dict when all of these hold:
+
+        - ``"path"`` is in *kwargs*
+        - The value is a non-empty string or VirtualPath
+        - ``_route()`` succeeds and returns ``self._real`` as the target
+
+        Paths that route to a virtual backend or fail validation are left
+        unchanged — the real backend's own ``_resolve()`` will raise a
+        :class:`WorkspacePathError` with a descriptive message.
+        """
+        if "path" not in kwargs:
+            return
+        raw_path = kwargs["path"]
+        if not isinstance(raw_path, (str, VirtualPath)) or not raw_path:
+            return
+        try:
+            if isinstance(raw_path, str):
+                raw_path = VirtualPath(raw_path)
+            target, rewritten = self._route(raw_path)
+        except (ValueError, TypeError):
+            return
+        if target is not self._real:
+            return
+        kwargs["path"] = rewritten
 
     def _wrap_extra_tool(self, tool: StructuredTool) -> StructuredTool:
         """Wrap a real-backend tool so that its ``path`` argument is
@@ -245,13 +278,13 @@ class HybridWorkspaceBackend(ThreadAwareWorkspace):
         original_coroutine = tool.coroutine
 
         def wrapped_func(*args, **kwargs):
-            _translate_path_kwarg(self, kwargs)
+            self._translate_path_kwarg(kwargs)
             if original_func is not None:
                 return original_func(*args, **kwargs)
             return None
 
         async def wrapped_coroutine(*args, **kwargs):
-            _translate_path_kwarg(self, kwargs)
+            self._translate_path_kwarg(kwargs)
             if original_coroutine is not None:
                 return await original_coroutine(*args, **kwargs)
             if original_func is not None:
@@ -263,8 +296,7 @@ class HybridWorkspaceBackend(ThreadAwareWorkspace):
             description=tool.description,
             args_schema=tool.args_schema,
             func=wrapped_func,
-            coroutine=wrapped_coroutine,
-            return_direct=tool.return_direct,
+            coroutine=wrapped_coroutine
         )
 
     # ------------------------------------------------------------------
@@ -273,23 +305,23 @@ class HybridWorkspaceBackend(ThreadAwareWorkspace):
 
     @property
     def description(self) -> str:
-        wr = self.workspace_root
+        wr = self.workspace_root.value
         core_tools = "`ls`, `read`, `write`, `edit`, `grep`, `glob`, `copy`"
         base = (
-            f"A virtual temporary workspace is available at **{self._prefix}/**.  "
+            f"A virtual temporary workspace is available at **{self._prefix.normalized}/**.  "
             f"Use it for intermediate files, chat history dumps, large "
             f"tool-result evictions, and subagent communication.  "
             f"This workspace is isolated from the real filesystem — files here "
             f"do not persist across sessions.  "
             f"All real-filesystem paths must start with **{wr}/**.  "
-            f"The following file tools work on **{self._prefix}/** paths: "
+            f"The following file tools work on **{self._prefix.normalized}/** paths: "
             f"{core_tools}.  "
             f"`copy` can move files between the virtual workspace and the real "
             f"filesystem.  "
             f"`tree` and `delete` automatically translate paths through the "
             f"workspace namespace.  "
             f"`execute` must use real filesystem paths — do NOT target "
-            f"**{self._prefix}/** paths with shell commands."
+            f"**{self._prefix.normalized}/** paths with shell commands."
         )
 
         delegate_desc = self._real.description
@@ -304,15 +336,10 @@ class HybridWorkspaceBackend(ThreadAwareWorkspace):
     # Path routing
     # ------------------------------------------------------------------
 
-    def _is_mambo(self, path: str) -> bool:
-        """Return ``True`` if *path* falls under the mambo prefix."""
-        p = path.rstrip("/")
-        mambo = self._prefix  # "/.mambo"
-        return p == mambo or p.startswith(mambo + "/")
 
     @staticmethod
-    def _rewrite(normalized_path: str, strip_prefix: str, target_ws_root: str) -> str:
-        """Strip *strip_prefix* from *normalized_path*, then prepend *target_ws_root*.
+    def _rewrite(vp: VirtualPath, strip_prefix: str, target_ws_root: VirtualPath) -> VirtualPath:
+        """Strip *strip_prefix* from *vp*, then prepend *target_ws_root*.
 
         Always rewrites: strip the prefix, prepend the target backend's
         ``workspace_root``.  No special cases — predictable regardless of
@@ -321,23 +348,15 @@ class HybridWorkspaceBackend(ThreadAwareWorkspace):
         Raises
         ------
         ValueError
-            If *normalized_path* is not under *strip_prefix*.
+            If *vp* is not under *strip_prefix*.
         """
-        if normalized_path == strip_prefix:
-            rel = ""
-        elif normalized_path.startswith(strip_prefix + "/"):
-            rel = normalized_path[len(strip_prefix):].lstrip("/")
-        else:
-            raise ValueError(
-                f"Cannot rewrite path {normalized_path!r}: "
-                f"not under prefix {strip_prefix!r}"
-            )
-        ws = target_ws_root.rstrip("/")
+        rel = vp.relative_to(strip_prefix)
+        ws = target_ws_root.value.rstrip("/")
         if not rel:
-            return ws
-        return ws + "/" + rel
+            return VirtualPath(ws)
+        return VirtualPath(ws + "/" + rel)
 
-    def _route(self, path: str) -> tuple[BackendProtocol, str]:
+    def _route(self, path: VirtualPath) -> tuple[BackendProtocol, VirtualPath]:
         """Resolve ``(target_backend, rewritten_path)`` for routing.
 
         Every path is rewritten: the relevant prefix (Hybrid workspace root
@@ -351,98 +370,87 @@ class HybridWorkspaceBackend(ThreadAwareWorkspace):
         2. Default virtual workspace (``/.mambo/...``)
         3. Real backend (everything else)
         """
-        if not isinstance(path, str):
-            raise TypeError(
-                f"path must be a string, got {type(path).__name__}: {path!r}"
-            )
-        p = path.rstrip("/")
-        if not p:
+        # VirtualPath already validates on construction (no .., no //, absolute)
+        if not path.normalized:
             raise ValueError(
                 f"不能使用空字符串或 '/' 作为路径，"
-                f"请提供 {self.workspace_root}/ 或 {self._prefix}/ 下的完整路径。"
+                f"请提供 {self.workspace_root.value}/ 或 {self._prefix.normalized}/ 下的完整路径。"
             )
-        mambo = self._prefix  # "/.mambo"
+        mambo_base = self._prefix.normalized  # "/.mambo"
 
         # (1) Check named virtual workspaces
         for name, be in self._virtual.items():
-            ns_prefix = f"{mambo}/{name}"
-            if p == ns_prefix or p.startswith(ns_prefix + "/"):
-                return be, self._rewrite(p, ns_prefix, be.workspace_root)
+            ns_vp = self._prefix.join(name)
+            if path == ns_vp or path.is_under(ns_vp.normalized):
+                return be, self._rewrite(path, ns_vp.value, be.workspace_root)
 
         # (2) Fallback: default /.mambo/
-        if p == mambo or p.startswith(mambo + "/"):
+        if path.is_under(mambo_base):
             return self._default_mambo, self._rewrite(
-                p, mambo, self._default_mambo.workspace_root,
+                path, mambo_base, self._default_mambo.workspace_root,
             )
 
         # (3) Real backend — strip Hybrid.ws_root, prepend real.ws_root
-        return self._real, self._rewrite(p, self.workspace_root, self._real.workspace_root)
+        return self._real, self._rewrite(path, self.workspace_root.value, self._real.workspace_root)
 
     # ------------------------------------------------------------------
     # Reverse path translation for results (ls / grep / glob)
     # ------------------------------------------------------------------
 
-    def _get_virtual_prefix(self, path: str) -> str:
+    def _get_virtual_prefix(self, path: str | VirtualPath) -> VirtualPath:
         """Return the external prefix that *path* would be routed from.
 
         This is the mirror of :meth:`_route` — given the same *path*, it
         returns the prefix that ``_route`` strips before delegation.
         Used to reverse-translate internal paths in result objects.
         """
-        p = path.rstrip("/")
-        mambo = self._prefix  # "/.mambo"
+        vp = VirtualPath(path) if not isinstance(path, VirtualPath) else path
 
         # (1) Named virtual workspace
         for name in self._virtual:
-            ns_prefix = f"{mambo}/{name}"
-            if p == ns_prefix or p.startswith(ns_prefix + "/"):
-                return ns_prefix
+            ns_vp = self._prefix.join(name)
+            if vp == ns_vp or vp.is_under(ns_vp.normalized):
+                return ns_vp
 
         # (2) Default mambo
-        if p == mambo or p.startswith(mambo + "/"):
-            return mambo
+        if vp.is_under(self._prefix.normalized):
+            return VirtualPath(self._prefix.normalized)
 
         # (3) Real backend
-        return self.workspace_root
+        return VirtualPath(self.workspace_root.normalized)
 
     @staticmethod
     def _reverse_path(
-        internal_path: str, target_ws_root: str, virtual_prefix: str,
-    ) -> str:
+        internal_path: VirtualPath,
+        target_ws_root: VirtualPath,
+        virtual_prefix: VirtualPath,
+    ) -> VirtualPath:
         """Reverse a ``_rewrite``: strip *target_ws_root*, prepend *virtual_prefix*.
 
         Example::
-            _reverse_path("/skill-a", "/", "/.mambo/skills")
-            # → "/.mambo/skills/skill-a"
+            _reverse_path(VirtualPath("/skill-a"), VirtualPath("/"), VirtualPath("/.mambo/skills"))
+            # → VirtualPath("/.mambo/skills/skill-a")
         """
-        twsr = target_ws_root.rstrip("/")
-        if internal_path == twsr:
-            return virtual_prefix
-        if internal_path.startswith(twsr + "/"):
-            rel = internal_path[len(twsr) + 1:]
-        elif internal_path.startswith(twsr):
-            rel = internal_path[len(twsr):].lstrip("/")
-        else:
-            rel = internal_path.lstrip("/")
+        rel = internal_path.relative_to(target_ws_root.normalized)
         if not rel:
-            return virtual_prefix
-        return virtual_prefix + "/" + rel
+            return VirtualPath(virtual_prefix.normalized)
+        return virtual_prefix.join(rel)
 
     def _valid_paths_description(self) -> str:
         """Build a human-readable description of all valid path prefixes,
         including the mapping from AI-facing workspace to real backend root.
         """
-        parts = [f"'{self.workspace_root}/'（映射至真实路径 '{self._real.workspace_root}/'）"]
-        parts.append(f"'{self._prefix}/'（虚拟临时工作区）")
+        parts = [f"'{self.workspace_root.value}/'（映射至真实路径 '{self._real.workspace_root.value}/'）",
+                 f"'{self._prefix.normalized}/'（虚拟临时工作区）"]
         for name in sorted(self._virtual):
-            parts.append(f"'{self._prefix}/{name}/'（虚拟工作区）")
+            parts.append(f"'{self._prefix.join(name).value}/'（虚拟工作区）")
         return "、".join(parts)
 
     # ------------------------------------------------------------------
     # Core file operations — prefix-routed
     # ------------------------------------------------------------------
 
-    def ls(self, path: str) -> LsResult:
+    def ls(self, path: VirtualPath) -> LsResult:
         try:
             target, p = self._route(path)
         except (ValueError, TypeError) as e:
@@ -459,10 +467,10 @@ class HybridWorkspaceBackend(ThreadAwareWorkspace):
                 }))
 
         # Inject named virtual workspace directories when listing /.mambo root
-        if path.rstrip("/") == self._prefix:
+        if str(path).rstrip("/") == self._prefix.normalized:
             for name in self._virtual:
                 entries.append(FileInfo(
-                    path=f"{self._prefix}/{name}",
+                    path=self._prefix.join(name),
                     is_dir=True,
                 ))
 
@@ -473,24 +481,22 @@ class HybridWorkspaceBackend(ThreadAwareWorkspace):
 
     def read(
         self,
-        file_path: str,
+        file_path: VirtualPath,
         offset: int = 0,
         limit: int = 2000,
         include_line_numbers: bool = False,
-        *,
-        _apply_max_chars: bool = True,
     ) -> ReadResult:
         try:
             target, p = self._route(file_path)
         except (ValueError, TypeError) as e:
             return ReadResult(error=f"路径 '{file_path}' 无效：{e}。仅可访问：{self._valid_paths_description()}")
-        return target.read(p, offset, limit, include_line_numbers, _apply_max_chars=_apply_max_chars)
+        return target.read(p, offset, limit, include_line_numbers)
 
     def read_raw(
         self,
-        file_path: str,
+        file_path: VirtualPath,
         offset: int = 0,
-        limit: int = 2000,
+        limit: int | None = 2000,
         include_line_numbers: bool = False,
     ) -> ReadResult:
         try:
@@ -500,7 +506,7 @@ class HybridWorkspaceBackend(ThreadAwareWorkspace):
         return target.read_raw(p, offset, limit, include_line_numbers)
 
     def write(
-        self, file_path: str, content: str, overwrite: bool = False,
+        self, file_path: VirtualPath, content: str, overwrite: bool = False,
     ) -> WriteResult:
         try:
             target, p = self._route(file_path)
@@ -510,7 +516,7 @@ class HybridWorkspaceBackend(ThreadAwareWorkspace):
 
     def edit(
         self,
-        file_path: str,
+        file_path: VirtualPath,
         old_str: str,
         new_str: str,
         *,
@@ -525,14 +531,14 @@ class HybridWorkspaceBackend(ThreadAwareWorkspace):
     def grep(
         self,
         pattern: str,
-        path: str = "/",
+        path: VirtualPath,
         glob: str | None = None,
         regex: bool = False,
         offset: int = 0,
         limit: int | None = None,
     ) -> GrepResult:
         # Fan-out to all virtual backends when searching /.mambo root
-        if path.rstrip("/") == self._prefix:
+        if str(path).rstrip("/") == self._prefix.normalized:
             return self._apply_grep_limit(
                 self._grep_all_virtual(pattern, glob, regex),
                 offset, limit,
@@ -559,9 +565,9 @@ class HybridWorkspaceBackend(ThreadAwareWorkspace):
             )
         return result
 
-    def glob(self, pattern: str, path: str = "/") -> GlobResult:
+    def glob(self, pattern: str, path: VirtualPath) -> GlobResult:
         # Fan-out to all virtual backends when searching /.mambo root
-        if path.rstrip("/") == self._prefix:
+        if str(path).rstrip("/") == self._prefix.normalized:
             return self._glob_all_virtual(pattern)
 
         try:
@@ -591,7 +597,7 @@ class HybridWorkspaceBackend(ThreadAwareWorkspace):
     # thread-pool thread, bypassing the target backend's async guards.
     # ------------------------------------------------------------------
 
-    async def als(self, path: str) -> LsResult:
+    async def als(self, path: VirtualPath) -> LsResult:
         try:
             target, p = self._route(path)
         except (ValueError, TypeError) as e:
@@ -608,10 +614,10 @@ class HybridWorkspaceBackend(ThreadAwareWorkspace):
                 }))
 
         # Inject named virtual workspace directories when listing /.mambo root
-        if path.rstrip("/") == self._prefix:
+        if str(path).rstrip("/") == self._prefix.normalized:
             for name in self._virtual:
                 entries.append(FileInfo(
-                    path=f"{self._prefix}/{name}",
+                    path=self._prefix.join(name),
                     is_dir=True,
                 ))
 
@@ -622,12 +628,10 @@ class HybridWorkspaceBackend(ThreadAwareWorkspace):
 
     async def aread(
         self,
-        file_path: str,
+        file_path: VirtualPath,
         offset: int = 0,
         limit: int = 2000,
         include_line_numbers: bool = False,
-        *,
-        _apply_max_chars: bool = True,
     ) -> ReadResult:
         try:
             target, p = self._route(file_path)
@@ -635,11 +639,10 @@ class HybridWorkspaceBackend(ThreadAwareWorkspace):
             return ReadResult(error=f"路径 '{file_path}' 无效：{e}。仅可访问：{self._valid_paths_description()}")
         return await target.aread(
             p, offset, limit, include_line_numbers,
-            _apply_max_chars=_apply_max_chars,
         )
 
     async def awrite(
-        self, file_path: str, content: str, overwrite: bool = False,
+        self, file_path: VirtualPath, content: str, overwrite: bool = False,
     ) -> WriteResult:
         try:
             target, p = self._route(file_path)
@@ -649,7 +652,7 @@ class HybridWorkspaceBackend(ThreadAwareWorkspace):
 
     async def aedit(
         self,
-        file_path: str,
+        file_path: VirtualPath,
         old_str: str,
         new_str: str,
         *,
@@ -664,14 +667,14 @@ class HybridWorkspaceBackend(ThreadAwareWorkspace):
     async def agrep(
         self,
         pattern: str,
-        path: str = "/",
+        path: VirtualPath,
         glob: str | None = None,
         regex: bool = False,
         offset: int = 0,
         limit: int | None = None,
     ) -> GrepResult:
         # Fan-out to all virtual backends when searching /.mambo root
-        if path.rstrip("/") == self._prefix:
+        if str(path).rstrip("/") == self._prefix.normalized:
             raw_matches = await self._agrep_all_virtual(pattern, glob, regex)
             return self._apply_grep_limit(raw_matches, offset, limit)
 
@@ -696,9 +699,9 @@ class HybridWorkspaceBackend(ThreadAwareWorkspace):
             )
         return result
 
-    async def aglob(self, pattern: str, path: str = "/") -> GlobResult:
+    async def aglob(self, pattern: str, path: VirtualPath) -> GlobResult:
         # Fan-out to all virtual backends when searching /.mambo root
-        if path.rstrip("/") == self._prefix:
+        if str(path).rstrip("/") == self._prefix.normalized:
             return await self._aglob_all_virtual(pattern)
 
         try:
@@ -729,19 +732,20 @@ class HybridWorkspaceBackend(ThreadAwareWorkspace):
         all_matches: list = []
 
         # Default mambo
-        p = self._rewrite(self._prefix, self._prefix, self._default_mambo.workspace_root)
+        mambo_prefix = self._prefix
+        p = self._rewrite(mambo_prefix, mambo_prefix.normalized, self._default_mambo.workspace_root)
         result = self._default_mambo.grep(pattern, p, glob, regex, offset=0, limit=None)
         if result.matches:
             twsr = self._default_mambo.workspace_root
             all_matches.extend(
-                m.model_copy(update={"path": self._reverse_path(m.path, twsr, self._prefix)})
+                m.model_copy(update={"path": self._reverse_path(m.path, twsr, mambo_prefix)})
                 for m in result.matches
             )
 
         # Named virtual workspaces
         for name, be in self._virtual.items():
-            vprefix = f"{self._prefix}/{name}"
-            result = be.grep(pattern, be.workspace_root, glob, regex, offset=0, limit=None)
+            vprefix = self._prefix.join(name)
+            result = be.grep(pattern, VirtualPath(be.workspace_root), glob, regex, offset=0, limit=None)
             if result.matches:
                 twsr = be.workspace_root
                 all_matches.extend(
@@ -756,23 +760,24 @@ class HybridWorkspaceBackend(ThreadAwareWorkspace):
         errors: list[str] = []
 
         # Default mambo
-        p = self._rewrite(self._prefix, self._prefix, self._default_mambo.workspace_root)
+        mambo_prefix = self._prefix
+        p = self._rewrite(mambo_prefix, mambo_prefix.normalized, self._default_mambo.workspace_root)
         result = self._default_mambo.glob(pattern, p)
         if result.error:
-            errors.append(f"[{self._prefix}]: {result.error}")
+            errors.append(f"[{mambo_prefix.normalized}]: {result.error}")
         if result.matches:
             twsr = self._default_mambo.workspace_root
             all_matches.extend(
-                e.model_copy(update={"path": self._reverse_path(e.path, twsr, self._prefix)})
+                e.model_copy(update={"path": self._reverse_path(e.path, twsr, mambo_prefix)})
                 for e in result.matches
             )
 
         # Named virtual workspaces
         for name, be in self._virtual.items():
-            vprefix = f"{self._prefix}/{name}"
-            result = be.glob(pattern, be.workspace_root)
+            vprefix = self._prefix.join(name)
+            result = be.glob(pattern, VirtualPath(be.workspace_root))
             if result.error:
-                errors.append(f"[{vprefix}]: {result.error}")
+                errors.append(f"[{vprefix.value}]: {result.error}")
             if result.matches:
                 twsr = be.workspace_root
                 all_matches.extend(
@@ -790,19 +795,20 @@ class HybridWorkspaceBackend(ThreadAwareWorkspace):
         all_matches: list = []
 
         # Default mambo
-        p = self._rewrite(self._prefix, self._prefix, self._default_mambo.workspace_root)
+        mambo_prefix = self._prefix
+        p = self._rewrite(mambo_prefix, mambo_prefix.normalized, self._default_mambo.workspace_root)
         result = await self._default_mambo.agrep(pattern, p, glob, regex, offset=0, limit=None)
         if result.matches:
             twsr = self._default_mambo.workspace_root
             all_matches.extend(
-                m.model_copy(update={"path": self._reverse_path(m.path, twsr, self._prefix)})
+                m.model_copy(update={"path": self._reverse_path(m.path, twsr, mambo_prefix)})
                 for m in result.matches
             )
 
         # Named virtual workspaces
         for name, be in self._virtual.items():
-            vprefix = f"{self._prefix}/{name}"
-            result = await be.agrep(pattern, be.workspace_root, glob, regex, offset=0, limit=None)
+            vprefix = self._prefix.join(name)
+            result = await be.agrep(pattern, VirtualPath(be.workspace_root), glob, regex, offset=0, limit=None)
             if result.matches:
                 twsr = be.workspace_root
                 all_matches.extend(
@@ -817,23 +823,24 @@ class HybridWorkspaceBackend(ThreadAwareWorkspace):
         errors: list[str] = []
 
         # Default mambo
-        p = self._rewrite(self._prefix, self._prefix, self._default_mambo.workspace_root)
+        mambo_prefix = self._prefix
+        p = self._rewrite(mambo_prefix, mambo_prefix.normalized, self._default_mambo.workspace_root)
         result = await self._default_mambo.aglob(pattern, p)
         if result.error:
-            errors.append(f"[{self._prefix}]: {result.error}")
+            errors.append(f"[{mambo_prefix.normalized}]: {result.error}")
         if result.matches:
             twsr = self._default_mambo.workspace_root
             all_matches.extend(
-                e.model_copy(update={"path": self._reverse_path(e.path, twsr, self._prefix)})
+                e.model_copy(update={"path": self._reverse_path(e.path, twsr, mambo_prefix)})
                 for e in result.matches
             )
 
         # Named virtual workspaces
         for name, be in self._virtual.items():
-            vprefix = f"{self._prefix}/{name}"
-            result = await be.aglob(pattern, be.workspace_root)
+            vprefix = self._prefix.join(name)
+            result = await be.aglob(pattern, VirtualPath(be.workspace_root))
             if result.error:
-                errors.append(f"[{vprefix}]: {result.error}")
+                errors.append(f"[{vprefix.value}]: {result.error}")
             if result.matches:
                 twsr = be.workspace_root
                 all_matches.extend(
@@ -850,7 +857,7 @@ class HybridWorkspaceBackend(ThreadAwareWorkspace):
     # copy — cross-backend single-file copy
     # ------------------------------------------------------------------
 
-    def copy(self, source: str, destination: str) -> CopyResult:
+    def copy(self, source: VirtualPath, destination: VirtualPath) -> CopyResult:
         """Copy a single file, potentially across different backends.
 
         Reads the source file as raw bytes via :meth:`download_files` on the
@@ -885,9 +892,9 @@ class HybridWorkspaceBackend(ThreadAwareWorkspace):
         if ul.error:
             return CopyResult(error=f"Failed to write '{destination}': {ul.error}")
 
-        return CopyResult(source=source, destination=destination)
+        return CopyResult(source=str(source), destination=str(destination))
 
-    async def acopy(self, source: str, destination: str) -> CopyResult:
+    async def acopy(self, source: VirtualPath, destination: VirtualPath) -> CopyResult:
         """Async: Copy a single file across backends."""
         return await asyncio.to_thread(self.copy, source, destination)
 
@@ -897,13 +904,13 @@ class HybridWorkspaceBackend(ThreadAwareWorkspace):
 
     def upload_files(
         self,
-        files: list[tuple[str, bytes]],
+        files: list[tuple[VirtualPath, bytes]],
         *,
         thread_id: str | None = None,
     ) -> list[UploadFileResult]:
         """Upload files, routing each to the correct backend by prefix."""
         # Group files by target backend
-        groups: dict[int, list[tuple[str, bytes]]] = {}  # backend_id → files
+        groups: dict[int, list[tuple[VirtualPath, bytes]]] = {}  # backend_id → files
         targets: list[BackendProtocol] = []
         index_map: list[tuple[int, int]] = []  # (target_idx, file_idx_in_group)
         routing_errors: dict[int, str] = {}  # file_orig_index → error message
@@ -944,7 +951,9 @@ class HybridWorkspaceBackend(ThreadAwareWorkspace):
         results: list[UploadFileResult] = []
         for orig_idx in range(len(files)):
             if orig_idx in routing_errors:
-                results.append(UploadFileResult(error=routing_errors[orig_idx]))
+                path = files[orig_idx][0]
+                path_str = path.value if isinstance(path, VirtualPath) else str(path)
+                results.append(UploadFileResult(path=path_str, error=routing_errors[orig_idx]))
             else:
                 # find the matching entry in index_map
                 for oi, target_idx, file_idx in index_map:
@@ -955,12 +964,12 @@ class HybridWorkspaceBackend(ThreadAwareWorkspace):
 
     def download_files(
         self,
-        paths: list[str],
+        paths: list[VirtualPath],
         *,
         thread_id: str | None = None,
     ) -> list[DownloadFileResult]:
         """Download files, routing each to the correct backend by prefix."""
-        groups: dict[int, list[str]] = {}
+        groups: dict[int, list[VirtualPath]] = {}
         targets: list[BackendProtocol] = []
         index_map: list[tuple[int, int, int]] = []
         routing_errors: dict[int, str] = {}
@@ -998,7 +1007,9 @@ class HybridWorkspaceBackend(ThreadAwareWorkspace):
         results: list[DownloadFileResult] = []
         for orig_idx in range(len(paths)):
             if orig_idx in routing_errors:
-                results.append(DownloadFileResult(error=routing_errors[orig_idx]))
+                path = paths[orig_idx]
+                path_str = path.value if isinstance(path, VirtualPath) else str(path)
+                results.append(DownloadFileResult(path=path_str, error=routing_errors[orig_idx]))
             else:
                 for oi, target_idx, file_idx in index_map:
                     if oi == orig_idx:

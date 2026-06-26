@@ -10,6 +10,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 import pytest
 
 from mambo_agents.backends.state import StateBackend
+from mambo_agents.backends.schemas import VirtualPath
 
 
 # ============================================================================
@@ -186,7 +187,7 @@ class TestStateBackendInit:
             assert files1["/init.txt"]["content"] == "template"
 
             # Now overwrite the file via write (simulating graph changes)
-            backend.write("/init.txt", "modified-by-agent", overwrite=True)
+            backend.write(VirtualPath("/init.txt"), "modified-by-agent", overwrite=True)
 
             # Second _read_files: should return the modified version, NOT
             # re-inject the stale initial template
@@ -203,7 +204,7 @@ class TestStateBackendInit:
         backend = StateBackend(initial_files={"/existing.txt": "stale-init"})
         with _simulate_graph(backend):
             # Simulate that a previous graph run wrote this file
-            backend.write("/existing.txt", "from-previous-run", overwrite=True)
+            backend.write(VirtualPath("/existing.txt"), "from-previous-run", overwrite=True)
             # Now a "fresh" _read_files should keep the snapshot value
             files = backend._read_files()
         assert files["/existing.txt"]["content"] == "from-previous-run"
@@ -218,30 +219,30 @@ class TestStateBackendWrite:
     def test_write_new_file(self):
         backend = StateBackend()
         with _simulate_graph(backend):
-            r = backend.write("/test.txt", "hello")
+            r = backend.write(VirtualPath("/test.txt"), "hello")
             assert r.error is None
-            assert "hello" in (backend.read("/test.txt").content or "")
+            assert "hello" in (backend.read(VirtualPath("/test.txt")).content or "")
 
     def test_write_fails_if_exists(self):
         backend = StateBackend()
         with _simulate_graph(backend):
-            backend.write("/dup.txt", "original")
-            r = backend.write("/dup.txt", "modified")
+            backend.write(VirtualPath("/dup.txt"), "original")
+            r = backend.write(VirtualPath("/dup.txt"), "modified")
         assert r.error is not None
         assert "already exists" in (r.error or "")
 
     def test_write_overwrite(self):
         backend = StateBackend()
         with _simulate_graph(backend):
-            backend.write("/x.txt", "v1")
-            r = backend.write("/x.txt", "v2", overwrite=True)
+            backend.write(VirtualPath("/x.txt"), "v1")
+            r = backend.write(VirtualPath("/x.txt"), "v2", overwrite=True)
             assert r.error is None
-            assert "v2" in (backend.read("/x.txt").content or "")
+            assert "v2" in (backend.read(VirtualPath("/x.txt")).content or "")
 
     def test_binary_extension_gets_base64(self):
         backend = StateBackend()
         with _simulate_graph(backend):
-            backend.write("/img.png", "data")
+            backend.write(VirtualPath("/img.png"), "data")
             files = backend._read_files()
         assert files["/img.png"]["encoding"] == "base64"
 
@@ -255,8 +256,8 @@ class TestStateBackendEdit:
     def test_edit_replaces(self):
         backend = StateBackend()
         with _simulate_graph(backend):
-            backend.write("/f.py", "x = 1\ny = 2")
-            r = backend.edit("/f.py", "x = 1", "x = 100")
+            backend.write(VirtualPath("/f.py"), "x = 1\ny = 2")
+            r = backend.edit(VirtualPath("/f.py"), "x = 1", "x = 100")
         assert r.error is None
         assert r.occurrences == 1
         assert "x = 100" in _files_snapshot(backend)["/f.py"]["content"]
@@ -264,8 +265,8 @@ class TestStateBackendEdit:
     def test_edit_replace_all(self):
         backend = StateBackend()
         with _simulate_graph(backend):
-            backend.write("/f.txt", "A-B-A-B-A")
-            r = backend.edit("/f.txt", "A", "X", replace_all=True)
+            backend.write(VirtualPath("/f.txt"), "A-B-A-B-A")
+            r = backend.edit(VirtualPath("/f.txt"), "A", "X", replace_all=True)
         assert r.error is None
         assert r.occurrences == 3
         assert _files_snapshot(backend)["/f.txt"]["content"] == "X-B-X-B-X"
@@ -273,29 +274,29 @@ class TestStateBackendEdit:
     def test_edit_multiple_without_replace_all(self):
         backend = StateBackend()
         with _simulate_graph(backend):
-            backend.write("/f.txt", "A-B-A")
-            r = backend.edit("/f.txt", "A", "X")
+            backend.write(VirtualPath("/f.txt"), "A-B-A")
+            r = backend.edit(VirtualPath("/f.txt"), "A", "X")
         assert "appears 2 times" in (r.error or "")
 
     def test_edit_not_found(self):
         backend = StateBackend()
         with _simulate_graph(backend):
-            backend.write("/f.txt", "hello")
-            r = backend.edit("/f.txt", "gone", "x")
+            backend.write(VirtualPath("/f.txt"), "hello")
+            r = backend.edit(VirtualPath("/f.txt"), "gone", "x")
         assert "old_str not found" in (r.error or "")
 
     def test_edit_file_not_found(self):
         backend = StateBackend()
         with _simulate_graph(backend):
-            r = backend.edit("/no.txt", "x", "y")
+            r = backend.edit(VirtualPath("/no.txt"), "x", "y")
         assert "file not found" in (r.error or "")
 
     def test_edit_binary_blocked(self):
         """FIX 1: edit() blocks binary (base64) files with clear error."""
         backend = StateBackend()
         with _simulate_graph(backend):
-            backend.write("/img.png", "AAAA")
-            r = backend.edit("/img.png", "AAA", "BBB")
+            backend.write(VirtualPath("/img.png"), "AAAA")
+            r = backend.edit(VirtualPath("/img.png"), "AAA", "BBB")
         assert r.error is not None
         assert "binary" in (r.error or "").lower()
         assert "base64" in (r.error or "").lower()
@@ -304,15 +305,15 @@ class TestStateBackendEdit:
         """FIX 1: edit() blocked even from initial_files binary."""
         backend = StateBackend(initial_files={"/img.png": "raw"})
         with _simulate_graph(backend):
-            r = backend.edit("/img.png", "raw", "new")
+            r = backend.edit(VirtualPath("/img.png"), "raw", "new")
         assert r.error is not None
         assert "binary" in (r.error or "").lower()
 
     def test_edit_trailing_newline_hint(self):
         backend = StateBackend()
         with _simulate_graph(backend):
-            backend.write("/f.txt", "def foo(): pass")
-            r = backend.edit("/f.txt", "def foo(): pass\n", "def bar():\n")
+            backend.write(VirtualPath("/f.txt"), "def foo(): pass")
+            r = backend.edit(VirtualPath("/f.txt"), "def foo(): pass\n", "def bar():\n")
         assert r.error is not None
         assert "newline" in (r.error or "").lower()
 
@@ -326,16 +327,16 @@ class TestStateBackendRead:
     def test_read_line_numbers(self):
         backend = StateBackend()
         with _simulate_graph(backend):
-            backend.write("/f.py", "a\nb\nc")
-            r = backend.read("/f.py")
+            backend.write(VirtualPath("/f.py"), "a\nb\nc")
+            r = backend.read(VirtualPath("/f.py"))
         assert r.total_lines == 3
         assert "a\nb\nc" in (r.content or "")
 
     def test_read_offset_limit(self):
         backend = StateBackend()
         with _simulate_graph(backend):
-            backend.write("/f.txt", "\n".join(f"L{i}" for i in range(10)))
-            r = backend.read("/f.txt", offset=2, limit=3)
+            backend.write(VirtualPath("/f.txt"), "\n".join(f"L{i}" for i in range(10)))
+            r = backend.read(VirtualPath("/f.txt"), offset=2, limit=3)
         assert r.error is None
         # Should have 3 lines starting from L2 (index 2)
         assert "L2" in (r.content or "")
@@ -344,8 +345,8 @@ class TestStateBackendRead:
     def test_read_binary_base64(self):
         backend = StateBackend()
         with _simulate_graph(backend):
-            backend.write("/img.png", "binary-data-here")
-            r = backend.read("/img.png")
+            backend.write(VirtualPath("/img.png"), "binary-data-here")
+            r = backend.read(VirtualPath("/img.png"))
         assert r.encoding == "base64"
         assert r.file_type == "image"
         assert r.content == "binary-data-here"
@@ -353,7 +354,7 @@ class TestStateBackendRead:
     def test_read_not_found(self):
         backend = StateBackend()
         with _simulate_graph(backend):
-            r = backend.read("/no.txt")
+            r = backend.read(VirtualPath("/no.txt"))
         assert "not found" in (r.error or "")
 
 
@@ -366,25 +367,25 @@ class TestStateBackendLs:
     def test_ls_flat(self):
         backend = StateBackend()
         with _simulate_graph(backend):
-            backend.write("/a.py", "1")
-            backend.write("/b.py", "2")
-            result = backend.ls("/")
+            backend.write(VirtualPath("/workspace/a.py"), "1")
+            backend.write(VirtualPath("/workspace/b.py"), "2")
+            result = backend.ls(VirtualPath("/workspace"))
         paths = [fi.path for fi in result.entries]
-        assert "/a.py" in paths
-        assert "/b.py" in paths
+        assert "/workspace/a.py" in paths
+        assert "/workspace/b.py" in paths
 
     def test_ls_with_subdir(self):
         backend = StateBackend()
         with _simulate_graph(backend):
-            backend.write("/sub/file.txt", "hello")
-            result = backend.ls("/")
+            backend.write(VirtualPath("/workspace/sub/file.txt"), "hello")
+            result = backend.ls(VirtualPath("/workspace"))
         dirs = [fi for fi in result.entries if fi.is_dir]
-        assert any("/sub/" in d.path for d in dirs)
+        assert any(d.path == "/workspace/sub/" for d in dirs)
 
     def test_ls_empty(self):
         backend = StateBackend()
         with _simulate_graph(backend):
-            result = backend.ls("/")
+            result = backend.ls(VirtualPath("/workspace"))
         assert result.entries is not None
         assert len(result.entries) == 0
 
@@ -398,26 +399,26 @@ class TestStateBackendGrep:
     def test_grep_finds(self):
         backend = StateBackend()
         with _simulate_graph(backend):
-            backend.write("/a.py", "def foo(): pass")
-            backend.write("/b.py", "def bar(): pass")
-            r = backend.grep("foo", path="/")
+            backend.write(VirtualPath("/workspace/a.py"), "def foo(): pass")
+            backend.write(VirtualPath("/workspace/b.py"), "def bar(): pass")
+            r = backend.grep("foo", path=VirtualPath("/workspace"))
         assert any("foo" in m.text for m in (r.matches or []))
 
     def test_grep_skips_binary(self):
         backend = StateBackend()
         with _simulate_graph(backend):
-            backend.write("/img.png", "foo-visible")
-            backend.write("/txt.txt", "foo-hidden")
-            r = backend.grep("foo", path="/")
+            backend.write(VirtualPath("/workspace/img.png"), "foo-visible")
+            backend.write(VirtualPath("/workspace/txt.txt"), "foo-hidden")
+            r = backend.grep("foo", path=VirtualPath("/workspace"))
         paths = [m.path for m in (r.matches or [])]
-        assert "/txt.txt" in paths
-        assert "/img.png" not in paths  # binary files skipped
+        assert "/workspace/txt.txt" in paths
+        assert "/workspace/img.png" not in paths  # binary files skipped
 
     def test_grep_no_match(self):
         backend = StateBackend()
         with _simulate_graph(backend):
-            backend.write("/f.txt", "hello")
-            r = backend.grep("zzz", path="/")
+            backend.write(VirtualPath("/workspace/f.txt"), "hello")
+            r = backend.grep("zzz", path=VirtualPath("/workspace"))
         assert len(r.matches or []) == 0
 
 
@@ -430,25 +431,25 @@ class TestStateBackendGlob:
     def test_glob_finds(self):
         backend = StateBackend()
         with _simulate_graph(backend):
-            backend.write("/src/main.py", "1")
-            backend.write("/src/util.py", "2")
-            backend.write("/README.md", "3")
-            r = backend.glob("**/*.py", path="/src")
+            backend.write(VirtualPath("/workspace/src/main.py"), "1")
+            backend.write(VirtualPath("/workspace/src/util.py"), "2")
+            backend.write(VirtualPath("/workspace/README.md"), "3")
+            r = backend.glob("**/*.py", path=VirtualPath("/workspace/src"))
         paths = [fi.path for fi in (r.matches or [])]
         assert len(paths) == 2
-        assert "/src/main.py" in paths
+        assert "/workspace/src/main.py" in paths
 
     def test_glob_no_match(self):
         backend = StateBackend()
         with _simulate_graph(backend):
-            r = backend.glob("*.py", path="/")
+            r = backend.glob("*.py", path=VirtualPath("/workspace"))
         assert len(r.matches or []) == 0
 
     def test_glob_size_is_content_length(self):
         backend = StateBackend()
         with _simulate_graph(backend):
-            backend.write("/f.txt", "hello")  # 5 chars
-            r = backend.glob("/f.txt", path="/")
+            backend.write(VirtualPath("/workspace/f.txt"), "hello")  # 5 chars
+            r = backend.glob("/workspace/f.txt", path=VirtualPath("/workspace"))
         assert r.matches[0].size == 5
 
 
@@ -463,19 +464,19 @@ class TestStateBackendUploadDownload:
     def test_upload_text_in_graph(self):
         backend = StateBackend()
         with _simulate_graph(backend):
-            results = backend.upload_files([("/upload.txt", b"hello world")])
+            results = backend.upload_files([(VirtualPath("/workspace/upload.txt"), b"hello world")])
             assert results[0].error is None
             files = backend._read_files()
-        assert files["/upload.txt"]["content"] == "hello world"
-        assert files["/upload.txt"]["encoding"] == "utf-8"
+        assert files["/workspace/upload.txt"]["content"] == "hello world"
+        assert files["/workspace/upload.txt"]["encoding"] == "utf-8"
 
     def test_upload_binary_in_graph(self):
         backend = StateBackend()
         raw = _binary_content(100)
         with _simulate_graph(backend):
-            results = backend.upload_files([("/data.bin", raw)])
+            results = backend.upload_files([(VirtualPath("/workspace/data.bin"), raw)])
             assert results[0].error is None
-            fd = backend._read_files()["/data.bin"]
+            fd = backend._read_files()["/workspace/data.bin"]
         assert fd["encoding"] == "base64"
         decoded = base64.b64decode(fd["content"])
         assert decoded == raw
@@ -483,34 +484,34 @@ class TestStateBackendUploadDownload:
     def test_download_text_in_graph(self):
         backend = StateBackend()
         with _simulate_graph(backend):
-            backend.write("/dl.txt", "download me")
-            results = backend.download_files(["/dl.txt"])
+            backend.write(VirtualPath("/workspace/dl.txt"), "download me")
+            results = backend.download_files([VirtualPath("/workspace/dl.txt")])
         assert results[0].content == b"download me"
 
     def test_download_binary_in_graph(self):
         backend = StateBackend()
         raw = _binary_content(100)
         with _simulate_graph(backend):
-            backend.upload_files([("/bin.bin", raw)])
-            results = backend.download_files(["/bin.bin"])
+            backend.upload_files([(VirtualPath("/workspace/bin.bin"), raw)])
+            results = backend.download_files([VirtualPath("/workspace/bin.bin")])
         assert results[0].content == raw
 
     def test_download_not_found_in_graph(self):
         backend = StateBackend()
         with _simulate_graph(backend):
-            results = backend.download_files(["/no.txt"])
+            results = backend.download_files([VirtualPath("/workspace/no.txt")])
         assert results[0].error == "file_not_found"
 
     def test_upload_multiple_in_graph(self):
         backend = StateBackend()
         with _simulate_graph(backend):
             results = backend.upload_files([
-                ("/a.txt", b"alpha"),
-                ("/b.txt", b"beta"),
+                (VirtualPath("/workspace/a.txt"), b"alpha"),
+                (VirtualPath("/workspace/b.txt"), b"beta"),
             ])
             assert all(r.error is None for r in results)
             files = backend._read_files()
-        assert set(files.keys()) == {"/a.txt", "/b.txt"}
+        assert set(files.keys()) == {"/workspace/a.txt", "/workspace/b.txt"}
 
     # ---- Graph-outside upload/download (explicit thread_id required) ----
 
@@ -518,46 +519,46 @@ class TestStateBackendUploadDownload:
         """Outside graph, upload_files() with no thread_id must raise ValueError."""
         backend = StateBackend()
         with pytest.raises(ValueError, match="thread_id is required"):
-            backend.upload_files([("/f.txt", b"data")])
+            backend.upload_files([(VirtualPath("/workspace/f.txt"), b"data")])
 
     def test_download_outside_graph_requires_thread_id(self):
         """Outside graph, download_files() with no thread_id must raise ValueError."""
         backend = StateBackend()
         with pytest.raises(ValueError, match="thread_id is required"):
-            backend.download_files(["/f.txt"])
+            backend.download_files([VirtualPath("/workspace/f.txt")])
 
     def test_upload_outside_graph_pending(self):
         """Graph-outside upload queues to per-thread pending buffer."""
         backend = StateBackend()
-        backend.upload_files([("/pending.txt", b"queued")], thread_id="t1")
+        backend.upload_files([(VirtualPath("/workspace/pending.txt"), b"queued")], thread_id="t1")
         # Not yet in snapshot
-        assert "/pending.txt" not in _files_snapshot(backend, "t1")
+        assert "/workspace/pending.txt" not in _files_snapshot(backend, "t1")
         # But visible via download_files (merges snapshot + pending)
-        results = backend.download_files(["/pending.txt"], thread_id="t1")
+        results = backend.download_files([VirtualPath("/workspace/pending.txt")], thread_id="t1")
         assert results[0].content == b"queued"
 
     def test_pending_flushed_on_graph_entry(self):
         """Graph-outside uploads are flushed on first _read_files for that thread."""
         backend = StateBackend()
-        backend.upload_files([("/flush.txt", b"flush-me")], thread_id="t1")
+        backend.upload_files([(VirtualPath("/workspace/flush.txt"), b"flush-me")], thread_id="t1")
         with _simulate_graph(backend, thread_id="t1"):
             files = backend._read_files()
-        assert files["/flush.txt"]["content"] == "flush-me"
+        assert files["/workspace/flush.txt"]["content"] == "flush-me"
 
     def test_download_outside_graph_reads_snapshot(self):
         """Outside graph, download reads from last-synced snapshot + pending."""
         backend = StateBackend()
         # Simulate a previous graph run that wrote a file
         with _simulate_graph(backend, thread_id="sess"):
-            backend.write("/output.txt", "finished")
+            backend.write(VirtualPath("/workspace/output.txt"), "finished")
         # Now outside graph
-        results = backend.download_files(["/output.txt"], thread_id="sess")
+        results = backend.download_files([VirtualPath("/workspace/output.txt")], thread_id="sess")
         assert results[0].content == b"finished"
 
     def test_download_outside_graph_nonexistent_thread(self):
         """Downloading from a never-seen thread returns empty results."""
         backend = StateBackend()
-        results = backend.download_files(["/a.txt"], thread_id="unknown")
+        results = backend.download_files([VirtualPath("/workspace/a.txt")], thread_id="unknown")
         assert results[0].error == "file_not_found"
 
 
@@ -571,57 +572,57 @@ class TestStateBackendIsolation:
         """Files written in thread A must NOT leak into thread B."""
         backend = StateBackend()
         with _simulate_graph(backend, thread_id="A"):
-            backend.write("/secret.txt", "A-only")
+            backend.write(VirtualPath("/workspace/secret.txt"), "A-only")
         with _simulate_graph(backend, thread_id="B"):
             files = backend._read_files()
-        assert "/secret.txt" not in files
+        assert "/workspace/secret.txt" not in files
 
     def test_separate_threads_independent_snapshots(self):
         """Each thread has its own independent file space."""
         backend = StateBackend()
         with _simulate_graph(backend, thread_id="A"):
-            backend.write("/a.txt", "a")
+            backend.write(VirtualPath("/workspace/a.txt"), "a")
         with _simulate_graph(backend, thread_id="B"):
-            backend.write("/b.txt", "b")
-        assert "/a.txt" in _files_snapshot(backend, "A")
-        assert "/b.txt" in _files_snapshot(backend, "B")
-        assert "/a.txt" not in _files_snapshot(backend, "B")
-        assert "/b.txt" not in _files_snapshot(backend, "A")
+            backend.write(VirtualPath("/workspace/b.txt"), "b")
+        assert "/workspace/a.txt" in _files_snapshot(backend, "A")
+        assert "/workspace/b.txt" in _files_snapshot(backend, "B")
+        assert "/workspace/a.txt" not in _files_snapshot(backend, "B")
+        assert "/workspace/b.txt" not in _files_snapshot(backend, "A")
 
     def test_initial_files_per_new_thread(self):
         """Each new thread receives initial_files on first access."""
-        backend = StateBackend(initial_files={"/init.txt": "template"})
+        backend = StateBackend(initial_files={"/workspace/init.txt": "template"})
         with _simulate_graph(backend, thread_id="t1"):
-            assert "/init.txt" in backend._read_files()
+            assert "/workspace/init.txt" in backend._read_files()
         with _simulate_graph(backend, thread_id="t2"):
-            assert "/init.txt" in backend._read_files()
+            assert "/workspace/init.txt" in backend._read_files()
 
     def test_pending_per_thread_isolated(self):
         """Pending uploads are per-thread — thread A's pending doesn't leak to thread B."""
         backend = StateBackend()
-        backend.upload_files([("/a.txt", b"a")], thread_id="A")
-        backend.upload_files([("/b.txt", b"b")], thread_id="B")
+        backend.upload_files([(VirtualPath("/workspace/a.txt"), b"a")], thread_id="A")
+        backend.upload_files([(VirtualPath("/workspace/b.txt"), b"b")], thread_id="B")
         with _simulate_graph(backend, thread_id="A"):
             files = backend._read_files()
-        assert "/a.txt" in files
-        assert "/b.txt" not in files  # B's pending not flushed to A
+        assert "/workspace/a.txt" in files
+        assert "/workspace/b.txt" not in files  # B's pending not flushed to A
 
     def test_full_replace_on_reread_removes_deleted_files(self):
         """Simulates checkpoint rollback: re-read replaces, not merges."""
         backend = StateBackend()
         with _simulate_graph(backend):
-            backend.write("/keep.txt", "keep")
-            backend.write("/gone.txt", "gone")
+            backend.write(VirtualPath("/workspace/keep.txt"), "keep")
+            backend.write(VirtualPath("/workspace/gone.txt"), "gone")
             # Simulate that /gone.txt was deleted from the channel
             # (in the mock, we manually remove it from the snapshot)
             with backend._lock:
                 backend._snapshots["test"] = {
-                    "/keep.txt": {"content": "keep", "encoding": "utf-8"}
+                    "/workspace/keep.txt": {"content": "keep", "encoding": "utf-8"}
                 }
             # _read_files should full-replace, not merge
             files = backend._read_files()
-        assert "/keep.txt" in files
-        assert "/gone.txt" not in files  # deleted file NOT resurrected
+        assert "/workspace/keep.txt" in files
+        assert "/workspace/gone.txt" not in files  # deleted file NOT resurrected
 
 
 # ============================================================================
@@ -637,7 +638,7 @@ class TestStateBackendConcurrency:
 
         def writer(i: int):
             with _simulate_graph(backend, thread_id=f"t{i}"):
-                backend.write(f"/file_{i}.txt", f"content_{i}")
+                backend.write(VirtualPath(f"/workspace/file_{i}.txt"), f"content_{i}")
 
         with ThreadPoolExecutor(max_workers=8) as pool:
             futures = [pool.submit(writer, i) for i in range(num_writers)]
@@ -646,26 +647,26 @@ class TestStateBackendConcurrency:
 
         for i in range(num_writers):
             snap = _files_snapshot(backend, f"t{i}")
-            assert f"/file_{i}.txt" in snap
-            assert snap[f"/file_{i}.txt"]["content"] == f"content_{i}"
+            assert f"/workspace/file_{i}.txt" in snap
+            assert snap[f"/workspace/file_{i}.txt"]["content"] == f"content_{i}"
 
     def test_concurrent_read_write_no_race(self):
         """FIX 2: Readers and writers interleaved — no corruption."""
         backend = StateBackend()
         with _simulate_graph(backend):
-            backend.write("/shared.txt", "initial\n" * 10)
+            backend.write(VirtualPath("/workspace/shared.txt"), "initial\n" * 10)
 
         def reader():
             for _ in range(100):
                 with _simulate_graph(backend):
-                    r = backend.read("/shared.txt")
+                    r = backend.read(VirtualPath("/workspace/shared.txt"))
                     if r.content:
                         assert "initial" in r.content
 
         def writer():
             for i in range(100):
                 with _simulate_graph(backend):
-                    backend.write(f"/w_{i}.txt", f"hello_{i}", overwrite=True)
+                    backend.write(VirtualPath(f"/workspace/w_{i}.txt"), f"hello_{i}", overwrite=True)
 
         with ThreadPoolExecutor(max_workers=6) as pool:
             futures = []
@@ -683,7 +684,7 @@ class TestStateBackendConcurrency:
 
         def uploader(start: int):
             batch = [
-                (f"/u_{j}.txt", f"val_{j}".encode())
+                (VirtualPath(f"/workspace/u_{j}.txt"), f"val_{j}".encode())
                 for j in range(start, start + 10)
             ]
             return backend.upload_files(batch, thread_id="shared")
@@ -698,7 +699,7 @@ class TestStateBackendConcurrency:
             pending = backend._pending_uploads.get("shared", {})
         assert len(pending) == num
         for i in range(num):
-            assert pending[f"/u_{i}.txt"]["content"] == f"val_{i}"
+            assert pending[f"/workspace/u_{i}.txt"]["content"] == f"val_{i}"
 
 
 # ============================================================================
@@ -717,9 +718,9 @@ class TestStateBackendTools:
     def test_tree_is_str(self):
         backend = StateBackend()
         with _simulate_graph(backend):
-            backend.write("/a.txt", "a")
-            backend.write("/sub/b.txt", "b")
-            result = backend.tree("/", depth=2)
+            backend.write(VirtualPath("/workspace/a.txt"), "a")
+            backend.write(VirtualPath("/workspace/sub/b.txt"), "b")
+            result = backend.tree(VirtualPath("/workspace"), depth=2)
         assert isinstance(result, str)
         assert len(result) > 0
 
@@ -738,24 +739,24 @@ class TestGraphContextGating:
     def test_send_files_update_outside_graph_raises(self):
         backend = StateBackend()
         with pytest.raises(RuntimeError, match="graph context"):
-            backend._send_files_update({"/f.txt": {"content": "x", "encoding": "utf-8"}})
+            backend._send_files_update({"/workspace/f.txt": {"content": "x", "encoding": "utf-8"}})
 
     def test_write_outside_graph_raises(self):
         backend = StateBackend()
         with pytest.raises(RuntimeError, match="graph context"):
-            backend.write("/f.txt", "data")
+            backend.write(VirtualPath("/workspace/f.txt"), "data")
 
     def test_read_outside_graph_raises(self):
         backend = StateBackend()
         with pytest.raises(RuntimeError, match="graph context"):
-            backend.read("/f.txt")
+            backend.read(VirtualPath("/workspace/f.txt"))
 
     def test_ls_outside_graph_raises(self):
         backend = StateBackend()
         with pytest.raises(RuntimeError, match="graph context"):
-            backend.ls("/")
+            backend.ls(VirtualPath("/workspace"))
 
     def test_edit_outside_graph_raises(self):
         backend = StateBackend()
         with pytest.raises(RuntimeError, match="graph context"):
-            backend.edit("/f.txt", "a", "b")
+            backend.edit(VirtualPath("/workspace/f.txt"), "a", "b")

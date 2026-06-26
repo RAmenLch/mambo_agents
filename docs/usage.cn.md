@@ -637,25 +637,25 @@ from mambo_agents.middleware.subagents import SubAgent
 agent = create_mambo_agent(
     "gpt-4o",
     subagents=[
-        {
-            "name": "researcher",
-            "description": "Research topics thoroughly and return structured findings",
-            "system_prompt": "You are a research specialist...",
-            "model": "gpt-4o",
-            "tools": [search_tool, web_fetch_tool],
-        },
-        {
-            "name": "code-reviewer",
-            "description": "Review code for bugs, security issues, and style",
-            "system_prompt": "You are a senior code reviewer...",
-            "model": "gpt-4o",
-            "tools": [],  # 只读分析，无需工具
-        },
+        SubAgent(
+            name="researcher",
+            description="Research topics thoroughly and return structured findings",
+            system_prompt="You are a research specialist...",
+            model="gpt-4o",
+            tools=[search_tool, web_fetch_tool],
+        ),
+        SubAgent(
+            name="code-reviewer",
+            description="Review code for bugs, security issues, and style",
+            system_prompt="You are a senior code reviewer...",
+            model="gpt-4o",
+            tools=[],  # 只读分析，无需工具
+        ),
     ],
 )
 ```
 
-**子代理规范（SubAgent TypedDict）：**
+**子代理规范（SubAgent Pydantic 模型）：**
 
 | 字段 | 必需 | 说明 |
 |------|:---:|------|
@@ -673,11 +673,11 @@ agent = create_mambo_agent(
 from mambo_agents.middleware.subagents import CompiledSubAgent
 
 # 可以用任意 runnable（需有 'messages' 状态键）
-compiled: CompiledSubAgent = {
-    "name": "custom-processor",
-    "description": "Custom processing pipeline",
-    "runnable": my_custom_graph,
-}
+compiled = CompiledSubAgent(
+    name="custom-processor",
+    description="Custom processing pipeline",
+    runnable=my_custom_graph,
+)
 ```
 
 **事件粒度（EventGranularity）：**
@@ -717,16 +717,18 @@ agent = create_mambo_agent(
 与同步子代理不同，异步子代理在后台线程中运行，`async_task()` 立即返回 `task_id`。
 
 ```python
+from mambo_agents.middleware.subagents import SubAgent
+
 agent = create_mambo_agent(
     "gpt-4o",
     async_subagents=[
-        {
-            "name": "deployer",
-            "description": "Deploy services to Kubernetes",
-            "system_prompt": "You are a deployment expert...",
-            "model": "gpt-4o",
-            "tools": [kubectl_tool, helm_tool],
-        },
+        SubAgent(
+            name="deployer",
+            description="Deploy services to Kubernetes",
+            system_prompt="You are a deployment expert...",
+            model="gpt-4o",
+            tools=[kubectl_tool, helm_tool],
+        ),
     ],
     async_subagent_timeout=1800,  # 30 分钟超时
 )
@@ -832,17 +834,19 @@ agent = create_mambo_agent(
 ### 8.6 技能 + 子代理组合
 
 ```python
+from mambo_agents.middleware.subagents import SubAgent
+
 agent = create_mambo_agent(
     "gpt-4o",
     skills=["/skills/team/"],
     subagents=[
-        {
-            "name": "analyst",
-            "description": "数据分析专家",
-            "system_prompt": "你是数据分析专家...",
-            "model": "gpt-4o",
-            "tools": [pandas_tool],
-        },
+        SubAgent(
+            name="analyst",
+            description="数据分析专家",
+            system_prompt="你是数据分析专家...",
+            model="gpt-4o",
+            tools=[pandas_tool],
+        ),
     ],
     summarization={
         "trigger": ("tokens", 200000),

@@ -72,7 +72,6 @@ from langchain_core.messages import (
     AIMessage,
     AnyMessage,
     HumanMessage,
-    MessageLikeRepresentation,
     get_buffer_string,
 )
 from langchain_core.messages.utils import (
@@ -80,10 +79,11 @@ from langchain_core.messages.utils import (
     count_tokens_approximately,
 )
 from langchain.chat_models import BaseChatModel, init_chat_model
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, Field
 from typing_extensions import NotRequired, TypedDict
 
 from mambo_agents.backends.protocol import BackendProtocol
+from mambo_agents.backends.schemas import VirtualPath
 
 logger = logging.getLogger(__name__)
 
@@ -196,10 +196,9 @@ conversation after summarization — this section is critical for continuing exe
 - The goal is to capture the actionable sub-goal so that execution can continue
   seamlessly after the conversation is compacted.
 
-"""
-"""Inject into the summary prompt when the preserved zone contains no user
-messages.  Trailing double-newline ensures clean formatting when the section
-is omitted (empty string)."""
+"""  # Inject into the summary prompt when the preserved zone contains no user
+  # messages.  Trailing double-newline ensures clean formatting when the section
+  # is omitted (empty string).
 
 
 # ---------------------------------------------------------------------------
@@ -212,9 +211,9 @@ is omitted (empty string)."""
 # CJK text (Chinese / Japanese / Korean) is denser — each character is
 # typically 1–2 tokens in modern subword tokenizers.
 _DEFAULT_EN_CHARS_PER_TOKEN: float = 4.0
+# Conservative estimate for CJK text — most modern tokenizers encode
+# ~1.5–2 CJK characters per token (e.g. o200k_base ≈ 1.8, cl100k ≈ 1.5).
 _DEFAULT_CJK_CHARS_PER_TOKEN: float = 1.8
-"""Conservative estimate for CJK text — most modern tokenizers encode
-~1.5–2 CJK characters per token (e.g. o200k_base ≈ 1.8, cl100k ≈ 1.5)."""
 
 # Unicode blocks treated as "CJK" for ratio estimation.
 _CJK_BLOCKS: list[tuple[int, int]] = [
@@ -231,7 +230,7 @@ _CJK_BLOCKS: list[tuple[int, int]] = [
 _MAX_RATIO_SCAN_CHARS: int = 50_000
 
 
-def _detect_cjk_ratio(messages: Iterable[MessageLikeRepresentation]) -> float:
+def _detect_cjk_ratio(messages: Iterable) -> float:
     """Estimate what fraction of the message content is CJK.
 
     Scans the first ``_MAX_RATIO_SCAN_CHARS`` characters across all messages
@@ -304,7 +303,7 @@ def _build_default_token_counter(
             use_usage_metadata_scaling=True,
         )
 
-    def _auto(token_iterable: Iterable[MessageLikeRepresentation]) -> int:
+    def _auto(token_iterable) -> int:
         messages = list(token_iterable)
         cjk_ratio = _detect_cjk_ratio(messages)
         effective_cpt = (
@@ -395,122 +394,64 @@ class SummarizationState(AgentState):
 
 
 # ---------------------------------------------------------------------------
-# Configuration TypedDict
+# Configuration Pydantic model
 # ---------------------------------------------------------------------------
 
 
-class SummarizationConfig(TypedDict, total=False):
+class SummarizationConfig(BaseModel):
     """Configuration for ``MamboSummarizationMiddleware`` via ``create_mambo_agent``.
 
-    All fields are optional — sensible defaults are applied when omitted.
-
-    Attributes:
-        model: Model to use for generating summaries.
-
-            - ``None`` (default): reuse the main agent's model.
-            - ``str``: model identifier (e.g. ``"gpt-4o-mini"``).
-            - ``BaseChatModel``: pre-resolved model instance.
-
-        trigger: One or more thresholds that trigger summarization.
-
-            Uses ``ContextSize`` tuples: ``("fraction", 0.85)``,
-            ``("tokens", 100000)``, or ``("messages", 50)``.
-
-            Pass a list to trigger when **any** condition is met.
-
-            Default: ``None`` — summarization is always checked
-            against the ``keep`` budget.  Set explicitly to control
-            when compaction begins.
-
-        keep: How many messages (or tokens/fraction) to preserve after
-            summarization.
-
-            Default: ``("messages", 20)``.
-
-        summary_prompt: Prompt template for generating summaries.
-            Must contain a ``{messages}`` placeholder.
-            Default: ``DEFAULT_MAMBO_SUMMARY_PROMPT``.
-
-        trim_tokens_to_summarize: Max tokens to feed into the summarization
-            LLM call.
-
-            Default: ``4000``.  Pass ``None`` to skip trimming.
-
-        token_counter: Custom token-counting function.
-            Default: auto-built via ``_build_default_token_counter``
-            with CJK-aware auto-detection.
-
-        chars_per_token: Characters-per-token ratio for approximate token
-            counting.  Lower values = more tokens per character (conservative).
-
-            - ``None`` (default): auto-detect from conversation content —
-              blends ``_DEFAULT_EN_CHARS_PER_TOKEN`` (4.0) for Latin text
-              and ``_DEFAULT_CJK_CHARS_PER_TOKEN`` (1.8) for CJK text
-              based on the actual character ratio in the message history.
-            - ``float``: use exactly this ratio, e.g. ``1.5`` for
-              a Chinese-only conversation.
-
-            Ignored when ``token_counter`` is explicitly provided.
-
-        backend: Optional ``BackendProtocol`` for persisting evicted messages
-            before they are replaced by the summary.  When provided, each
-            summarization event appends the evicted messages to:
-
-                ``/conversation_history/{thread_id}.md``
-
-            on the backend, creating a running log of all evicted messages.
-
-            ``create_mambo_agent`` automatically passes the outer ``backend``
-            when summarization is configured, so you usually don't need to
-            set this explicitly.  Set it here only to override the backend
-            used for offloading.
-
-        summary_hooks: Optional list of :class:`SummaryHook` callables.
-            Each is invoked when summarization occurs and its return value
-            (if not ``None``) is appended below the AI-generated summary.
-            ``create_mambo_agent`` automatically adds the
-            ``MamboPlanMiddleware`` hook when both summarization and
-            Plan middleware are active.
+    All fields are optional with sensible defaults.
+    Callable fields (``token_counter``, ``summary_hooks``) require
+    ``arbitrary_types_allowed=True`` since Pydantic cannot serialize callables.
     """
 
-    model: str | BaseChatModel | None
-    trigger: ContextSize | list[ContextSize] | None
-    keep: ContextSize
-    summary_prompt: str
-    chained_summary_prompt: NotRequired[str]
-    """Prompt template for chained summarization (when prior summaries exist).
+    model_config = ConfigDict(frozen=True, arbitrary_types_allowed=True)
 
-    Must contain ``{previous_summaries}`` and ``{messages}`` placeholders.
-    Default: ``DEFAULT_MAMBO_CHAINED_SUMMARY_PROMPT``.
-    """
-    trim_tokens_to_summarize: int | None
-    token_counter: TokenCounter
-    chars_per_token: float | None
-    offload_to_backend: NotRequired[bool]
-    """Enable persisting evicted messages to the backend.
-
-    - ``True``: evicted messages are persisted to
-      ``/conversation_history/{thread_id}.md`` before summarization.
-      **Requires** ``backend`` to be set — raises ``ValueError`` otherwise.
-    - ``False`` (default): evicted messages are **permanently lost**.
-      Summarization still proceeds normally; no backend is needed.
-    """
-    backend: NotRequired[BackendProtocol]
-    """Optional backend for persisting evicted messages.
-
-    When provided (or when ``create_mambo_agent`` auto-injects it),
-    messages that are about to be summarized away are first persisted
-    to ``/conversation_history/{thread_id}.md`` on this backend.
-    Offload failure is non-fatal — summarization still proceeds but
-    a warning is logged.
-    """
-    summary_hooks: NotRequired[list[SummaryHook]]
-    """Optional hooks that append supplementary state to the summary message.
-
-    Each hook receives a :class:`SummaryHookContext` and returns either
-    a ``str`` to inject or ``None`` to skip.  Typical use: inject the
-    current todo list so task progress is not lost after compaction.
-    """
+    model: str | BaseChatModel | None = Field(
+        default=None,
+        description="Model to use for generating summaries. None = reuse main agent model.",
+    )
+    trigger: ContextSize | list[ContextSize] | None = Field(
+        default=None,
+        description="Threshold(s) that trigger summarization.",
+    )
+    keep: ContextSize = Field(
+        default=("messages", 20),
+        description="How many messages to retain after summarization.",
+    )
+    summary_prompt: str = Field(
+        default=DEFAULT_MAMBO_SUMMARY_PROMPT,
+        description="Prompt template with {messages} placeholder.",
+    )
+    chained_summary_prompt: str | None = Field(
+        default=None,
+        description="Prompt template for chained summarization. None = use default.",
+    )
+    trim_tokens_to_summarize: int | None = Field(
+        default=4000,
+        description="Max tokens fed to the summarization LLM call.",
+    )
+    token_counter: TokenCounter | None = Field(
+        default=None,
+        description="Custom token-counting function. None = CJK-aware auto-detect.",
+    )
+    chars_per_token: float | None = Field(
+        default=None,
+        description="Characters-per-token ratio. None = auto-detect from content.",
+    )
+    offload_to_backend: bool = Field(
+        default=False,
+        description="Enable persisting evicted messages to the backend.",
+    )
+    backend: BackendProtocol | None = Field(
+        default=None,
+        description="Backend for offloading evicted messages. None = reuse main backend.",
+    )
+    summary_hooks: list[SummaryHook] | None = Field(
+        default=None,
+        description="Optional hooks that append supplementary state to the summary.",
+    )
 
 
 class MamboSummarizationMiddleware(AgentMiddleware[SummarizationState, ContextT, ResponseT]):
@@ -724,7 +665,7 @@ class MamboSummarizationMiddleware(AgentMiddleware[SummarizationState, ContextT,
         logger.debug("No thread_id found, using generated session ID: %s", generated_id)
         return generated_id
 
-    def _get_history_path(self, runtime: Any = None) -> str:
+    def _get_history_path(self, runtime: Any = None) -> VirtualPath:
         """Generate path for storing conversation history.
 
         Returns a single file per thread that gets appended to over time.
@@ -733,10 +674,10 @@ class MamboSummarizationMiddleware(AgentMiddleware[SummarizationState, ContextT,
             runtime: Optional ``Runtime`` for extracting ``thread_id``.
 
         Returns:
-            Path string like ``'/conversation_history/{thread_id}.md'``.
+            VirtualPath like ``'/conversation_history/{thread_id}.md'``.
         """
         thread_id = self._get_thread_id(runtime)
-        return f"{self._history_path_prefix}/{thread_id}.md"
+        return VirtualPath(f"{self._history_path_prefix}/{thread_id}.md")
 
     def _offload_to_backend(
         self,
@@ -1266,9 +1207,7 @@ class MamboSummarizationMiddleware(AgentMiddleware[SummarizationState, ContextT,
         the cutoff is moved back by one to avoid splitting user context
         mid-message.
 
-        Unlike the previous implementation, this no longer forcibly
-        moves the cutoff to include the most recent user message.
-        Instead, when the preserved zone contains no user messages,
+        When the preserved zone contains no user messages,
         ``_LATEST_USER_INTENT_SECTION`` is injected into the summary
         prompt so the LLM extracts the current sub-task intent.
 

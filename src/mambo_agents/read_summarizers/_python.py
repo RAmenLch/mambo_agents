@@ -6,6 +6,7 @@ import ast
 from pathlib import PurePosixPath
 
 from mambo_agents.backends.protocol import ReadSummarizer
+from mambo_agents.backends.schemas import VirtualPath
 
 _LINE_LIMIT = 200
 
@@ -18,8 +19,8 @@ def python_summarizer() -> ReadSummarizer:
     generic behaviour (prompt to re-read with offset + limit).
     """
 
-    def _summarize(file_path: str, content: str, max_chars: int) -> str:
-        suffix = PurePosixPath(file_path).suffix.lower()
+    def _summarize(file_path: VirtualPath, content: str, max_chars: int) -> str:
+        suffix = PurePosixPath(file_path.value).suffix.lower()
         if suffix != ".py":
             return _fallback(file_path, content, max_chars)
         return _summarize_python(file_path, content, max_chars)
@@ -32,7 +33,7 @@ def python_summarizer() -> ReadSummarizer:
 # ---------------------------------------------------------------------------
 
 
-def _fallback(file_path: str, content: str, max_chars: int) -> str:
+def _fallback(file_path: VirtualPath, content: str, max_chars: int) -> str:
     total_lines = content.count("\n") + 1
     return (
         f"[返回结果过大（{len(content):,} 字符，{total_lines:,} 行），"
@@ -42,7 +43,7 @@ def _fallback(file_path: str, content: str, max_chars: int) -> str:
     )
 
 
-def _summarize_python(file_path: str, content: str, max_chars: int) -> str:
+def _summarize_python(file_path: VirtualPath, content: str, max_chars: int) -> str:
     total_lines = content.count("\n") + 1
     try:
         tree = ast.parse(content)

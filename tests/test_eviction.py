@@ -9,6 +9,7 @@ from langchain_core.messages import ToolMessage
 from langgraph.prebuilt.tool_node import ToolCallRequest
 
 from mambo_agents.backends.state import StateBackend
+from mambo_agents.backends.schemas import VirtualPath
 from tests.test_state_backend import _simulate_graph
 from mambo_agents.middleware.backend_tools import (
     BackendToolsMiddleware,
@@ -155,7 +156,7 @@ class TestEviction:
         # Read back from backend
         sane_id = _sanitize_tool_call_id("call_003")
         with _simulate_graph(mw.backend):
-            read_result = mw.backend.read(f"{_EVICTION_PREFIX}/{sane_id}")
+            read_result = mw.backend.read(VirtualPath(f"{_EVICTION_PREFIX}/{sane_id}"))
         assert read_result.error is None
         assert "HELLO_EVICTED_CONTENT" in (read_result.content or "")
 
@@ -297,7 +298,7 @@ class TestEviction:
             mw._maybe_evict(result2, req2)
 
         with _simulate_graph(mw.backend):
-            read = mw.backend.read(file_path)
+            read = mw.backend.read(VirtualPath(file_path))
         assert "SECOND_CONTENT" in (read.content or "")
         assert "FIRST_CONTENT" not in (read.content or "")
 
@@ -309,7 +310,7 @@ class TestEviction:
         class FailWriteBackend(StateBackend):
             def write(self, file_path: str, content: str):
                 from mambo_agents.backends.protocol import WriteResult
-                return WriteResult(error="Disk full", path=file_path)
+                return WriteResult(error="Disk full", path=str(file_path))
 
         mw.backend = FailWriteBackend()
 
@@ -363,7 +364,7 @@ class TestEvictionAsync:
 
         sane_id = _sanitize_tool_call_id("call_async_03")
         with _simulate_graph(mw.backend):
-            read_result = await mw.backend.aread(f"{_EVICTION_PREFIX}/{sane_id}")
+            read_result = await mw.backend.aread(VirtualPath(f"{_EVICTION_PREFIX}/{sane_id}"))
         assert read_result.error is None
         assert "ASYNC_CONTENT" in (read_result.content or "")
 

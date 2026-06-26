@@ -297,7 +297,7 @@ def _handle_subagent_event(data: dict) -> None:
 # ---------------------------------------------------------------------------
 
 def _parse_subagent(raw: str) -> SubAgent | None:
-    """Parse 'name:description:system_prompt' into a SubAgent dict.
+    """Parse 'name:description:system_prompt' into a SubAgent.
 
     Returns None if the format is invalid.
     """

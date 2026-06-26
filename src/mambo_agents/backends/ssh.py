@@ -47,10 +47,10 @@ from mambo_agents.backends.utils import (
     TreeEntry,
     check_path_allowed,
     format_tree_entries,
+    format_validation_error,
     format_with_line_numbers,
-    human_size,
-    validate_canonical_path,
 )
+from mambo_agents.backends.schemas import human_size,VirtualPath
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -106,6 +106,9 @@ class SshBackend(BackendProtocol):
             an ``/(ignore)`` marker but its content is not expanded.
     """
 
+    # Default per-tool timeout values specific to this backend (overridable via __init__).
+    _BACKEND_DEFAULT_TIMEOUTS = ToolTimeouts(tree=60.0, delete=30.0, execute=180.0)
+
     def __init__(
         self,
         host: str,
@@ -115,7 +118,7 @@ class SshBackend(BackendProtocol):
         password: str | None = None,
         key_filename: str | None = None,
         remote_root: str = "~",
-        workspace_root: str = "/workspace",
+        workspace_root: VirtualPath = VirtualPath("/workspace"),
         connect_timeout: int = _DEFAULT_SSH_CONNECT_TIMEOUT,
         execute_timeout: int = _DEFAULT_EXECUTE_TIMEOUT,
         max_output_bytes: int = _MAX_OUTPUT_BYTES,
@@ -128,11 +131,14 @@ class SshBackend(BackendProtocol):
         summarizer: "ReadSummarizer | None" = None,
         tool_timeouts: ToolTimeouts | None = None,
     ) -> None:
+        # Merge backend-specific timeout defaults with user overrides.
+        _user = tool_timeouts.model_dump() if tool_timeouts else {}
+        _merged = ToolTimeouts(**{**self._BACKEND_DEFAULT_TIMEOUTS.model_dump(), **_user})
         super().__init__(
             max_read_chars=max_read_chars,
             max_grep_matches=max_grep_matches,
             summarizer=summarizer,
-            tool_timeouts=tool_timeouts,
+            tool_timeouts=_merged,
         )
         if password is None and key_filename is None:
             raise ValueError(
@@ -145,7 +151,7 @@ class SshBackend(BackendProtocol):
                 "Provide at most one of them."
             )
 
-        self.workspace_root = validate_canonical_path(workspace_root, "workspace_root")
+        self.workspace_root = VirtualPath(workspace_root)
         self._host = host
         self._username = username
         self._port = port
@@ -201,8 +207,30 @@ class SshBackend(BackendProtocol):
             home = stdout.read().decode().strip()
             # Replace the leading ~ with $HOME
             remote_root = home + remote_root[1:]
-        # Normalise: strip trailing slash (except "/")
-        self._remote_root = remote_root.rstrip("/") or "/"
+
+        # Normalise: strip trailing slashes (both / and \ for Windows remotes)
+        remote_root = remote_root.rstrip("/").rstrip("\\")
+
+        # Validate: remote_root must be non-empty and MUST exist on the remote
+        if not remote_root:
+            raise ValueError(
+                f"remote_root '{self._raw_remote_root}' resolved to an empty path. "
+                f"Please provide a valid absolute path on the remote host."
+            )
+        try:
+            _ = self._sftp.stat(remote_root)
+        except FileNotFoundError:
+            raise ValueError(
+                f"remote_root '{remote_root}' does not exist on the remote host "
+                f"({self._host}). Please create it first or use an existing directory."
+            )
+        except PermissionError as e:
+            raise PermissionError(
+                f"remote_root '{remote_root}' is not accessible on the remote host "
+                f"({self._host}): {e}"
+            )
+
+        self._remote_root = remote_root
 
         # Detect whether python3 is available (needed by edit())
         self._has_python3 = False
@@ -243,28 +271,28 @@ class SshBackend(BackendProtocol):
     # Path resolution
     # ------------------------------------------------------------------
 
-    def _resolve(self, path: str) -> str:
+    def _resolve(self, path: VirtualPath) -> str:
         """Map a virtual absolute path to a remote filesystem path.
 
         Validates that *path* is under :attr:`workspace_root` and strips
         the prefix before resolving against *remote_root*.  Raises
         :class:`WorkspacePathError` for paths outside the workspace.
 
-        Virtual paths use POSIX separators and the workspace root as
-        the anchor for all file operations.
+        VirtualPath already validates on construction (no ``..``, no
+        ``//``, absolute, non-empty), so no additional traversal checks
+        are needed here.
         """
-        pp = PurePosixPath(path)
-        path_str = str(pp)
-        wr = self.workspace_root
+        v = path.value
+        wr = self.workspace_root.value
 
         # Must start with workspace root
-        if path_str != wr and not path_str.startswith(wr + "/"):
+        if v != wr and not v.startswith(wr + "/"):
             raise WorkspacePathError(
                 f"Path '{path}' is outside the workspace. "
                 f"All file paths must be under '{wr}'."
             )
 
-        rel = path_str[len(wr):].lstrip("/")
+        rel = v[len(wr):].lstrip("/")
         if not rel:
             return self._remote_root
 
@@ -343,7 +371,7 @@ class SshBackend(BackendProtocol):
 
     @property
     def tools(self) -> list[StructuredTool]:
-        wr = self.workspace_root
+        wr = self.workspace_root.value
         tools: list[StructuredTool] = [
             StructuredTool(
                 name="tree",
@@ -353,11 +381,12 @@ class SshBackend(BackendProtocol):
                 ),
                 args_schema=create_model(
                     "TreeSchema",
-                    path=(str, Field(default=wr, description="Root directory to display")),
+                    path=(VirtualPath, Field(default=VirtualPath(wr), description="Root directory to display")),
                     depth=(int, Field(default=3, description="Maximum recursion depth")),
                 ),
                 func=self._safe_tool_func("tree", self.tree),
                 coroutine=self._safe_tool_coroutine("tree", self.atree),
+                handle_validation_error=format_validation_error,
             ),
             StructuredTool(
                 name="delete",
@@ -368,10 +397,11 @@ class SshBackend(BackendProtocol):
                 ),
                 args_schema=create_model(
                     "DeleteSchema",
-                    path=(str, Field(description="Absolute file path to delete")),
+                    path=(VirtualPath, Field(description="Absolute file path to delete")),
                 ),
                 func=self._safe_tool_func("delete", self.delete),
                 coroutine=self._safe_tool_coroutine("delete", self.adelete),
+                handle_validation_error=format_validation_error,
             ),
         ]
 
@@ -407,7 +437,7 @@ class SshBackend(BackendProtocol):
 
     @property
     def description(self) -> str:
-        wr = self.workspace_root
+        wr = self.workspace_root.value
         py3_note = (
             "" if self._has_python3
             else (
@@ -435,7 +465,7 @@ class SshBackend(BackendProtocol):
             f"{py3_note}"
         )
 
-    def ls(self, path: str) -> LsResult:
+    def ls(self, path: VirtualPath) -> LsResult:
         """List files and directories under *path* (non-recursive).
 
         Uses SFTP ``listdir_attr`` for structured, locale-independent output.
@@ -489,9 +519,9 @@ class SshBackend(BackendProtocol):
 
     def read_raw(
         self,
-        file_path: str,
+        file_path: VirtualPath,
         offset: int = 0,
-        limit: int = 2000,
+        limit: int | None = 2000,
         include_line_numbers: bool = False,
     ) -> ReadResult:
         try:
@@ -507,8 +537,8 @@ class SshBackend(BackendProtocol):
         except OSError as e:
             return ReadResult(error=f"Error accessing '{file_path}': {e}")
 
-        file_type = _get_file_type(file_path)
-        mime_type = _get_mime_type(file_path)
+        file_type = _get_file_type(file_path.value)
+        mime_type = _get_mime_type(file_path.value)
 
         if file_type != "text":
             try:
@@ -558,7 +588,7 @@ class SshBackend(BackendProtocol):
                 error=f"Line offset {offset} exceeds file length ({total} lines)",
             )
 
-        sliced = lines[offset : offset + limit]
+        sliced = lines[offset : offset + limit] if limit is not None else lines[offset:]
         raw_slice = "".join(sliced)
         content = (
             format_with_line_numbers(raw_slice, start_line=offset + 1)
@@ -581,7 +611,7 @@ class SshBackend(BackendProtocol):
     # ------------------------------------------------------------------
 
     def write(
-        self, file_path: str, content: str, overwrite: bool = False,
+        self, file_path: VirtualPath, content: str, overwrite: bool = False,
     ) -> WriteResult:
         if not self._check_edit_allowed(file_path):
             return WriteResult(
@@ -649,7 +679,7 @@ class SshBackend(BackendProtocol):
 
     def edit(
         self,
-        file_path: str,
+        file_path: VirtualPath,
         old_str: str,
         new_str: str,
         *,
@@ -822,7 +852,7 @@ class SshBackend(BackendProtocol):
     def grep(
         self,
         pattern: str,
-        path: str = "/workspace",
+        path: VirtualPath = VirtualPath("/workspace"),
         glob: str | None = None,
         regex: bool = False,
         offset: int = 0,
@@ -949,7 +979,7 @@ class SshBackend(BackendProtocol):
         remote_repr = repr(remote)
 
         # Convert virtual ignore_dirs → relative names for remote os.walk
-        wr = self.workspace_root
+        wr = self.workspace_root.value
         ignore_names_b64 = base64.b64encode(
             json.dumps([
                 p[len(wr):].lstrip("/").rsplit("/", 1)[-1]
@@ -1080,7 +1110,7 @@ class SshBackend(BackendProtocol):
         """
         # Normalize separators
         physical_path = physical_path.replace("\\", "/")
-        wr = self.workspace_root
+        wr = self.workspace_root.value
         if physical_path.startswith(self._remote_root):
             suffix = physical_path[len(self._remote_root):]
             rel = suffix if suffix.startswith("/") else ("/" + suffix if suffix else "")
@@ -1088,17 +1118,17 @@ class SshBackend(BackendProtocol):
         # If the path doesn't start with remote_root, return as-is
         return physical_path
 
-    def _check_edit_allowed(self, path: str) -> bool:
+    def _check_edit_allowed(self, path: VirtualPath) -> bool:
         """Check whether *path* is allowed for edit/write/delete."""
         whitelist = self._edit_whitelist or None
         blacklist = self._edit_blacklist or None
-        return check_path_allowed(path, whitelist=whitelist, blacklist=blacklist)
+        return check_path_allowed(path.value, whitelist=whitelist, blacklist=blacklist)
 
     # ------------------------------------------------------------------
     # Core: glob
     # ------------------------------------------------------------------
 
-    def glob(self, pattern: str, path: str = "/workspace") -> GlobResult:
+    def glob(self, pattern: str, path: VirtualPath = VirtualPath("/workspace")) -> GlobResult:
         """Find files matching *pattern* under *path*.
 
         Uses remote ``python3`` with ``glob.glob(recursive=True)``
@@ -1273,7 +1303,7 @@ class SshBackend(BackendProtocol):
     # Extra: tree
     # ------------------------------------------------------------------
 
-    def tree(self, path: str = "/workspace", depth: int = 3) -> str:
+    def tree(self, path: VirtualPath = VirtualPath("/workspace"), depth: int = 3) -> str:
         """Render a directory tree.
 
         Uses remote ``python3`` with :func:`os.walk` for portable
@@ -1298,7 +1328,7 @@ class SshBackend(BackendProtocol):
             out, err, exit_code = self._tree_find(remote, depth)
 
         # Map virtual ignore_dirs → relative paths expected in output
-        wr = self.workspace_root
+        wr = self.workspace_root.value
         ignore_rel_paths: frozenset[str] = frozenset(
             p[len(wr):].lstrip("/") for p in self._ignore_dirs
         )
@@ -1489,7 +1519,7 @@ class SshBackend(BackendProtocol):
     # Extra: delete
     # ------------------------------------------------------------------
 
-    def delete(self, path: str) -> str:
+    def delete(self, path: VirtualPath) -> str:
         """Delete a single **file** on the remote server.
 
         Directories are rejected — the agent must remove files inside
@@ -1598,13 +1628,10 @@ class SshBackend(BackendProtocol):
         offset: int = 0,
         limit: int = 2000,
         include_line_numbers: bool = False,
-        *,
-        _apply_max_chars: bool = True,
     ) -> ReadResult:
         async with self._async_lock:
             return await asyncio.to_thread(
                 self.read, file_path, offset, limit, include_line_numbers,
-                _apply_max_chars=_apply_max_chars,
             )
 
     async def awrite(
@@ -1665,7 +1692,7 @@ class SshBackend(BackendProtocol):
 
     def upload_files(
         self,
-        files: list[tuple[str, bytes]],
+        files: list[tuple[VirtualPath, bytes]],
     ) -> list[UploadFileResult]:
         """Upload multiple files as raw bytes to the remote server.
 
@@ -1679,20 +1706,20 @@ class SshBackend(BackendProtocol):
                 self._ensure_remote_dir(str(PurePosixPath(remote).parent))
                 with self._sftp.open(remote, "wb") as f:
                     f.write(raw_content)
-                results.append(UploadFileResult(path=path))
+                results.append(UploadFileResult(path=path.value))
             except OSError as e:
-                results.append(UploadFileResult(path=path, error=str(e)))
+                results.append(UploadFileResult(path=path.value, error=str(e)))
             except Exception as e:
                 results.append(
                     UploadFileResult(
-                        path=path, error=f"{type(e).__name__}: {e}"
+                        path=path.value, error=f"{type(e).__name__}: {e}"
                     )
                 )
         return results
 
     def download_files(
         self,
-        paths: list[str],
+        paths: list[VirtualPath],
     ) -> list[DownloadFileResult]:
         """Download multiple files as raw bytes from the remote server."""
         results: list[DownloadFileResult] = []
@@ -1704,7 +1731,7 @@ class SshBackend(BackendProtocol):
                 except FileNotFoundError:
                     results.append(
                         DownloadFileResult(
-                            path=path, content=None, error="file_not_found"
+                            path=path.value, content=None, error="file_not_found"
                         )
                     )
                     continue
@@ -1712,7 +1739,7 @@ class SshBackend(BackendProtocol):
                 if self._attr_is_dir_maybe(attr.st_mode):
                     results.append(
                         DownloadFileResult(
-                            path=path, content=None, error="is_directory"
+                            path=path.value, content=None, error="is_directory"
                         )
                     )
                     continue
@@ -1720,16 +1747,16 @@ class SshBackend(BackendProtocol):
                 with self._sftp.open(remote, "rb") as f:
                     raw = f.read()
                 results.append(
-                    DownloadFileResult(path=path, content=raw)
+                    DownloadFileResult(path=path.value, content=raw)
                 )
             except OSError as e:
                 results.append(
-                    DownloadFileResult(path=path, content=None, error=str(e))
+                    DownloadFileResult(path=path.value, content=None, error=str(e))
                 )
             except Exception as e:
                 results.append(
                     DownloadFileResult(
-                        path=path,
+                        path=path.value,
                         content=None,
                         error=f"{type(e).__name__}: {e}",
                     )

@@ -3,13 +3,13 @@
 import pytest
 
 from mambo_agents.backends.protocol import EditResult
+from mambo_agents.backends.schemas import human_size
 from mambo_agents.backends.utils import (
     TreeEntry,
     check_path_allowed,
     detect_trailing_newline_mismatch,
     format_tree_entries,
     format_with_line_numbers,
-    human_size,
 )
 
 

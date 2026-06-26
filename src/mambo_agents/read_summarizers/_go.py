@@ -8,6 +8,7 @@ from tree_sitter import Language, Node, Parser
 import tree_sitter_go
 
 from mambo_agents.backends.protocol import ReadSummarizer
+from mambo_agents.backends.schemas import VirtualPath
 
 _LANG = Language(tree_sitter_go.language())
 _PARSER = Parser(_LANG)
@@ -17,8 +18,8 @@ _LINE_LIMIT = 200
 def go_summarizer() -> ReadSummarizer:
     """Return a ``ReadSummarizer`` that analyses Go source files."""
 
-    def _summarize(file_path: str, content: str, max_chars: int) -> str:
-        suffix = PurePosixPath(file_path).suffix.lower()
+    def _summarize(file_path: VirtualPath, content: str, max_chars: int) -> str:
+        suffix = PurePosixPath(file_path.value).suffix.lower()
         if suffix != ".go":
             return _fallback(file_path, content, max_chars)
         return _summarize_go(file_path, content, max_chars)
@@ -26,7 +27,7 @@ def go_summarizer() -> ReadSummarizer:
     return _summarize
 
 
-def _fallback(file_path: str, content: str, max_chars: int) -> str:
+def _fallback(file_path: VirtualPath, content: str, max_chars: int) -> str:
     total_lines = content.count("\n") + 1
     return (
         f"[返回结果过大（{len(content):,} 字符，{total_lines:,} 行），"
@@ -36,7 +37,7 @@ def _fallback(file_path: str, content: str, max_chars: int) -> str:
     )
 
 
-def _summarize_go(file_path: str, content: str, max_chars: int) -> str:
+def _summarize_go(file_path: VirtualPath, content: str, max_chars: int) -> str:
     total_lines = content.count("\n") + 1
     code = content.encode("utf-8")
     tree = _PARSER.parse(code)

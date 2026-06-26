@@ -8,6 +8,7 @@ from tree_sitter import Language, Node, Parser
 import tree_sitter_cpp
 
 from mambo_agents.backends.protocol import ReadSummarizer
+from mambo_agents.backends.schemas import VirtualPath
 
 _LANG = Language(tree_sitter_cpp.language())
 _PARSER = Parser(_LANG)
@@ -19,8 +20,8 @@ _CPP_SUFFIXES = frozenset({".cpp", ".cc", ".cxx", ".c++", ".hpp", ".hh", ".hxx",
 def cpp_summarizer() -> ReadSummarizer:
     """Return a ``ReadSummarizer`` that analyses C++ source files."""
 
-    def _summarize(file_path: str, content: str, max_chars: int) -> str:
-        suffix = PurePosixPath(file_path).suffix.lower()
+    def _summarize(file_path: VirtualPath, content: str, max_chars: int) -> str:
+        suffix = PurePosixPath(file_path.value).suffix.lower()
         if suffix not in _CPP_SUFFIXES:
             return _fallback(file_path, content, max_chars)
         return _summarize_cpp(file_path, content, max_chars)
@@ -28,7 +29,7 @@ def cpp_summarizer() -> ReadSummarizer:
     return _summarize
 
 
-def _fallback(file_path: str, content: str, max_chars: int) -> str:
+def _fallback(file_path: VirtualPath, content: str, max_chars: int) -> str:
     total_lines = content.count("\n") + 1
     return (
         f"[返回结果过大（{len(content):,} 字符，{total_lines:,} 行），"
@@ -38,7 +39,7 @@ def _fallback(file_path: str, content: str, max_chars: int) -> str:
     )
 
 
-def _summarize_cpp(file_path: str, content: str, max_chars: int) -> str:
+def _summarize_cpp(file_path: VirtualPath, content: str, max_chars: int) -> str:
     total_lines = content.count("\n") + 1
     code = content.encode("utf-8")
     tree = _PARSER.parse(code)

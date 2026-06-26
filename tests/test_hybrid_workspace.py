@@ -8,7 +8,7 @@ from pathlib import Path, PurePosixPath
 import pytest
 import yaml
 from langchain_core.tools import StructuredTool
-from pydantic import Field, create_model
+from pydantic import Field, ValidationError, create_model
 
 from mambo_agents.backends.hybrid_workspace import HybridWorkspaceBackend
 from mambo_agents.backends.local import LocalBackend
@@ -19,6 +19,7 @@ from mambo_agents.backends.protocol import (
     UploadFileResult,
 )
 from mambo_agents.backends.state import StateBackend
+from mambo_agents.backends.schemas import VirtualPath
 
 from tests.test_state_backend import _simulate_graph
 
@@ -43,10 +44,10 @@ class _FakeBackend(BackendProtocol):
     def tools(self) -> list[StructuredTool]:
         return self._extra_tools
 
-    def ls(self, path: str):
+    def ls(self, path: VirtualPath):
         from mambo_agents.backends.protocol import FileInfo, LsResult
 
-        prefix = path.rstrip("/") + "/" if path != "/" else "/"
+        prefix = path.value.rstrip("/") + "/" if path.value != "/" else "/"
         infos: list[FileInfo] = []
         dirs: set[str] = set()
         for fp, content in self._files.items():
@@ -62,37 +63,40 @@ class _FakeBackend(BackendProtocol):
         infos.sort(key=lambda fi: fi.path)
         return LsResult(entries=infos)
 
-    def read_raw(self, file_path: str, offset=0, limit=2000, include_line_numbers=False):
+    def read_raw(self, file_path: VirtualPath, offset=0, limit=2000, include_line_numbers=False):
         from mambo_agents.backends.protocol import ReadResult
 
-        c = self._files.get(file_path)
+        s = str(file_path)
+        c = self._files.get(s)
         if c is None:
-            return ReadResult(error=f"File '{file_path}' not found")
+            return ReadResult(error=f"File '{s}' not found")
         return ReadResult(content=c, total_lines=len(c.split("\n")))
 
-    def write(self, file_path: str, content: str, overwrite=False):
+    def write(self, file_path: VirtualPath, content: str, overwrite=False):
         from mambo_agents.backends.protocol import WriteResult
 
-        if file_path in self._files and not overwrite:
-            return WriteResult(error=f"Cannot write '{file_path}': file already exists")
-        self._files[file_path] = content
-        return WriteResult(path=file_path)
+        s = str(file_path)
+        if s in self._files and not overwrite:
+            return WriteResult(error=f"Cannot write '{s}': file already exists")
+        self._files[s] = content
+        return WriteResult(path=s)
 
-    def edit(self, file_path: str, old_str: str, new_str: str, *, replace_all=False):
+    def edit(self, file_path: VirtualPath, old_str: str, new_str: str, *, replace_all=False):
         from mambo_agents.backends.protocol import EditResult
 
-        c = self._files.get(file_path)
+        s = str(file_path)
+        c = self._files.get(s)
         if c is None:
-            return EditResult(error=f"Cannot edit '{file_path}': file not found")
+            return EditResult(error=f"Cannot edit '{s}': file not found")
         if old_str not in c:
-            return EditResult(error=f"Cannot edit '{file_path}': old_str not found")
-        self._files[file_path] = c.replace(old_str, new_str)
-        return EditResult(path=file_path, occurrences=c.count(old_str))
+            return EditResult(error=f"Cannot edit '{s}': old_str not found")
+        self._files[s] = c.replace(old_str, new_str)
+        return EditResult(path=s, occurrences=c.count(old_str))
 
-    def grep(self, pattern: str, path="/", glob=None, regex=False, offset=0, limit=None):
+    def grep(self, pattern: str, path: VirtualPath, glob=None, regex=False, offset=0, limit=None):
         from mambo_agents.backends.protocol import GrepResult, GrepMatch
 
-        prefix = path.rstrip("/") + "/" if path != "/" else "/"
+        prefix = path.value.rstrip("/") + "/" if path.value != "/" else "/"
         matches: list[GrepMatch] = []
         if regex:
             compiled = __import__("re").compile(pattern)
@@ -106,11 +110,11 @@ class _FakeBackend(BackendProtocol):
                     matches.append(GrepMatch(path=fp, line=li, text=line))
         return GrepResult(matches=matches)
 
-    def glob(self, pattern: str, path="/"):
+    def glob(self, pattern: str, path: VirtualPath):
         import fnmatch as _fnmatch
         from mambo_agents.backends.protocol import FileInfo, GlobResult
 
-        prefix = path.rstrip("/") if path != "/" else ""
+        prefix = path.value.rstrip("/") if path.value != "/" else ""
         results: list[FileInfo] = []
         for fp in sorted(self._files):
             if prefix and fp != prefix and not fp.startswith(prefix + "/"):
@@ -133,10 +137,10 @@ class _FakeThreadAwareBackend(ThreadAwareWorkspace):
     def tools(self) -> list[StructuredTool]:
         return []
 
-    def ls(self, path: str):
+    def ls(self, path: VirtualPath):
         from mambo_agents.backends.protocol import FileInfo, LsResult
 
-        prefix = path.rstrip("/") + "/" if path != "/" else "/"
+        prefix = path.value.rstrip("/") + "/" if path.value != "/" else "/"
         infos: list[FileInfo] = []
         dirs: set[str] = set()
         for fp, content in self._files.items():
@@ -152,37 +156,40 @@ class _FakeThreadAwareBackend(ThreadAwareWorkspace):
         infos.sort(key=lambda fi: fi.path)
         return LsResult(entries=infos)
 
-    def read_raw(self, file_path: str, offset=0, limit=2000, include_line_numbers=False):
+    def read_raw(self, file_path: VirtualPath, offset=0, limit=2000, include_line_numbers=False):
         from mambo_agents.backends.protocol import ReadResult
 
-        c = self._files.get(file_path)
+        s = str(file_path)
+        c = self._files.get(s)
         if c is None:
-            return ReadResult(error=f"File '{file_path}' not found")
+            return ReadResult(error=f"File '{s}' not found")
         return ReadResult(content=c, total_lines=len(c.split("\n")))
 
-    def write(self, file_path: str, content: str, overwrite=False):
+    def write(self, file_path: VirtualPath, content: str, overwrite=False):
         from mambo_agents.backends.protocol import WriteResult
 
-        if file_path in self._files and not overwrite:
-            return WriteResult(error=f"Cannot write '{file_path}': file already exists")
-        self._files[file_path] = content
-        return WriteResult(path=file_path)
+        s = str(file_path)
+        if s in self._files and not overwrite:
+            return WriteResult(error=f"Cannot write '{s}': file already exists")
+        self._files[s] = content
+        return WriteResult(path=s)
 
-    def edit(self, file_path: str, old_str: str, new_str: str, *, replace_all=False):
+    def edit(self, file_path: VirtualPath, old_str: str, new_str: str, *, replace_all=False):
         from mambo_agents.backends.protocol import EditResult
 
-        c = self._files.get(file_path)
+        s = str(file_path)
+        c = self._files.get(s)
         if c is None:
-            return EditResult(error=f"Cannot edit '{file_path}': file not found")
+            return EditResult(error=f"Cannot edit '{s}': file not found")
         if old_str not in c:
-            return EditResult(error=f"Cannot edit '{file_path}': old_str not found")
-        self._files[file_path] = c.replace(old_str, new_str)
-        return EditResult(path=file_path, occurrences=c.count(old_str))
+            return EditResult(error=f"Cannot edit '{s}': old_str not found")
+        self._files[s] = c.replace(old_str, new_str)
+        return EditResult(path=s, occurrences=c.count(old_str))
 
-    def grep(self, pattern: str, path="/", glob=None, regex=False, offset=0, limit=None):
+    def grep(self, pattern: str, path: VirtualPath, glob=None, regex=False, offset=0, limit=None):
         from mambo_agents.backends.protocol import GrepResult, GrepMatch
 
-        prefix = path.rstrip("/") + "/" if path != "/" else "/"
+        prefix = path.value.rstrip("/") + "/" if path.value != "/" else "/"
         matches: list[GrepMatch] = []
         if regex:
             compiled = __import__("re").compile(pattern)
@@ -196,11 +203,11 @@ class _FakeThreadAwareBackend(ThreadAwareWorkspace):
                     matches.append(GrepMatch(path=fp, line=li, text=line))
         return GrepResult(matches=matches)
 
-    def glob(self, pattern: str, path="/"):
+    def glob(self, pattern: str, path: VirtualPath):
         import fnmatch as _fnmatch
         from mambo_agents.backends.protocol import FileInfo, GlobResult
 
-        prefix = path.rstrip("/") if path != "/" else ""
+        prefix = path.value.rstrip("/") if path.value != "/" else ""
         results: list[FileInfo] = []
         for fp in sorted(self._files):
             if prefix and fp != prefix and not fp.startswith(prefix + "/"):
@@ -213,23 +220,25 @@ class _FakeThreadAwareBackend(ThreadAwareWorkspace):
         self._last_upload_thread_id = thread_id
         results: list[UploadFileResult] = []
         for path, raw_content in files:
+            s = str(path)
             try:
                 text = raw_content.decode("utf-8")
             except UnicodeDecodeError:
                 text = "binary"
-            self._files[path] = text
-            results.append(UploadFileResult(path=path, error=None))
+            self._files[s] = text
+            results.append(UploadFileResult(path=s, error=None))
         return results
 
     def download_files(self, paths, *, thread_id=None):
         self._last_download_thread_id = thread_id
         results: list[DownloadFileResult] = []
         for path in paths:
-            c = self._files.get(path)
+            s = str(path)
+            c = self._files.get(s)
             if c is None:
-                results.append(DownloadFileResult(path=path, content=None, error="file_not_found"))
+                results.append(DownloadFileResult(path=s, content=None, error="file_not_found"))
             else:
-                results.append(DownloadFileResult(path=path, content=c.encode("utf-8"), error=None))
+                results.append(DownloadFileResult(path=s, content=c.encode("utf-8"), error=None))
         return results
 
 
@@ -254,7 +263,7 @@ def hybrid_ws(tmp_root: Path) -> HybridWorkspaceBackend:
 
 def _write_virtual(hws: HybridWorkspaceBackend, path: str, content: str):
     """Write a file under /.mambo/ via graph simulation."""
-    target, stripped = hws._route(path)
+    target, stripped = hws._route(VirtualPath(path))
     if isinstance(target, StateBackend):
         with _simulate_graph(target):
             r = target.write(stripped, content, overwrite=True)
@@ -265,7 +274,7 @@ def _write_virtual(hws: HybridWorkspaceBackend, path: str, content: str):
 
 
 def _read_virtual(hws: HybridWorkspaceBackend, path: str) -> str:
-    target, stripped = hws._route(path)
+    target, stripped = hws._route(VirtualPath(path))
     if isinstance(target, StateBackend):
         with _simulate_graph(target):
             r = target.read(stripped)
@@ -283,29 +292,19 @@ def _read_virtual(hws: HybridWorkspaceBackend, path: str) -> str:
 class TestPathRouting:
     """Verify that mambo-prefixed paths hit virtual backends, others hit real."""
 
-    def test_is_mambo_hits_prefix(self, hybrid_ws: HybridWorkspaceBackend):
-        assert hybrid_ws._is_mambo("/.mambo/")
-        assert hybrid_ws._is_mambo("/.mambo/workspace/")
-        assert hybrid_ws._is_mambo("/.mambo/large_tool_results/abc")
-        assert hybrid_ws._is_mambo("/.mambo/conversation_history/t1.md")
-
-    def test_is_mambo_misses_others(self, hybrid_ws: HybridWorkspaceBackend):
-        assert not hybrid_ws._is_mambo("/")
-        assert not hybrid_ws._is_mambo(f"{_W}/project/")
-        assert not hybrid_ws._is_mambo(f"{_W}/tmp/file.txt")
 
     def test_route_default_mambo_returns_default_state(self, hybrid_ws: HybridWorkspaceBackend):
-        target, path = hybrid_ws._route("/.mambo/workspace/f.txt")
+        target, path = hybrid_ws._route(VirtualPath("/.mambo/workspace/f.txt"))
         assert target is hybrid_ws._default_mambo
         assert path == "/workspace/workspace/f.txt"
 
     def test_route_default_mambo_root(self, hybrid_ws: HybridWorkspaceBackend):
-        target, path = hybrid_ws._route("/.mambo")
+        target, path = hybrid_ws._route(VirtualPath("/.mambo"))
         assert target is hybrid_ws._default_mambo
         assert path == "/workspace"
 
     def test_route_non_mambo_returns_real_backend(self, hybrid_ws: HybridWorkspaceBackend):
-        target, path = hybrid_ws._route(f"{_W}/project/main.py")
+        target, path = hybrid_ws._route(VirtualPath(f"{_W}/project/main.py"))
         assert target is hybrid_ws._real
         assert path == f"{_W}/project/main.py"
 
@@ -315,7 +314,7 @@ class TestPathRouting:
             real_backend=LocalBackend(root_dir=str(tmp_root)),
             virtual_workspaces={"skills": skills_be},
         )
-        target, path = hws._route("/.mambo/skills/guidelines.md")
+        target, path = hws._route(VirtualPath("/.mambo/skills/guidelines.md"))
         assert target is skills_be
         assert path == "/workspace/guidelines.md"
 
@@ -325,7 +324,7 @@ class TestPathRouting:
             real_backend=LocalBackend(root_dir=str(tmp_root)),
             virtual_workspaces={"skills": skills_be},
         )
-        target, path = hws._route("/.mambo/skills")
+        target, path = hws._route(VirtualPath("/.mambo/skills"))
         assert target is skills_be
         assert path == "/workspace"
 
@@ -336,7 +335,7 @@ class TestPathRouting:
             virtual_workspaces={"skills": skills_be},
         )
         # "skills_other" should NOT match "skills"
-        target, path = hws._route("/.mambo/skills_other/f.txt")
+        target, path = hws._route(VirtualPath("/.mambo/skills_other/f.txt"))
         assert target is hws._default_mambo
         assert path == "/workspace/skills_other/f.txt"
 
@@ -346,7 +345,7 @@ class TestPathRouting:
             real_backend=LocalBackend(root_dir=str(tmp_root)),
             virtual_workspaces={".": custom},
         )
-        target, path = hws._route("/.mambo/config.yml")
+        target, path = hws._route(VirtualPath("/.mambo/config.yml"))
         assert target is custom
         assert path == "/workspace/config.yml"
 
@@ -360,9 +359,9 @@ class TestStripPrefix:
     """Virtual backends receive paths under their own workspace_root."""
 
     def test_default_strips_mambo_prefix(self, hybrid_ws: HybridWorkspaceBackend):
-        target, path = hybrid_ws._route("/.mambo/workspace/scratch.txt")
+        target, path = hybrid_ws._route(VirtualPath("/.mambo/workspace/scratch.txt"))
         assert path == "/workspace/workspace/scratch.txt"
-        assert not path.startswith("/.mambo")
+        assert not str(path).startswith("/.mambo")
 
     def test_named_strips_full_prefix(self, tmp_root: Path):
         skills_be = StateBackend()
@@ -370,11 +369,11 @@ class TestStripPrefix:
             real_backend=LocalBackend(root_dir=str(tmp_root)),
             virtual_workspaces={"skills": skills_be},
         )
-        _, path = hws._route("/.mambo/skills/guides/python.md")
+        _, path = hws._route(VirtualPath("/.mambo/skills/guides/python.md"))
         assert path == "/workspace/guides/python.md"
 
     def test_real_backend_path_unchanged(self, hybrid_ws: HybridWorkspaceBackend):
-        _, path = hybrid_ws._route(f"{_W}/src/main.py")
+        _, path = hybrid_ws._route(VirtualPath(f"{_W}/src/main.py"))
         assert path == f"{_W}/src/main.py"
 
 
@@ -384,8 +383,8 @@ class TestStripPrefix:
 
 
 class TestCoreOpsRouting:
-    WORKSPACE_FILE = "/.mambo/workspace/scratch.txt"
-    PROJECT_FILE = f"{_W}/project/hello.txt"
+    WORKSPACE_FILE = VirtualPath("/.mambo/workspace/scratch.txt")
+    PROJECT_FILE = VirtualPath(f"{_W}/project/hello.txt")
 
     def test_write_read_default_mambo(self, hybrid_ws: HybridWorkspaceBackend):
         _write_virtual(hybrid_ws, self.WORKSPACE_FILE, "virtual scratch")
@@ -421,7 +420,7 @@ class TestCoreOpsRouting:
         _write_virtual(hws, "/.mambo/scratch.txt", "scratch")
 
         # Skills workspace has its own file
-        _, guide_path = hws._route("/.mambo/skills/guide.md")
+        _, guide_path = hws._route(VirtualPath("/.mambo/skills/guide.md"))
         with _simulate_graph(skills_be):
             r = skills_be.read(guide_path)
         assert r.error is None
@@ -449,8 +448,8 @@ class TestCoreOpsRouting:
 
     def test_ls_default_mambo(self, hybrid_ws: HybridWorkspaceBackend):
         _write_virtual(hybrid_ws, self.WORKSPACE_FILE, "a")
-        _write_virtual(hybrid_ws, "/.mambo/workspace/other.txt", "b")
-        target, stripped = hybrid_ws._route("/.mambo/workspace/")
+        _write_virtual(hybrid_ws, VirtualPath("/.mambo/workspace/other.txt"), "b")
+        target, stripped = hybrid_ws._route(VirtualPath("/.mambo/workspace/"))
         with _simulate_graph(target):
             r = target.ls(stripped)
         assert r.entries is not None
@@ -459,9 +458,9 @@ class TestCoreOpsRouting:
         assert "/workspace/workspace/other.txt" in paths
 
     def test_ls_project(self, hybrid_ws: HybridWorkspaceBackend):
-        hybrid_ws.write(f"{_W}/project/a.py", "1")
-        hybrid_ws.write(f"{_W}/project/b.py", "2")
-        r = hybrid_ws.ls(f"{_W}/project/")
+        hybrid_ws.write(VirtualPath(f"{_W}/project/a.py"), "1")
+        hybrid_ws.write(VirtualPath(f"{_W}/project/b.py"), "2")
+        r = hybrid_ws.ls(VirtualPath(f"{_W}/project/"))
         assert r.entries is not None
         paths = [fi.path for fi in r.entries]
         assert f"{_W}/project/a.py" in paths
@@ -469,22 +468,22 @@ class TestCoreOpsRouting:
 
     def test_grep_default_mambo(self, hybrid_ws: HybridWorkspaceBackend):
         _write_virtual(hybrid_ws, self.WORKSPACE_FILE, "needle in a haystack")
-        target, stripped = hybrid_ws._route("/.mambo/")
+        target, stripped = hybrid_ws._route(VirtualPath("/.mambo/"))
         with _simulate_graph(target):
             r = target.grep("needle", path=stripped)
         assert r.matches is not None
         assert any("needle" in m.text for m in r.matches)
 
     def test_grep_project(self, hybrid_ws: HybridWorkspaceBackend):
-        hybrid_ws.write(f"{_W}/project/f.py", "def needle(): pass")
-        r = hybrid_ws.grep("needle", path=f"{_W}/project/")
+        hybrid_ws.write(VirtualPath(f"{_W}/project/f.py"), "def needle(): pass")
+        r = hybrid_ws.grep("needle", path=VirtualPath(f"{_W}/project/"))
         assert r.matches is not None
         assert any("needle" in m.text for m in r.matches)
 
     def test_glob_default_mambo(self, hybrid_ws: HybridWorkspaceBackend):
         _write_virtual(hybrid_ws, self.WORKSPACE_FILE, "a")
-        _write_virtual(hybrid_ws, "/.mambo/workspace/b.md", "b")
-        target, stripped = hybrid_ws._route("/.mambo/workspace/")
+        _write_virtual(hybrid_ws, VirtualPath("/.mambo/workspace/b.md"), "b")
+        target, stripped = hybrid_ws._route(VirtualPath("/.mambo/workspace/"))
         with _simulate_graph(target):
             r = target.glob("*.txt", path=stripped)
         assert r.matches is not None
@@ -493,9 +492,9 @@ class TestCoreOpsRouting:
         assert "/workspace/workspace/b.md" not in paths
 
     def test_glob_project(self, hybrid_ws: HybridWorkspaceBackend):
-        hybrid_ws.write(f"{_W}/project/x.py", "1")
-        hybrid_ws.write(f"{_W}/project/y.txt", "2")
-        r = hybrid_ws.glob("*.py", path=f"{_W}/project/")
+        hybrid_ws.write(VirtualPath(f"{_W}/project/x.py"), "1")
+        hybrid_ws.write(VirtualPath(f"{_W}/project/y.txt"), "2")
+        r = hybrid_ws.glob("*.py", path=VirtualPath(f"{_W}/project/"))
         assert r.matches is not None
         paths = [fi.path for fi in r.matches]
         assert len(paths) == 1
@@ -508,7 +507,7 @@ class TestCoreOpsRouting:
 
 
 def _make_dummy_tree_tool() -> StructuredTool:
-    from pydantic import Field, create_model
+    from pydantic import Field, ValidationError, create_model
 
     return StructuredTool(
         name="tree",
@@ -600,14 +599,14 @@ class TestToolsDelegation:
         # Use a real LocalBackend with a different workspace_root
         with tempfile.TemporaryDirectory() as tmpdir:
             real = LocalBackend(root_dir=tmpdir, workspace_root="/real")
-            real.write("/real/hello.txt", "hello", overwrite=True)
+            real.write(VirtualPath("/real/hello.txt"), "hello", overwrite=True)
 
             hws = HybridWorkspaceBackend(
                 real_backend=real,
                 workspace_root="/workspace",  # AI-facing
             )
             # Verify file exists on disk via real backend (using real ws_root)
-            read_result = real.read("/real/hello.txt")
+            read_result = real.read(VirtualPath("/real/hello.txt"))
             assert "hello" in str(read_result)
 
             # Invoke delete through Hybrid's wrapper — path should be translated
@@ -617,7 +616,7 @@ class TestToolsDelegation:
             assert "Error" not in result
 
             # Verify file is actually gone
-            check = real.read("/real/hello.txt")
+            check = real.read(VirtualPath("/real/hello.txt"))
             assert check.error is not None
 
 
@@ -665,11 +664,11 @@ class TestUploadDownload:
     def test_upload_mixed_routes_correctly(self, tmp_root: Path):
         hws = HybridWorkspaceBackend(real_backend=LocalBackend(root_dir=str(tmp_root)))
 
-        files: list[tuple[str, bytes]] = [
-            ("/.mambo/workspace/a.txt", b"workspace a"),
-            (f"{_W}/project/b.txt", b"project b"),
-            ("/.mambo/workspace/c.txt", b"workspace c"),
-            (f"{_W}/project/d.txt", b"project d"),
+        files: list[tuple[VirtualPath, bytes]] = [
+            (VirtualPath("/.mambo/workspace/a.txt"), b"workspace a"),
+            (VirtualPath(f"{_W}/project/b.txt"), b"project b"),
+            (VirtualPath("/.mambo/workspace/c.txt"), b"workspace c"),
+            (VirtualPath(f"{_W}/project/d.txt"), b"project d"),
         ]
 
         with _simulate_graph(hws._default_mambo):
@@ -679,8 +678,8 @@ class TestUploadDownload:
         assert all(r.error is None for r in results)
 
         # Verify workspace files in default StateBackend
-        _, a_path = hws._route("/.mambo/workspace/a.txt")
-        _, c_path = hws._route("/.mambo/workspace/c.txt")
+        _, a_path = hws._route(VirtualPath("/.mambo/workspace/a.txt"))
+        _, c_path = hws._route(VirtualPath("/.mambo/workspace/c.txt"))
         with _simulate_graph(hws._default_mambo):
             r1 = hws._default_mambo.read(a_path)
             r3 = hws._default_mambo.read(c_path)
@@ -688,8 +687,8 @@ class TestUploadDownload:
         assert "workspace c" in (r3.content or "")
 
         # Verify project files in real backend
-        r2 = hws.read(f"{_W}/project/b.txt")
-        r4 = hws.read(f"{_W}/project/d.txt")
+        r2 = hws.read(VirtualPath(f"{_W}/project/b.txt"))
+        r4 = hws.read(VirtualPath(f"{_W}/project/d.txt"))
         assert "project b" in (r2.content or "")
         assert "project d" in (r4.content or "")
 
@@ -698,12 +697,12 @@ class TestUploadDownload:
 
         # Pre-populate both sides
         _write_virtual(hws, "/.mambo/x.txt", "state file")
-        hws.write(f"{_W}/y.txt", "backend file", overwrite=True)
+        hws.write(VirtualPath(f"{_W}/y.txt"), "backend file", overwrite=True)
 
         with _simulate_graph(hws._default_mambo):
             results = hws.download_files([
-                "/.mambo/x.txt",
-                f"{_W}/y.txt",
+                VirtualPath("/.mambo/x.txt"),
+                VirtualPath(f"{_W}/y.txt"),
             ])
 
         assert len(results) == 2
@@ -717,9 +716,9 @@ class TestUploadDownload:
             virtual_workspaces={"skills": skills_be},
         )
 
-        files: list[tuple[str, bytes]] = [
-            ("/.mambo/skills/guide.md", b"skill content"),
-            ("/.mambo/scratch.txt", b"default scratch"),
+        files: list[tuple[VirtualPath, bytes]] = [
+            (VirtualPath("/.mambo/skills/guide.md"), b"skill content"),
+            (VirtualPath("/.mambo/scratch.txt"), b"default scratch"),
         ]
 
         with _simulate_graph(skills_be), _simulate_graph(hws._default_mambo):
@@ -729,13 +728,13 @@ class TestUploadDownload:
         assert all(r.error is None for r in results)
 
         # Verify skills workspace
-        _, skills_path = hws._route("/.mambo/skills/guide.md")
+        _, skills_path = hws._route(VirtualPath("/.mambo/skills/guide.md"))
         with _simulate_graph(skills_be):
             r = skills_be.read(skills_path)
         assert "skill content" in (r.content or "")
 
         # Verify default workspace
-        _, scratch_path = hws._route("/.mambo/scratch.txt")
+        _, scratch_path = hws._route(VirtualPath("/.mambo/scratch.txt"))
         with _simulate_graph(hws._default_mambo):
             r = hws._default_mambo.read(scratch_path)
         assert "default scratch" in (r.content or "")
@@ -754,9 +753,9 @@ class TestUploadDownload:
         )
 
         # upload_files with mixed targets (real + non-ThreadAware virtual)
-        files: list[tuple[str, bytes]] = [
-            ("/.mambo/plain/a.txt", b"virtual a"),
-            (f"{_W}/project/b.txt", b"real b"),
+        files: list[tuple[VirtualPath, bytes]] = [
+            (VirtualPath("/.mambo/plain/a.txt"), b"virtual a"),
+            (VirtualPath(f"{_W}/project/b.txt"), b"real b"),
         ]
         results = hws.upload_files(files)
         assert len(results) == 2
@@ -764,8 +763,8 @@ class TestUploadDownload:
 
         # download_files with mixed targets
         results = hws.download_files([
-            "/.mambo/plain/a.txt",
-            f"{_W}/project/b.txt",
+            VirtualPath("/.mambo/plain/a.txt"),
+            VirtualPath(f"{_W}/project/b.txt"),
         ])
         assert len(results) == 2
         assert results[0].content == b"virtual a"
@@ -780,13 +779,13 @@ class TestUploadDownload:
         )
 
         hws.upload_files(
-            [("/.mambo/aware/x.txt", b"hello")],
+            [(VirtualPath("/.mambo/aware/x.txt"), b"hello")],
             thread_id="session-42",
         )
         assert aware_be._last_upload_thread_id == "session-42"
 
         hws.download_files(
-            ["/.mambo/aware/x.txt"],
+            [VirtualPath("/.mambo/aware/x.txt")],
             thread_id="session-99",
         )
         assert aware_be._last_download_thread_id == "session-99"
@@ -800,10 +799,10 @@ class TestUploadDownload:
             virtual_workspaces={"aware": aware_be, "plain": plain_be},
         )
 
-        files: list[tuple[str, bytes]] = [
-            ("/.mambo/aware/a.txt", b"aware a"),
-            ("/.mambo/plain/b.txt", b"plain b"),
-            (f"{_W}/real.txt", b"real"),
+        files: list[tuple[VirtualPath, bytes]] = [
+            (VirtualPath("/.mambo/aware/a.txt"), b"aware a"),
+            (VirtualPath("/.mambo/plain/b.txt"), b"plain b"),
+            (VirtualPath(f"{_W}/real.txt"), b"real"),
         ]
         results = hws.upload_files(files, thread_id="mixed-test")
         assert len(results) == 3
@@ -823,14 +822,14 @@ class TestUploadDownload:
         )
 
         results = hws.upload_files(
-            [("/.mambo/scratch.txt", b"scratch")],
+            [(VirtualPath("/.mambo/scratch.txt"), b"scratch")],
             thread_id="any-thread",
         )
         assert len(results) == 1
         assert results[0].error is None
 
         dl = hws.download_files(
-            ["/.mambo/scratch.txt"],
+            [VirtualPath("/.mambo/scratch.txt")],
             thread_id="any-thread",
         )
         assert len(dl) == 1
@@ -852,7 +851,7 @@ class TestDotOverride:
         assert hws._default_mambo is custom
 
         with _simulate_graph(custom):
-            r = custom.read("/config.yml")
+            r = custom.read(VirtualPath("/config.yml"))
         assert r.error is None
         assert "port: 8080" in (r.content or "")
 
@@ -870,12 +869,12 @@ class TestDotOverride:
         assert hws._virtual["skills"] is skills_be
 
         # Route default
-        t1, p1 = hws._route("/.mambo/f.txt")
+        t1, p1 = hws._route(VirtualPath("/.mambo/f.txt"))
         assert t1 is default_be
         assert p1 == "/workspace/f.txt"
 
         # Route named
-        t2, p2 = hws._route("/.mambo/skills/g.md")
+        t2, p2 = hws._route(VirtualPath("/.mambo/skills/g.md"))
         assert t2 is skills_be
         assert p2 == "/workspace/g.md"
 
@@ -896,14 +895,14 @@ class TestCopy:
 
         # Copy to real filesystem
         with _simulate_graph(hws._default_mambo):
-            result = hws.copy("/.mambo/draft.txt", f"{_W}/output.txt")
+            result = hws.copy(VirtualPath("/.mambo/draft.txt"), VirtualPath(f"{_W}/output.txt"))
 
         assert result.error is None, result.error
         assert result.source == "/.mambo/draft.txt"
         assert result.destination == f"{_W}/output.txt"
 
         # Verify destination
-        r = hws.read(f"{_W}/output.txt")
+        r = hws.read(VirtualPath(f"{_W}/output.txt"))
         assert r.error is None
         assert "hello from virtual" in (r.content or "")
 
@@ -911,16 +910,16 @@ class TestCopy:
         hws = HybridWorkspaceBackend(real_backend=LocalBackend(root_dir=str(tmp_root)))
 
         # Write in real filesystem
-        hws.write(f"{_W}/source.txt", "hello from real", overwrite=True)
+        hws.write(VirtualPath(f"{_W}/source.txt"), "hello from real", overwrite=True)
 
         # Copy to virtual workspace
         with _simulate_graph(hws._default_mambo):
-            result = hws.copy(f"{_W}/source.txt", "/.mambo/imported.txt")
+            result = hws.copy(VirtualPath(f"{_W}/source.txt"), VirtualPath("/.mambo/imported.txt"))
 
         assert result.error is None, result.error
 
         # Verify destination in virtual
-        target, stripped = hws._route("/.mambo/imported.txt")
+        target, stripped = hws._route(VirtualPath("/.mambo/imported.txt"))
         with _simulate_graph(target):
             r = target.read(stripped)
         assert r.error is None
@@ -939,14 +938,14 @@ class TestCopy:
         # Copy from default to skills
         with _simulate_graph(hws._default_mambo), _simulate_graph(skills_be):
             result = hws.copy(
-                "/.mambo/shared/file.txt",
-                "/.mambo/skills/incoming.txt",
+                VirtualPath("/.mambo/shared/file.txt"),
+                VirtualPath("/.mambo/skills/incoming.txt"),
             )
 
         assert result.error is None, result.error
 
         # Verify in skills workspace
-        _, incoming_path = hws._route("/.mambo/skills/incoming.txt")
+        _, incoming_path = hws._route(VirtualPath("/.mambo/skills/incoming.txt"))
         with _simulate_graph(skills_be):
             r = skills_be.read(incoming_path)
         assert r.error is None
@@ -956,21 +955,21 @@ class TestCopy:
         hws = HybridWorkspaceBackend(real_backend=LocalBackend(root_dir=str(tmp_root)))
 
         _write_virtual(hws, "/.mambo/source.txt", "new content")
-        hws.write(f"{_W}/dest.txt", "old content", overwrite=True)
+        hws.write(VirtualPath(f"{_W}/dest.txt"), "old content", overwrite=True)
 
         with _simulate_graph(hws._default_mambo):
-            result = hws.copy("/.mambo/source.txt", f"{_W}/dest.txt")
+            result = hws.copy(VirtualPath("/.mambo/source.txt"), VirtualPath(f"{_W}/dest.txt"))
 
         assert result.error is None, result.error
 
-        r = hws.read(f"{_W}/dest.txt")
+        r = hws.read(VirtualPath(f"{_W}/dest.txt"))
         assert "new content" in (r.content or "")
 
     def test_copy_source_not_found(self, tmp_root: Path):
         hws = HybridWorkspaceBackend(real_backend=LocalBackend(root_dir=str(tmp_root)))
 
         with _simulate_graph(hws._default_mambo):
-            result = hws.copy("/.mambo/nonexistent.txt", f"{_W}/out.txt")
+            result = hws.copy(VirtualPath("/.mambo/nonexistent.txt"), VirtualPath(f"{_W}/out.txt"))
 
         assert result.error is not None
         assert "nonexistent" in result.error.lower() or "not found" in result.error.lower()
@@ -1005,17 +1004,17 @@ class TestWorkspaceRootRewrite:
         )
         assert hws.workspace_root == "/a"
 
-        target, path = hws._route("/a/data.txt")
+        target, path = hws._route(VirtualPath("/a/data.txt"))
         assert target is local
         assert path == "/b/data.txt"
 
         # Root exact match
-        _, path2 = hws._route("/a")
+        _, path2 = hws._route(VirtualPath("/a"))
         assert path2 == "/b"
 
     def test_default_workspace_root_is_noop(self, hybrid_ws: HybridWorkspaceBackend):
         """When both Hybrid and real use /workspace, paths are unchanged."""
-        target, path = hybrid_ws._route("/workspace/src/main.py")
+        target, path = hybrid_ws._route(VirtualPath("/workspace/src/main.py"))
         assert target is hybrid_ws._real
         assert path == "/workspace/src/main.py"
 
@@ -1028,12 +1027,12 @@ class TestWorkspaceRootRewrite:
             workspace_root="/myworkspace",
         )
         # Mambo paths are independent of Hybrid.ws_root
-        target, path = hws._route("/.mambo/skills/tips.md")
+        target, path = hws._route(VirtualPath("/.mambo/skills/tips.md"))
         assert target is skills_be
         assert path == "/workspace/tips.md"
 
         # Real paths use Hybrid's ws_root
-        _, path2 = hws._route("/myworkspace/file.py")
+        _, path2 = hws._route(VirtualPath("/myworkspace/file.py"))
         assert path2 == "/workspace/file.py"
 
 
@@ -1044,22 +1043,22 @@ class TestRewritePredictable:
         from mambo_agents.backends.hybrid_workspace import HybridWorkspaceBackend as HWB
 
         # /.mambo/workspace/f.txt → strip → workspace/f.txt → prepend → /workspace/workspace/f.txt
-        assert HWB._rewrite("/.mambo/workspace/f.txt", "/.mambo", "/workspace") == "/workspace/workspace/f.txt"
+        assert HWB._rewrite(VirtualPath("/.mambo/workspace/f.txt"), "/.mambo", VirtualPath("/workspace")) == "/workspace/workspace/f.txt"
 
     def test_without_workspace_in_path(self):
         from mambo_agents.backends.hybrid_workspace import HybridWorkspaceBackend as HWB
 
-        assert HWB._rewrite("/.mambo/foo.txt", "/.mambo", "/workspace") == "/workspace/foo.txt"
+        assert HWB._rewrite(VirtualPath("/.mambo/foo.txt"), "/.mambo", VirtualPath("/workspace")) == "/workspace/foo.txt"
 
     def test_root_to_root(self):
         from mambo_agents.backends.hybrid_workspace import HybridWorkspaceBackend as HWB
 
-        assert HWB._rewrite("/.mambo", "/.mambo", "/workspace") == "/workspace"
+        assert HWB._rewrite(VirtualPath("/.mambo"), "/.mambo", VirtualPath("/workspace")) == "/workspace"
 
     def test_different_target_wsroot(self):
         from mambo_agents.backends.hybrid_workspace import HybridWorkspaceBackend as HWB
 
-        assert HWB._rewrite("/a/data.txt", "/a", "/b") == "/b/data.txt"
+        assert HWB._rewrite(VirtualPath("/a/data.txt"), "/a", VirtualPath("/b")) == "/b/data.txt"
 
 
 # ============================================================================
@@ -1078,12 +1077,12 @@ class TestLocalBackendInVirtualSlot:
             virtual_workspaces={"temp": local_slot},
         )
 
-        target, path = hws._route("/.mambo/temp/foo.txt")
+        target, path = hws._route(VirtualPath("/.mambo/temp/foo.txt"))
         assert target is local_slot
         assert path == "/workspace/foo.txt"
 
         # Write should succeed — path starts with local's ws_root
-        r = hws.write("/.mambo/temp/foo.txt", "hello temp", overwrite=True)
+        r = hws.write(VirtualPath("/.mambo/temp/foo.txt"), "hello temp", overwrite=True)
         assert r.error is None, r.error
 
         # Verify written to disk
@@ -1098,12 +1097,12 @@ class TestLocalBackendInVirtualSlot:
             virtual_workspaces={"temp": local_slot},
         )
 
-        target, path = hws._route("/.mambo/temp/workspace/bar.txt")
+        target, path = hws._route(VirtualPath("/.mambo/temp/workspace/bar.txt"))
         assert target is local_slot
         assert path == "/workspace/workspace/bar.txt"
 
         # Write should succeed
-        r = hws.write("/.mambo/temp/workspace/bar.txt", "nested", overwrite=True)
+        r = hws.write(VirtualPath("/.mambo/temp/workspace/bar.txt"), "nested", overwrite=True)
         assert r.error is None, r.error
 
         # Verify written to disk
@@ -1117,9 +1116,9 @@ class TestLocalBackendInVirtualSlot:
 
 
 def _make_root_fake(files=None):
-    """Create a _FakeBackend with ``workspace_root="/"`` (like MamboResourceBackend)."""
+    """Create a _FakeBackend with ``workspace_root="/workspace"``."""
     be = _FakeBackend()
-    be.workspace_root = "/"
+    be.workspace_root = VirtualPath("/workspace")
     if files is not None:
         be._files = files
     return be
@@ -1155,45 +1154,59 @@ class TestReversePath:
     HWB = HybridWorkspaceBackend
 
     def test_from_root_workspace(self):
-        """target ws_root="/" → strip nothing, prepend virtual prefix."""
-        result = self.HWB._reverse_path("/skill-a", "/", "/.mambo/skills")
+        """target ws_root="/workspace" → strip ws_root, prepend virtual prefix."""
+        result = self.HWB._reverse_path(
+            VirtualPath("/workspace/skill-a"), VirtualPath("/workspace"), VirtualPath("/.mambo/skills"),
+        )
         assert result == "/.mambo/skills/skill-a"
 
     def test_root_to_root(self):
         """Internal path IS the target ws_root."""
-        result = self.HWB._reverse_path("/", "/", "/.mambo/skills")
+        result = self.HWB._reverse_path(
+            VirtualPath("/workspace"), VirtualPath("/workspace"), VirtualPath("/.mambo/skills"),
+        )
         assert result == "/.mambo/skills"
 
     def test_from_default_workspace(self):
         """target ws_root="/workspace" → strip ws_root, prepend virtual prefix."""
-        result = self.HWB._reverse_path("/workspace/f.txt", "/workspace", "/.mambo")
+        result = self.HWB._reverse_path(
+            VirtualPath("/workspace/f.txt"), VirtualPath("/workspace"), VirtualPath("/.mambo"),
+        )
         assert result == "/.mambo/f.txt"
 
     def test_nested_from_default_workspace(self):
         """Nested path under /workspace."""
         result = self.HWB._reverse_path(
-            "/workspace/workspace/scratch.txt", "/workspace", "/.mambo",
+            VirtualPath("/workspace/workspace/scratch.txt"),
+            VirtualPath("/workspace"),
+            VirtualPath("/.mambo"),
         )
         assert result == "/.mambo/workspace/scratch.txt"
 
     def test_real_backend_with_different_root(self):
         """Hybrid ws_root=/workspace, real ws_root=/home/user/project."""
         result = self.HWB._reverse_path(
-            "/home/user/project/file.py", "/home/user/project", "/workspace",
+            VirtualPath("/home/user/project/file.py"),
+            VirtualPath("/home/user/project"),
+            VirtualPath("/workspace"),
         )
         assert result == "/workspace/file.py"
 
     def test_real_backend_root_exact(self):
         """Internal path matches real ws_root exactly."""
         result = self.HWB._reverse_path(
-            "/home/user/project", "/home/user/project", "/workspace",
+            VirtualPath("/home/user/project"),
+            VirtualPath("/home/user/project"),
+            VirtualPath("/workspace"),
         )
         assert result == "/workspace"
 
     def test_directory_path_with_trailing_slash(self):
         """Directory paths with trailing slash are handled correctly."""
-        result = self.HWB._reverse_path("/skill-a/", "/", "/.mambo/skills")
-        assert result == "/.mambo/skills/skill-a/"
+        result = self.HWB._reverse_path(
+            VirtualPath("/workspace/skill-a/"), VirtualPath("/workspace"), VirtualPath("/.mambo/skills"),
+        )
+        assert result == "/.mambo/skills/skill-a"
 
 
 # ============================================================================
@@ -1207,62 +1220,62 @@ class TestLsReverseTranslation:
     def test_named_virtual_workspace_dirs(self, tmp_root: Path):
         """Directories under named virtual workspace have translated paths."""
         skills_be = _make_root_fake({
-            "/skill-a/SKILL.md": "# Skill A",
-            "/skill-b/SKILL.md": "# Skill B",
+            "/workspace/skill-a/SKILL.md": "# Skill A",
+            "/workspace/skill-b/SKILL.md": "# Skill B",
         })
         hws = HybridWorkspaceBackend(
             real_backend=LocalBackend(root_dir=str(tmp_root)),
             virtual_workspaces={"skills": skills_be},
         )
-        result = hws.ls("/.mambo/skills/")
+        result = hws.ls(VirtualPath("/.mambo/skills/"))
         assert result.entries is not None
         dirs = [e for e in result.entries if e.is_dir]
         assert len(dirs) >= 2
         for d in dirs:
-            assert d.path.startswith(
+            assert str(d.path).startswith(
                 "/.mambo/skills/"
             ), f"Dir path {d.path} not under /.mambo/skills/"
 
     def test_named_virtual_workspace_no_internal_leakage(self, tmp_root: Path):
-        """No internal paths (e.g. bare /skill-a) leak to caller."""
+        """No internal paths (e.g. bare /workspace/skill-a) leak to caller."""
         skills_be = _make_root_fake({
-            "/skill-a/SKILL.md": "# A",
+            "/workspace/skill-a/SKILL.md": "# A",
         })
         hws = HybridWorkspaceBackend(
             real_backend=LocalBackend(root_dir=str(tmp_root)),
             virtual_workspaces={"skills": skills_be},
         )
-        result = hws.ls("/.mambo/skills/")
+        result = hws.ls(VirtualPath("/.mambo/skills/"))
         assert result.entries is not None
         for e in result.entries:
             # Must NOT be a raw internal path from the sub-backend
-            assert not e.path.startswith("/skill"), (
+            assert not str(e.path).startswith("/skill"), (
                 f"Internal path leaked: {e.path}"
             )
-            assert e.path.startswith("/.mambo/"), (
+            assert str(e.path).startswith("/.mambo/"), (
                 f"Path {e.path} not in external namespace"
             )
 
     def test_default_mambo_ls(self, hybrid_ws: HybridWorkspaceBackend):
         """ls on /.mambo/ returns paths under /.mambo/ (not /workspace/...)."""
-        _write_virtual(hybrid_ws, "/.mambo/workspace/a.txt", "a")
-        _write_virtual(hybrid_ws, "/.mambo/workspace/b.txt", "b")
+        _write_virtual(hybrid_ws, VirtualPath("/.mambo/workspace/a.txt"), "a")
+        _write_virtual(hybrid_ws, VirtualPath("/.mambo/workspace/b.txt"), "b")
         with _simulate_graph(hybrid_ws._default_mambo):
-            result = hybrid_ws.ls("/.mambo/workspace/")
+            result = hybrid_ws.ls(VirtualPath("/.mambo/workspace/"))
         assert result.entries is not None
         for e in result.entries:
-            assert e.path.startswith("/.mambo/"), (
+            assert str(e.path).startswith("/.mambo/"), (
                 f"Path {e.path} not in external namespace"
             )
 
     def test_real_backend_ls_preserves_paths(self, tmp_root: Path):
         """ls on real backend paths is unaffected (regression check)."""
         hws = HybridWorkspaceBackend(real_backend=LocalBackend(root_dir=str(tmp_root)))
-        hws.write(f"{_W}/project/x.py", "code", overwrite=True)
-        result = hws.ls(f"{_W}/project/")
+        hws.write(VirtualPath(f"{_W}/project/x.py"), "code", overwrite=True)
+        result = hws.ls(VirtualPath(f"{_W}/project/"))
         assert result.entries is not None
         paths = [e.path for e in result.entries]
-        assert any(f"{_W}/project/x.py" in p for p in paths)
+        assert any(f"{_W}/project/x.py" in str(p) for p in paths)
 
     def test_empty_directory(self, tmp_root: Path):
         """ls on an empty named virtual workspace returns no entries (not an error)."""
@@ -1271,7 +1284,7 @@ class TestLsReverseTranslation:
             real_backend=LocalBackend(root_dir=str(tmp_root)),
             virtual_workspaces={"skills": skills_be},
         )
-        result = hws.ls("/.mambo/skills/")
+        result = hws.ls(VirtualPath("/.mambo/skills/"))
         assert result.entries is None or len(result.entries) == 0
 
 
@@ -1285,38 +1298,40 @@ class TestGrepReverseTranslation:
 
     def test_named_virtual_workspace(self, tmp_root: Path):
         fake_be = _make_root_fake({
-            "/skill-a/SKILL.md": "name: skill-a\ndescription: does stuff\n---",
-            "/skill-b/SKILL.md": "name: skill-b\ndescription: other stuff\n---",
+            "/workspace/skill-a/SKILL.md": "name: skill-a\ndescription: does stuff\n---",
+            "/workspace/skill-b/SKILL.md": "name: skill-b\ndescription: other stuff\n---",
         })
         hws = HybridWorkspaceBackend(
             real_backend=LocalBackend(root_dir=str(tmp_root)),
             virtual_workspaces={"skills": fake_be},
         )
-        result = hws.grep("description", path="/.mambo/skills/")
+        result = hws.grep("description", path=VirtualPath("/.mambo/skills/"))
         assert result.matches is not None
         assert len(result.matches) >= 2
         for m in result.matches:
-            assert m.path.startswith("/.mambo/skills/"), (
+            assert str(m.path).startswith("/.mambo/skills/"), (
                 f"Match path {m.path} not in external namespace"
             )
 
     def test_default_mambo(self, hybrid_ws: HybridWorkspaceBackend):
-        _write_virtual(hybrid_ws, "/.mambo/notes.txt", "important note here")
+        _write_virtual(hybrid_ws, VirtualPath("/.mambo/notes.txt"), "important note here")
         with _simulate_graph(hybrid_ws._default_mambo):
-            result = hybrid_ws.grep("important", path="/.mambo/")
+            result = hybrid_ws.grep("important", path=VirtualPath("/.mambo/"))
         assert result.matches is not None
         for m in result.matches:
-            assert m.path.startswith("/.mambo/"), (
+            assert str(m.path).startswith("/.mambo/"), (
                 f"Match path {m.path} not under /.mambo/"
             )
 
     def test_real_backend_preserves_paths(self, tmp_root: Path):
         hws = HybridWorkspaceBackend(real_backend=LocalBackend(root_dir=str(tmp_root)))
-        hws.write(f"{_W}/code.py", "def important(): pass", overwrite=True)
-        result = hws.grep("important", path=f"{_W}/")
+        hws.write(VirtualPath(f"{_W}/code.py"), "def important(): pass", overwrite=True)
+        result = hws.grep("important", path=VirtualPath(f"{_W}/"))
         assert result.matches is not None
         for m in result.matches:
-            assert m.path.startswith(f"{_W}/")
+            assert str(m.path).startswith(f"{_W}/")
+
+
 
 
 # ============================================================================
@@ -1329,40 +1344,42 @@ class TestGlobReverseTranslation:
 
     def test_named_virtual_workspace(self, tmp_root: Path):
         fake_be = _make_root_fake({
-            "/skill-a/SKILL.md": "content a",
-            "/skill-a/helper.py": "print('a')",
-            "/skill-b/SKILL.md": "content b",
+            "/workspace/skill-a/SKILL.md": "content a",
+            "/workspace/skill-a/helper.py": "print('a')",
+            "/workspace/skill-b/SKILL.md": "content b",
         })
         hws = HybridWorkspaceBackend(
             real_backend=LocalBackend(root_dir=str(tmp_root)),
             virtual_workspaces={"skills": fake_be},
         )
-        result = hws.glob("*SKILL*", path="/.mambo/skills/")
+        result = hws.glob("*SKILL*", path=VirtualPath("/.mambo/skills/"))
         assert result.matches is not None
         for m in result.matches:
-            assert m.path.startswith("/.mambo/skills/"), (
+            assert str(m.path).startswith("/.mambo/skills/"), (
                 f"Match path {m.path} not in external namespace"
             )
 
     def test_default_mambo(self, hybrid_ws: HybridWorkspaceBackend):
-        _write_virtual(hybrid_ws, "/.mambo/a.txt", "a")
-        _write_virtual(hybrid_ws, "/.mambo/b.md", "b")
+        _write_virtual(hybrid_ws, VirtualPath("/.mambo/a.txt"), "a")
+        _write_virtual(hybrid_ws, VirtualPath("/.mambo/b.md"), "b")
         with _simulate_graph(hybrid_ws._default_mambo):
-            result = hybrid_ws.glob("*.txt", path="/.mambo/")
+            result = hybrid_ws.glob("*.txt", path=VirtualPath("/.mambo/"))
         assert result.matches is not None
         for m in result.matches:
-            assert m.path.startswith("/.mambo/"), (
+            assert str(m.path).startswith("/.mambo/"), (
                 f"Match path {m.path} not under /.mambo/"
             )
 
     def test_real_backend_preserves_paths(self, tmp_root: Path):
         hws = HybridWorkspaceBackend(real_backend=LocalBackend(root_dir=str(tmp_root)))
-        hws.write(f"{_W}/x.py", "1", overwrite=True)
-        hws.write(f"{_W}/y.txt", "2", overwrite=True)
-        result = hws.glob("*.py", path=f"{_W}/")
+        hws.write(VirtualPath(f"{_W}/x.py"), "1", overwrite=True)
+        hws.write(VirtualPath(f"{_W}/y.txt"), "2", overwrite=True)
+        result = hws.glob("*.py", path=VirtualPath(f"{_W}/"))
         assert result.matches is not None
         for m in result.matches:
-            assert m.path.startswith(f"{_W}/")
+            assert str(m.path).startswith(f"{_W}/")
+
+
 
 
 # ============================================================================
@@ -1375,18 +1392,18 @@ class TestAglobPathForwardingFix:
     original external path."""
 
     def test_passes_rewritten_path_not_original(self, tmp_root: Path):
-        """If aglob passed the original path ``/.mambo/skills/`` to a backend
-        whose files are stored under ``/``, glob would find zero matches.
-        With the fix it passes ``/`` and finds the files."""
+        """If aglob passed the original path ``/.mambo/skills/`` to a backend,
+        glob would find zero matches.  With the fix it passes the rewritten
+        path and finds the files."""
         skills_be = _make_root_fake({
-            "/skill-a/SKILL.md": "content a",
-            "/skill-b/SKILL.md": "content b",
+            "/workspace/skill-a/SKILL.md": "content a",
+            "/workspace/skill-b/SKILL.md": "content b",
         })
         hws = HybridWorkspaceBackend(
             real_backend=LocalBackend(root_dir=str(tmp_root)),
             virtual_workspaces={"skills": skills_be},
         )
-        result = hws.glob("*SKILL*", path="/.mambo/skills/")
+        result = hws.glob("*SKILL*", path=VirtualPath("/.mambo/skills/"))
         assert result.matches is not None
         # Both SKILL.md files should be found under "/"
         assert len(result.matches) >= 2, (
@@ -1407,10 +1424,10 @@ class TestSkillsMiddlewareIntegration:
     def test_skill_discovery_full_flow(self, tmp_root: Path):
         """Step-by-step: ls → collect dirs → build SKILL.md paths → download."""
         skills_be = _make_root_fake({
-            "/cat-girl/SKILL.md": (
+            "/workspace/cat-girl/SKILL.md": (
                 "---\nname: cat-girl\ndescription: Cat girl skill\n---\n# Meow"
             ),
-            "/web-research/SKILL.md": (
+            "/workspace/web-research/SKILL.md": (
                 "---\nname: web-research\ndescription: Research skill\n---\n# Research"
             ),
         })
@@ -1420,7 +1437,7 @@ class TestSkillsMiddlewareIntegration:
         )
 
         # Step 1: ls (simulates SkillsMiddleware._alist_skills_with_errors)
-        ls_result = hws.ls("/.mambo/skills/")
+        ls_result = hws.ls(VirtualPath("/.mambo/skills/"))
         assert ls_result.error is None, ls_result.error
         assert ls_result.entries is not None
 
@@ -1428,7 +1445,7 @@ class TestSkillsMiddlewareIntegration:
         skill_dirs: list[str] = []
         for item in ls_result.entries:
             if item.is_dir:
-                skill_dirs.append(item.path)
+                skill_dirs.append(str(item.path))
 
         assert len(skill_dirs) >= 2, f"Expected >=2 dirs, got {skill_dirs}"
 
@@ -1445,7 +1462,7 @@ class TestSkillsMiddlewareIntegration:
             )
 
         # Step 4: download SKILL.md files
-        responses = hws.download_files(skill_md_paths)
+        responses = hws.download_files([VirtualPath(p) for p in skill_md_paths])
         assert len(responses) == len(skill_md_paths)
         for r in responses:
             assert r.error is None, f"Download error for {r.path}: {r.error}"
@@ -1468,7 +1485,7 @@ class TestSkillsMiddlewareIntegration:
         """Without reverse translation, paths would be wrong and downloads fail.
         This test verifies the fix is in place: downloads succeed."""
         skills_be = _make_root_fake({
-            "/my-skill/SKILL.md": (
+            "/workspace/my-skill/SKILL.md": (
                 "---\nname: my-skill\ndescription: A skill\n---\n# My Skill"
             ),
         })
@@ -1477,16 +1494,16 @@ class TestSkillsMiddlewareIntegration:
             virtual_workspaces={"skills": skills_be},
         )
 
-        ls_result = hws.ls("/.mambo/skills/")
+        ls_result = hws.ls(VirtualPath("/.mambo/skills/"))
         assert ls_result.entries is not None
 
-        dirs = [e.path for e in ls_result.entries if e.is_dir]
+        dirs = [str(e.path) for e in ls_result.entries if e.is_dir]
         assert len(dirs) == 1
 
         skill_md_path = str(PurePosixPath(dirs[0].replace("\\", "/")) / "SKILL.md")
         assert skill_md_path.startswith("/.mambo/skills/")
 
-        results = hws.download_files([skill_md_path])
+        results = hws.download_files([VirtualPath(skill_md_path)])
         assert len(results) == 1
         assert results[0].error is None, (
             f"Download failed: {results[0].error}. "
@@ -1501,7 +1518,7 @@ class TestSkillsMiddlewareIntegration:
             real_backend=LocalBackend(root_dir=str(tmp_root)),
             virtual_workspaces={"skills": skills_be},
         )
-        ls_result = hws.ls("/.mambo/skills/")
+        ls_result = hws.ls(VirtualPath("/.mambo/skills/"))
         assert ls_result.entries is None or len(ls_result.entries) == 0
 
 
@@ -1516,32 +1533,32 @@ class TestAsyncReverseTranslation:
     @pytest.mark.asyncio
     async def test_als_named_virtual_workspace(self, tmp_root: Path):
         skills_be = _make_root_fake({
-            "/skill-a/SKILL.md": "# A",
+            "/workspace/skill-a/SKILL.md": "# A",
         })
         hws = HybridWorkspaceBackend(
             real_backend=LocalBackend(root_dir=str(tmp_root)),
             virtual_workspaces={"skills": skills_be},
         )
-        result = await hws.als("/.mambo/skills/")
+        result = await hws.als(VirtualPath("/.mambo/skills/"))
         assert result.entries is not None
         for e in result.entries:
-            assert e.path.startswith("/.mambo/skills/"), (
+            assert str(e.path).startswith("/.mambo/skills/"), (
                 f"Path {e.path} not in external namespace"
             )
 
     @pytest.mark.asyncio
     async def test_agrep_named_virtual_workspace(self, tmp_root: Path):
         fake_be = _make_root_fake({
-            "/skill-a/SKILL.md": "name: skill-a\ndescription: A skill\n---",
+            "/workspace/skill-a/SKILL.md": "name: skill-a\ndescription: A skill\n---",
         })
         hws = HybridWorkspaceBackend(
             real_backend=LocalBackend(root_dir=str(tmp_root)),
             virtual_workspaces={"skills": fake_be},
         )
-        result = await hws.agrep("description", path="/.mambo/skills/")
+        result = await hws.agrep("description", path=VirtualPath("/.mambo/skills/"))
         assert result.matches is not None
         for m in result.matches:
-            assert m.path.startswith("/.mambo/skills/"), (
+            assert str(m.path).startswith("/.mambo/skills/"), (
                 f"Match path {m.path} not in external namespace"
             )
 
@@ -1549,19 +1566,19 @@ class TestAsyncReverseTranslation:
     async def test_aglob_named_virtual_workspace(self, tmp_root: Path):
         """Verifies both the path-forwarding fix AND reverse translation."""
         fake_be = _make_root_fake({
-            "/skill-a/SKILL.md": "content a",
+            "/workspace/skill-a/SKILL.md": "content a",
         })
         hws = HybridWorkspaceBackend(
             real_backend=LocalBackend(root_dir=str(tmp_root)),
             virtual_workspaces={"skills": fake_be},
         )
-        result = await hws.aglob("*SKILL*", path="/.mambo/skills/")
+        result = await hws.aglob("*SKILL*", path=VirtualPath("/.mambo/skills/"))
         assert result.matches is not None
         assert len(result.matches) >= 1, (
             "aglob found nothing — path forwarding may still be broken"
         )
         for m in result.matches:
-            assert m.path.startswith("/.mambo/skills/"), (
+            assert str(m.path).startswith("/.mambo/skills/"), (
                 f"Match path {m.path} not in external namespace"
             )
 
@@ -1585,70 +1602,171 @@ class TestOutOfWorkspacePaths:
     # -- _route still throws ValueError for invalid paths -------------------
 
     def test_route_raises_for_outside_path(self, hws: HybridWorkspaceBackend):
-        with pytest.raises(ValueError, match="Cannot rewrite path"):
-            hws._route("/home/ramenl")
+        with pytest.raises(ValueError, match="is not under"):
+            hws._route(VirtualPath("/home/ramenl"))
 
     def test_route_raises_for_absolute_root(self, hws: HybridWorkspaceBackend):
-        with pytest.raises(ValueError, match="Cannot rewrite path"):
-            hws._route("/etc/passwd")
+        with pytest.raises(ValueError, match="is not under"):
+            hws._route(VirtualPath("/etc/passwd"))
 
     # -- Operation methods catch ValueError and return error results --------
 
     def test_ls_outside_workspace_returns_error(self, hws: HybridWorkspaceBackend):
-        r = hws.ls("/home/ramenl")
+        r = hws.ls(VirtualPath("/home/ramenl"))
         assert r.error is not None
         assert "无效" in r.error
-        assert hws.workspace_root in r.error
+        assert hws.workspace_root.value in r.error
 
     def test_read_outside_workspace_returns_error(self, hws: HybridWorkspaceBackend):
-        r = hws.read("/home/ramenl/.bashrc")
+        r = hws.read(VirtualPath("/home/ramenl/.bashrc"))
         assert r.error is not None
         assert "无效" in r.error
 
     def test_read_raw_outside_workspace_returns_error(self, hws: HybridWorkspaceBackend):
-        r = hws.read_raw("/home/ramenl/.bashrc")
+        r = hws.read_raw(VirtualPath("/home/ramenl/.bashrc"))
         assert r.error is not None
         assert "无效" in r.error
 
     def test_grep_outside_workspace_returns_error(self, hws: HybridWorkspaceBackend):
-        r = hws.grep("password", path="/home")
+        r = hws.grep("password", path=VirtualPath("/home"))
         assert r.error is not None
         assert "无效" in r.error
 
     def test_glob_outside_workspace_returns_error(self, hws: HybridWorkspaceBackend):
-        r = hws.glob("*", path="/home")
+        r = hws.glob("*", path=VirtualPath("/home"))
         assert r.error is not None
         assert "无效" in r.error
 
     # -- Error message content ------------------------------------------------
 
     def test_error_includes_workspace_root(self, hws: HybridWorkspaceBackend):
-        r = hws.ls("/tmp")
-        assert hws.workspace_root in r.error
+        r = hws.ls(VirtualPath("/tmp"))
+        assert hws.workspace_root.value in r.error
 
     def test_error_includes_mambo_prefix(self, hws: HybridWorkspaceBackend):
-        r = hws.read("/root/.profile")
-        assert hws._prefix in r.error
+        r = hws.read(VirtualPath("/root/.profile"))
+        assert hws._prefix.value in r.error
 
     def test_error_includes_named_virtual_workspaces(self, hws: HybridWorkspaceBackend):
-        r = hws.glob("*", path="/opt")
+        r = hws.glob("*", path=VirtualPath("/opt"))
         assert "/.mambo/skills/" in r.error
 
     def test_error_includes_real_backend_mapping(self, hws: HybridWorkspaceBackend):
-        r = hws.ls("/home/ramenl")
+        r = hws.ls(VirtualPath("/home/ramenl"))
         assert "映射至真实路径" in r.error
-        assert hws._real.workspace_root in r.error
+        assert hws._real.workspace_root.value in r.error
 
     # -- _valid_paths_description --------------------------------------------
 
     def test_valid_paths_description_structure(self, hws: HybridWorkspaceBackend):
         desc = hws._valid_paths_description()
-        assert hws.workspace_root in desc
-        assert hws._prefix in desc
+        assert hws.workspace_root.value in desc
+        assert hws._prefix.value in desc
         assert "映射至真实路径" in desc
-        assert hws._real.workspace_root in desc
+        assert hws._real.workspace_root.value in desc
 
     def test_valid_paths_description_includes_named(self, hws: HybridWorkspaceBackend):
         desc = hws._valid_paths_description()
         assert "/.mambo/skills/" in desc
         assert "虚拟工作区" in desc
+
+
+# ============================================================================
+# VirtualPath integration — path-traversal protection
+# ============================================================================
+
+
+class TestVirtualPathIntegration:
+    """End-to-end: VirtualPath syntax validation protects the backend pipeline."""
+
+    @pytest.fixture
+    def hws(self, tmp_root: Path) -> HybridWorkspaceBackend:
+        return HybridWorkspaceBackend(real_backend=LocalBackend(root_dir=str(tmp_root)))
+
+    # -- VirtualPath: construction-time rejection ----------------------------
+
+    def test_route_rejects_dotdot_traversal(self, hws: HybridWorkspaceBackend):
+        """VirtualPath construction blocks '..' before it reaches _route."""
+        with pytest.raises(ValidationError, match="must not contain '..'"):
+            VirtualPath("/workspace/../../etc/passwd")
+
+    def test_route_rejects_double_slash(self, hws: HybridWorkspaceBackend):
+        """VirtualPath construction blocks '//' before it reaches _route."""
+        with pytest.raises(ValidationError, match="must not contain '//'"):
+            VirtualPath("/workspace//src")
+
+    def test_route_rejects_non_absolute(self, hws: HybridWorkspaceBackend):
+        """VirtualPath construction rejects non-absolute paths."""
+        with pytest.raises(ValidationError, match="must be an absolute path"):
+            VirtualPath("workspace/src")
+
+    def test_route_accepts_valid_path(self, hws: HybridWorkspaceBackend):
+        """Valid absolute path under workspace_root passes validation."""
+        target, path = hws._route(VirtualPath("/workspace/src/main.py"))
+        assert target is hws._real
+        assert path == "/workspace/src/main.py"
+
+    # -- Public methods with VirtualPath -----------------------------------
+
+    def test_write_valid_path_succeeds(self, hws: HybridWorkspaceBackend):
+        """Write to a valid workspace path."""
+        r = hws.write(VirtualPath("/workspace/f.txt"), "hello")
+        assert r.error is None
+        assert r.path == "/workspace/f.txt"
+
+    def test_read_valid_path_succeeds(self, hws: HybridWorkspaceBackend):
+        """Read from a valid workspace path."""
+        hws.write(VirtualPath("/workspace/f.txt"), "data")
+        r = hws.read(VirtualPath("/workspace/f.txt"))
+        assert r.error is None
+        assert r.content == "data"
+
+    def test_ls_workspace_root(self, hws: HybridWorkspaceBackend):
+        """Listing workspace root should not crash."""
+        hws.write(VirtualPath("/workspace/a.txt"), "a")
+        r = hws.ls(VirtualPath("/workspace"))
+        assert r.error is None
+        assert r.entries is not None
+
+    # -- Workspace boundary: outside-path returns error, not crash ---------
+
+    def test_write_outside_workspace_returns_error(self, hws: HybridWorkspaceBackend):
+        """Writing to a path outside workspace returns error, doesn't crash."""
+        r = hws.write(VirtualPath("/etc/hosts"), "evil")
+        assert r.error is not None
+        assert "无效" in r.error
+
+    def test_edit_outside_workspace_returns_error(self, hws: HybridWorkspaceBackend):
+        """Editing outside workspace returns error result, doesn't crash."""
+        r = hws.edit(VirtualPath("/etc/crontab"), "old", "new")
+        assert r.error is not None
+        assert "无效" in r.error
+
+    # -- VirtualPath pass-through via _route ---------------------------------
+
+    def test_virtual_path_roundtrips_through_route(self, hws: HybridWorkspaceBackend):
+        """VirtualPath passes through _route and roundtrips correctly."""
+        target, stripped = hws._route(VirtualPath("/workspace/test.txt"))
+        r = target.write(stripped, "coerced!", overwrite=True)
+        assert r.error is None
+        r2 = target.read(stripped)
+        assert r2.content == "coerced!"
+
+    def test_route_preserves_virtual_path_for_valid_input(self, hws: HybridWorkspaceBackend):
+        """VirtualPath passes through _route unchanged for valid paths."""
+        vp = VirtualPath("/workspace/project/main.py")
+        target, rewritten = hws._route(vp)
+        assert rewritten == vp
+        assert target is hws._real
+
+    # -- Double-slash and dotdot are blocked by VirtualPath at construction
+
+    def test_virtual_path_blocks_dotdot_before_route(self):
+        """VirtualPath constructor blocks '..' before it reaches _route."""
+        with pytest.raises(ValidationError, match="must not contain '..'"):
+            VirtualPath("/workspace/../../etc/passwd")
+
+    def test_virtual_path_blocks_double_slash_before_route(self):
+        """VirtualPath constructor blocks '//' before it reaches _route."""
+        with pytest.raises(ValidationError, match="must not contain '//'"):
+            VirtualPath("/workspace//src/secret")

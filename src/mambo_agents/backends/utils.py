@@ -8,7 +8,9 @@ from __future__ import annotations
 
 from typing import Literal
 
-from pydantic import BaseModel
+from pydantic import BaseModel, ValidationError
+
+from mambo_agents.backends.schemas import EditResult
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -26,13 +28,20 @@ MAX_LINE_LENGTH = 5000
 # ---------------------------------------------------------------------------
 
 
-def human_size(size: int) -> str:
-    """Format *size* as a human-readable string (e.g. ``"1.2 MB"``)."""
-    for unit in ("B", "KB", "MB", "GB"):
-        if size < 1024:
-            return f"{size} {unit}"
-        size //= 1024
-    return f"{size} TB"
+def format_validation_error(e: ValidationError) -> str:
+    """Format a Pydantic ``ValidationError`` into a readable message for the LLM.
+
+    Produces a bullet list of ``field: reason`` entries so the AI can
+    understand exactly which argument was rejected and why, then retry
+    with a corrected value.
+    """
+    errors = e.errors()
+    lines = ["Validation error(s):"]
+    for err in errors:
+        loc = " -> ".join(str(p) for p in err.get("loc", ()))
+        msg = err.get("msg", "unknown error")
+        lines.append(f"  • {loc}: {msg}")
+    return "\n".join(lines)
 
 
 def format_with_line_numbers(content: str, start_line: int = 1) -> str:
@@ -82,56 +91,7 @@ class TreeEntry(BaseModel):
 
 
 # ---------------------------------------------------------------------------
-# Path validation
-# ---------------------------------------------------------------------------
-
-
-def validate_canonical_path(value: str, name: str = "path") -> str:
-    """Validate and normalize a virtual-filesystem path.
-
-    A canonical path is:
-
-    - Non-empty and non-whitespace-only
-    - Absolute (starts with ``"/"``)
-    - Not ``"/"`` (root directory is forbidden as a workspace anchor)
-    - Does not contain ``".."`` segments (no path traversal)
-    - Does not contain ``"//"`` (no double slashes)
-
-    Trailing slashes are stripped on success, so callers can assign the
-    return value directly.
-
-    Args:
-        value: The path string to validate.
-        name: Human-readable name for the parameter (used in error messages).
-
-    Returns:
-        Normalized path without trailing slash.
-
-    Raises:
-        ValueError: If *value* violates any canonical-path constraint.
-    """
-    if not value or not value.strip():
-        raise ValueError(f"{name} must not be empty")
-    if not value.startswith("/"):
-        raise ValueError(
-            f"{name} must be an absolute path starting with '/', got {value!r}"
-        )
-    normalized = value.rstrip("/")
-    if normalized == "/":
-        raise ValueError(
-            f"{name}='/' is forbidden; use a subdirectory like '/workspace'"
-        )
-    if ".." in normalized.split("/"):
-        raise ValueError(
-            f"{name} must not contain '..' path traversal, got {value!r}"
-        )
-    if "//" in normalized:
-        raise ValueError(f"{name} must not contain '//', got {value!r}")
-    return normalized
-
-
-# ---------------------------------------------------------------------------
-# Edit helpers
+# Tree formatter
 # ---------------------------------------------------------------------------
 
 
@@ -140,8 +100,8 @@ def format_tree_entries(
 ) -> str:
     """Render ``TreeEntry`` list as a visual directory tree.
 
-    Used by both ``LocalBackend`` and ``SshBackend`` – the tree-walk
-    logic is backend-specific, but the formatting is shared.
+    The tree-walk logic is backend-specific; this function provides the
+    shared visual formatting regardless of which backend produces the entries.
 
     Directory markers are appended to the display name:
     - ``/(empty)`` — directory has no children
@@ -244,8 +204,6 @@ def detect_trailing_newline_mismatch(
     Returns ``None`` when no trailing-newline mismatch is detected (the
     caller should fall through to the generic "not found" error).
     """
-    from mambo_agents.backends.protocol import EditResult  # lazy – avoids circular import
-
     if not (
         old_str.endswith("\n")
         and len(old_str) > 1

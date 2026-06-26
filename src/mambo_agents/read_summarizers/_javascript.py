@@ -9,6 +9,7 @@ import tree_sitter_javascript
 import tree_sitter_typescript
 
 from mambo_agents.backends.protocol import ReadSummarizer
+from mambo_agents.backends.schemas import VirtualPath
 
 _JS_LANG = Language(tree_sitter_javascript.language())
 _TS_LANG = Language(tree_sitter_typescript.language_typescript())
@@ -31,8 +32,8 @@ def javascript_summarizer() -> ReadSummarizer:
         ".tsx": Parser(_TSX_LANG),
     }
 
-    def _summarize(file_path: str, content: str, max_chars: int) -> str:
-        suffix = PurePosixPath(file_path).suffix.lower()
+    def _summarize(file_path: VirtualPath, content: str, max_chars: int) -> str:
+        suffix = PurePosixPath(file_path.value).suffix.lower()
         parser = _parsers.get(suffix)
         if parser is None:
             return _fallback(file_path, content, max_chars)
@@ -46,7 +47,7 @@ def javascript_summarizer() -> ReadSummarizer:
 # ---------------------------------------------------------------------------
 
 
-def _fallback(file_path: str, content: str, max_chars: int) -> str:
+def _fallback(file_path: VirtualPath, content: str, max_chars: int) -> str:
     total_lines = content.count("\n") + 1
     return (
         f"[返回结果过大（{len(content):,} 字符，{total_lines:,} 行），"
@@ -57,7 +58,7 @@ def _fallback(file_path: str, content: str, max_chars: int) -> str:
 
 
 def _summarize_js(
-    file_path: str, content: str, max_chars: int, parser: Parser, suffix: str
+    file_path: VirtualPath, content: str, max_chars: int, parser: Parser, suffix: str
 ) -> str:
     total_lines = content.count("\n") + 1
     code = content.encode("utf-8")

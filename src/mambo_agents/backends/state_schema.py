@@ -55,9 +55,6 @@ def _file_data_reducer(
     ``None`` values in *right* signal file deletions (the key is removed
     from the channel).  Non-``None`` values overwrite the entry for that
     path.  All other keys are preserved unchanged.
-
-    Reference:
-        ``deepagents/middleware/filesystem.py`` (``file_data_reducer``)
     """
     if left is None:
         return {k: v for k, v in right.items() if v is not None}

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import pytest
 
+from mambo_agents.backends.schemas import VirtualPath
 from mambo_agents.read_summarizers import (
     c_summarizer,
     cpp_summarizer,
@@ -60,7 +61,7 @@ def test_factory_returns_callable(name: str, factory) -> None:
 def test_callable_accepts_three_args(name: str, factory) -> None:
     """The returned callable accepts (file_path, content, max_chars)."""
     s = factory()
-    result = s("/test.txt", "hello world", 100)
+    result = s(VirtualPath("/test.txt"), "hello world", 100)
     assert isinstance(result, str), f"{name} did not return a str"
 
 
@@ -68,7 +69,7 @@ def test_callable_accepts_three_args(name: str, factory) -> None:
 def test_fallback_on_unmatched_suffix(name: str, factory) -> None:
     """Unmatched file suffix → fallback (mentions offset + limit)."""
     s = factory()
-    result = s("/file.xyz", _build_class(200), MAX_CHARS)
+    result = s(VirtualPath("/file.xyz"), _build_class(200), MAX_CHARS)
     assert "offset" in result.lower(), f"{name} fallback missing offset hint"
     assert "limit" in result.lower(), f"{name} fallback missing limit hint"
 
@@ -93,7 +94,7 @@ def top_level(x: int) -> int:
     return x
 """
     s = python_summarizer()
-    result = s("/test.py", py_src, MAX_CHARS)
+    result = s(VirtualPath("/test.py"), py_src, MAX_CHARS)
 
     assert "L" in result
     assert "Foo" in result
@@ -106,7 +107,7 @@ def top_level(x: int) -> int:
 
 def test_python_handles_syntax_error() -> None:
     s = python_summarizer()
-    result = s("/test.py", "def broken(:", MAX_CHARS)
+    result = s(VirtualPath("/test.py"), "def broken(:", MAX_CHARS)
     assert "语法错误" in result or "无法解析" in result
 
 
@@ -128,7 +129,7 @@ export async function fetchData(url) {
 const square = (x) => x * x;
 """
     s = javascript_summarizer()
-    result = s("/test.js", js_src, MAX_CHARS)
+    result = s(VirtualPath("/test.js"), js_src, MAX_CHARS)
 
     assert "class Calculator" in result
     assert "fetchData" in result
@@ -146,7 +147,7 @@ class Admin implements User {
 }
 """
     s = javascript_summarizer()
-    result = s("/test.ts", ts_src, MAX_CHARS)
+    result = s(VirtualPath("/test.ts"), ts_src, MAX_CHARS)
     assert "interface User" in result
     assert "class Admin" in result
 
@@ -169,7 +170,7 @@ interface Processor {
 }
 """
     s = java_summarizer()
-    result = s("/test.java", java_src, MAX_CHARS)
+    result = s(VirtualPath("/test.java"), java_src, MAX_CHARS)
     assert "class App" in result
     assert "interface Processor" in result
     assert "main" in result
@@ -193,7 +194,7 @@ int add(int a, int b) {
 enum Result { OK, FAIL };
 """
     s = c_summarizer()
-    result = s("/test.c", c_src, MAX_CHARS)
+    result = s(VirtualPath("/test.c"), c_src, MAX_CHARS)
     assert "struct Node" in result
     assert "add" in result
     assert "enum Result" in result
@@ -201,7 +202,7 @@ enum Result { OK, FAIL };
 
 def test_c_handles_h_files() -> None:
     s = c_summarizer()
-    result = s("/test.h", "int add(int, int);", MAX_CHARS)
+    result = s(VirtualPath("/test.h"), "int add(int, int);", MAX_CHARS)
     assert isinstance(result, str)  # does not crash
 
 
@@ -222,7 +223,7 @@ namespace zoo {
 }
 """
     s = cpp_summarizer()
-    result = s("/test.cpp", cpp_src, MAX_CHARS)
+    result = s(VirtualPath("/test.cpp"), cpp_src, MAX_CHARS)
     assert "class Animal" in result
     assert "namespace zoo" in result
     assert "feed" in result
@@ -252,7 +253,7 @@ func NewConfig() *Config {
 func (c *Config) Start() {}
 """
     s = go_summarizer()
-    result = s("/test.go", go_src, MAX_CHARS)
+    result = s(VirtualPath("/test.go"), go_src, MAX_CHARS)
     assert "Runner" in result
     assert "Config" in result
     assert "NewConfig" in result
@@ -281,7 +282,7 @@ impl Person {
 }
 """
     s = rust_summarizer()
-    result = s("/test.rs", rust_src, MAX_CHARS)
+    result = s(VirtualPath("/test.rs"), rust_src, MAX_CHARS)
     assert "trait Named" in result
     assert "struct Person" in result
     assert "impl Person" in result
@@ -302,7 +303,7 @@ more text
 ## Section 2
 """
     s = markdown_summarizer()
-    result = s("/test.md", md_src, MAX_CHARS)
+    result = s(VirtualPath("/test.md"), md_src, MAX_CHARS)
     assert "# Title" in result
     assert "## Section 1" in result
     assert "### Sub 1.1" in result
@@ -311,7 +312,7 @@ more text
 
 def test_md_no_headings() -> None:
     s = markdown_summarizer()
-    result = s("/test.md", "just some text\nno headings\n", MAX_CHARS)
+    result = s(VirtualPath("/test.md"), "just some text\nno headings\n", MAX_CHARS)
     assert isinstance(result, str)
 
 
@@ -323,20 +324,20 @@ def test_md_no_headings() -> None:
 def test_json_extracts_keys() -> None:
     json_str = '{"name": "app", "version": 2, "deps": ["a", "b"], "config": null}'
     s = json_summarizer()
-    result = s("/test.json", json_str, MAX_CHARS)
+    result = s(VirtualPath("/test.json"), json_str, MAX_CHARS)
     for key in ("name", "version", "deps", "config"):
         assert key in result, f"missing key {key}"
 
 
 def test_json_handles_array() -> None:
     s = json_summarizer()
-    result = s("/test.json", "[1, 2, 3, 4, 5, 6, 7, 8]", MAX_CHARS)
+    result = s(VirtualPath("/test.json"), "[1, 2, 3, 4, 5, 6, 7, 8]", MAX_CHARS)
     assert "Array" in result or "array" in result
 
 
 def test_json_handles_parse_error() -> None:
     s = json_summarizer()
-    result = s("/test.json", "{bad json", MAX_CHARS)
+    result = s(VirtualPath("/test.json"), "{bad json", MAX_CHARS)
     assert isinstance(result, str)
 
 
@@ -348,7 +349,7 @@ def test_json_handles_parse_error() -> None:
 @pytest.mark.parametrize("name,factory", _ALL_SUMMARIZERS)
 def test_empty_file_does_not_crash(name: str, factory) -> None:
     s = factory()
-    result = s("/test.txt", "", MAX_CHARS)
+    result = s(VirtualPath("/test.txt"), "", MAX_CHARS)
     assert isinstance(result, str)
 
 
@@ -359,7 +360,7 @@ def test_content_shorter_than_limit_is_handled(name: str, factory) -> None:
     s = factory()
     # Force a matching file — use .py for python, .java for java, etc.
     # For simplicity, just ensure no exception is raised.
-    result = s("/test.txt", "small content", 1_000_000)
+    result = s(VirtualPath("/test.txt"), "small content", 1_000_000)
     assert isinstance(result, str)
 
 
@@ -370,7 +371,7 @@ def test_line_numbers_are_positive() -> None:
         + "    pass\n" * 100
     )
     s = python_summarizer()
-    result = s("/test.py", code, 500)
+    result = s(VirtualPath("/test.py"), code, 500)
     # Extract L-prefixed numbers
     import re
     nums = [int(m.group(1)) for m in re.finditer(r"L(\d+)", result)]

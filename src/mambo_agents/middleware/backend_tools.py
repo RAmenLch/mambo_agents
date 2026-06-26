@@ -22,7 +22,6 @@ from langchain.agents.middleware.types import (
 )
 from langchain.tools import ToolRuntime
 from langchain_core.messages import SystemMessage, ToolMessage
-from langchain_core.runnables.config import RunnableConfig
 from langchain_core.tools import BaseTool, StructuredTool
 from langgraph.prebuilt.tool_node import ToolCallRequest
 from langgraph.types import Command
@@ -30,7 +29,9 @@ from langgraph.typing import ContextT
 from pydantic import BaseModel, Field
 
 from mambo_agents.backends.protocol import BackendProtocol, ReadResult, ToolTimeoutError
+from mambo_agents.backends.schemas import VirtualPath
 from mambo_agents.backends.state_schema import FilesystemState
+from mambo_agents.backends.utils import format_validation_error
 
 
 # ---------------------------------------------------------------------------
@@ -176,7 +177,7 @@ _CORE_TOOLS = [
         ),
         "method": "ls",
         "fields": {
-            "path": (str, Field(description="Absolute path to list")),
+            "path": (VirtualPath, Field(description="Absolute path to list")),
         },
     },
     {
@@ -190,7 +191,7 @@ _CORE_TOOLS = [
         ),
         "method": "read",
         "fields": {
-            "file_path": (str, Field(description="Absolute file path")),
+            "file_path": (VirtualPath, Field(description="Absolute file path")),
             "offset": (int, Field(default=0, description="Line offset from start")),
             "limit": (int, Field(default=2000, description="Max lines to return")),
         },
@@ -204,7 +205,7 @@ _CORE_TOOLS = [
         ),
         "method": "write",
         "fields": {
-            "file_path": (str, Field(description="Absolute file path")),
+            "file_path": (VirtualPath, Field(description="Absolute file path")),
             "content": (str, Field(description="Content to write")),
             "overwrite": (bool, Field(default=False, description="If True, replace the file content entirely even if it already exists")),
         },
@@ -219,7 +220,7 @@ _CORE_TOOLS = [
         ),
         "method": "edit",
         "fields": {
-            "file_path": (str, Field(description="Absolute file path")),
+            "file_path": (VirtualPath, Field(description="Absolute file path")),
             "old_str": (str, Field(description="Exact text to replace. Must be unique unless replace_all is True.")),
             "new_str": (str, Field(description="Replacement text")),
             "replace_all": (bool, Field(default=False, description="If True, replace all occurrences of old_str. If False (default), old_str must appear exactly once.")),
@@ -238,7 +239,7 @@ _CORE_TOOLS = [
         "method": "grep",
         "fields": {
             "pattern": (str, Field(description="Text substring or regex pattern to find")),
-            "path": (str, Field(description="Base directory to search")),
+            "path": (VirtualPath, Field(description="Base directory to search")),
             "glob": (str | None, Field(default=None, description="Optional glob to filter filenames, e.g. '*.py'")),
             "regex": (bool, Field(default=False, description="If True, interpret pattern as regex. Default False (literal match).")),
             "offset": (int, Field(default=0, description="0-based index to start from (for pagination)")),
@@ -254,7 +255,7 @@ _CORE_TOOLS = [
         "method": "glob",
         "fields": {
             "pattern": (str, Field(description="Glob pattern to match")),
-            "path": (str, Field(description="Base directory to search")),
+            "path": (VirtualPath, Field(description="Base directory to search")),
         },
     },
 ]
@@ -277,7 +278,7 @@ _ASYNC_METHOD_MAP: dict[str, str] = {
 class _ReadSchema(BaseModel):
     """Schema for the read tool."""
 
-    file_path: Annotated[str, Field(description="Absolute file path")]
+    file_path: Annotated[VirtualPath, Field(description="Absolute file path")]
     offset: Annotated[int, Field(default=0, description="Line offset from start")]
     limit: Annotated[int, Field(default=2000, description="Max lines to return")]
     include_line_numbers: Annotated[
@@ -304,7 +305,7 @@ def _build_sync_read_tool(backend: BackendProtocol) -> StructuredTool:
     _wrapped_read_sync = backend._wrap_sync_with_timeout("read", backend.read)
 
     def sync_read(
-        file_path: Annotated[str, Field(description="Absolute file path")],
+        file_path: Annotated[VirtualPath, Field(description="Absolute file path")],
         offset: Annotated[int, Field(default=0, description="Line offset from start")],
         limit: Annotated[int, Field(default=2000, description="Max lines to return")],
         include_line_numbers: Annotated[
@@ -349,7 +350,7 @@ def _build_sync_read_tool(backend: BackendProtocol) -> StructuredTool:
     _wrapped_aread = backend._wrap_tool_coroutine("read", backend.aread)
 
     async def async_read(
-        file_path: Annotated[str, Field(description="Absolute file path")],
+        file_path: Annotated[VirtualPath, Field(description="Absolute file path")],
         offset: Annotated[int, Field(default=0, description="Line offset from start")],
         limit: Annotated[int, Field(default=2000, description="Max lines to return")],
         include_line_numbers: Annotated[
@@ -406,6 +407,7 @@ def _build_sync_read_tool(backend: BackendProtocol) -> StructuredTool:
         func=sync_read,
         coroutine=async_read,
         args_schema=_ReadSchema,
+        handle_validation_error=format_validation_error,
     )
 
 
@@ -460,7 +462,7 @@ def build_core_tools(backend: BackendProtocol) -> list[StructuredTool]:
         fields = dict(spec["fields"])
         if spec["name"] in ("grep", "glob") and "path" in fields:
             _, original_field = fields["path"]
-            fields["path"] = (str, Field(default=wr, description=original_field.description))
+            fields["path"] = (VirtualPath, Field(default=VirtualPath(wr), description=original_field.description))
 
         tools.append(
             StructuredTool(
@@ -472,6 +474,7 @@ def build_core_tools(backend: BackendProtocol) -> list[StructuredTool]:
                 ),
                 func=_make_func(spec["method"]),
                 coroutine=_make_coro(spec["method"]),
+                handle_validation_error=format_validation_error,
             )
         )
     return tools
@@ -629,7 +632,7 @@ class BackendToolsMiddleware(AgentMiddleware[FilesystemState, ContextT, Response
         if _estimate_tokens(text) <= self._evict_limit:  # type: ignore[operator]
             return message
 
-        file_path = f"{_EVICTION_PREFIX}/{tool_call_id}"
+        file_path = VirtualPath(f"{_EVICTION_PREFIX}/{tool_call_id}")
         write_result = self.backend.write(file_path, text)
         if write_result.error:
             # If we cannot persist the content, return the original — better
@@ -662,7 +665,7 @@ class BackendToolsMiddleware(AgentMiddleware[FilesystemState, ContextT, Response
         if _estimate_tokens(text) <= self._evict_limit:  # type: ignore[operator]
             return message
 
-        file_path = f"{_EVICTION_PREFIX}/{tool_call_id}"
+        file_path = VirtualPath(f"{_EVICTION_PREFIX}/{tool_call_id}")
         write_result = await self.backend.awrite(file_path, text)
         if write_result.error:
             return message

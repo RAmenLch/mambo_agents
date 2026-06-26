@@ -24,10 +24,10 @@ from __future__ import annotations
 
 import time
 from collections.abc import Awaitable, Callable, Sequence
-from typing import Any, Literal, NotRequired, TypedDict, cast
+from typing import Any, Literal, cast
 
 from langchain.agents.factory import create_agent as _langchain_create_agent
-from langchain.agents.middleware import HumanInTheLoopMiddleware, InterruptOnConfig
+from langchain.agents.middleware import HumanInTheLoopMiddleware
 from langchain.agents.middleware.types import (
     AgentMiddleware,
     AgentState,
@@ -48,12 +48,12 @@ from pydantic import BaseModel, ConfigDict, Field
 from mambo_agents.backends.protocol import BackendProtocol
 
 # ---------------------------------------------------------------------------
-# TypedDicts for subagent specification
+# Pydantic models for subagent specification
 # ---------------------------------------------------------------------------
 
 
-class SubAgent(TypedDict):
-    """Specification for a subagent.
+class SubAgent(BaseModel):
+    """Specification for a subagent to be compiled by the middleware.
 
     Required fields:
         name: Unique identifier for the subagent.
@@ -63,28 +63,31 @@ class SubAgent(TypedDict):
         system_prompt: Instructions for the subagent.
 
     Optional fields:
-        tools: Tools the subagent can use.
-            If not specified, inherits from the main agent.
+        tools: Tools the subagent can use. Default: empty list.
         model: Override the main agent's model.
         middleware: Additional middleware for this subagent.
         interrupt_on: Human-in-the-loop config for specific tools.
     """
 
+    model_config = ConfigDict(extra="forbid", arbitrary_types_allowed=True)
+
     name: str
     description: str
     system_prompt: str
-    tools: NotRequired[Sequence[BaseTool | Callable | dict[str, Any]]]
-    model: NotRequired[str | BaseChatModel]
-    middleware: NotRequired[list[AgentMiddleware]]
-    interrupt_on: NotRequired[dict[str, bool | InterruptOnConfig]]
+    tools: Sequence[BaseTool | Callable | dict[str, Any]] = Field(default_factory=list)
+    model: str | BaseChatModel | None = None
+    middleware: list[AgentMiddleware] = Field(default_factory=list)
+    interrupt_on: dict[str, Any] | None = None
 
 
-class CompiledSubAgent(TypedDict):
+class CompiledSubAgent(BaseModel):
     """A pre-compiled subagent.
 
     The runnable's state schema must include a ``'messages'`` key so the
     subagent can communicate results back to the main agent.
     """
+
+    model_config = ConfigDict(extra="forbid", arbitrary_types_allowed=True)
 
     name: str
     description: str
@@ -378,8 +381,10 @@ def _merge_updates_state(final: dict, chunk: dict) -> dict:
 # ---------------------------------------------------------------------------
 
 
-class _SubagentSpec(TypedDict):
+class _SubagentSpec(BaseModel):
     """Internal spec for building a task tool."""
+
+    model_config = ConfigDict(arbitrary_types_allowed=True)
 
     name: str
     description: str
@@ -408,10 +413,10 @@ def _build_task_tool(
         A ``StructuredTool`` that invokes subagents by type.
     """
     subagent_graphs: dict[str, Runnable] = {
-        spec["name"]: spec["runnable"] for spec in subagents
+        spec.name: spec.runnable for spec in subagents
     }
     subagent_description_str = "\n".join(
-        f"- {s['name']}: {s['description']}" for s in subagents
+        f"- {s.name}: {s.description}" for s in subagents
     )
 
     if task_description is None:
@@ -580,7 +585,8 @@ def _build_task_tool(
                 # In single-mode, assume "values" semantics
                 final_state = cast(dict, chunk)
 
-        # fallback
+        # If streaming yielded no final state (e.g. empty subagent graph),
+        # fall back to a direct invoke.
         if not final_state:
             final_state = await subagent.ainvoke(
                 subagent_state, subagent_config
@@ -661,7 +667,7 @@ class SubAgentMiddleware(AgentMiddleware[AgentState, ContextT, ResponseT]):
         # Build system prompt with available agent descriptions
         if system_prompt and subagent_specs:
             agents_desc = "\n".join(
-                f"- {s['name']}: {s['description']}" for s in subagent_specs
+                f"- {s.name}: {s.description}" for s in subagent_specs
             )
             self._system_prompt = (
                 system_prompt + "\n\nAvailable subagent types:\n" + agents_desc
@@ -678,55 +684,46 @@ class SubAgentMiddleware(AgentMiddleware[AgentState, ContextT, ResponseT]):
         specs: list[_SubagentSpec] = []
 
         for spec in self._subagents:
-            if "runnable" in spec:
-                compiled = cast("CompiledSubAgent", spec)
-                runnable = compiled["runnable"].with_config(
+            if isinstance(spec, CompiledSubAgent):
+                runnable = spec.runnable.with_config(
                     {
-                        "metadata": {"lc_agent_name": compiled["name"]},
-                        "run_name": compiled["name"],
+                        "metadata": {"lc_agent_name": spec.name},
+                        "run_name": spec.name,
                     }
                 )
                 specs.append(
-                    {
-                        "name": compiled["name"],
-                        "description": compiled["description"],
-                        "runnable": runnable,
-                    }
+                    _SubagentSpec(
+                        name=spec.name,
+                        description=spec.description,
+                        runnable=runnable,
+                    )
                 )
                 continue
 
-            # SubAgent — must have model and tools
-            sub = cast("SubAgent", spec)
-            if "model" not in sub:
+            # SubAgent — model is required if not provided
+            if spec.model is None:
                 raise ValueError(
-                    f"SubAgent '{sub['name']}' must specify 'model'"
-                )
-            if "tools" not in sub:
-                raise ValueError(
-                    f"SubAgent '{sub['name']}' must specify 'tools'"
+                    f"SubAgent '{spec.name}' must specify 'model'"
                 )
 
-            middleware: list[AgentMiddleware] = list(
-                sub.get("middleware", [])
-            )
-            interrupt_on = sub.get("interrupt_on")
-            if interrupt_on:
+            middleware: list[AgentMiddleware] = list(spec.middleware)
+            if spec.interrupt_on:
                 middleware.append(
-                    HumanInTheLoopMiddleware(interrupt_on=interrupt_on)
+                    HumanInTheLoopMiddleware(interrupt_on=spec.interrupt_on)
                 )
 
             specs.append(
-                {
-                    "name": sub["name"],
-                    "description": sub["description"],
-                    "runnable": _langchain_create_agent(
-                        sub["model"],
-                        system_prompt=sub["system_prompt"],
-                        tools=sub["tools"],
+                _SubagentSpec(
+                    name=spec.name,
+                    description=spec.description,
+                    runnable=_langchain_create_agent(
+                        spec.model,
+                        system_prompt=spec.system_prompt,
+                        tools=spec.tools,
                         middleware=middleware,
-                        name=sub["name"],
+                        name=spec.name,
                     ),
-                }
+                )
             )
 
         return specs

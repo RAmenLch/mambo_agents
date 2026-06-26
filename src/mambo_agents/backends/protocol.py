@@ -10,23 +10,33 @@ import asyncio
 import base64
 import mimetypes
 import threading
-from dataclasses import dataclass
 from pathlib import PurePosixPath
-from typing import Any, Awaitable, Callable, Literal, TypeVar
+from typing import Any, Awaitable, Callable, ClassVar, TypeVar
 
 from langchain_core.tools import StructuredTool
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, Field
 
-from mambo_agents.backends.utils import human_size
+from mambo_agents.backends.schemas import (
+    DownloadFileResult,
+    EditResult,
+    FileInfo,
+    FileType,
+    GlobResult,
+    GrepMatch,
+    GrepResult,
+    LsResult,
+    ReadResult,
+    UploadFileResult,
+    VirtualPath,
+    WriteResult,
+)
+
 
 
 # ============================================================================
-# File type classification
+# File type classification helpers
 # ============================================================================
 
-
-FileType = Literal["text", "image", "audio", "video", "file"]
-"""Classification of a file by its extension for multimodal dispatch."""
 
 _EXTENSION_TO_FILE_TYPE: dict[str, FileType] = {
     # Images (https://ai.google.dev/gemini-api/docs/image-understanding)
@@ -86,7 +96,7 @@ def _get_mime_type(path: str) -> str:
 # ============================================================================
 
 
-ReadSummarizer = Callable[[str, str, int], str]
+ReadSummarizer = Callable[[VirtualPath, str, int], str]
 """Callback that summarizes oversized text content.
 
 Args:
@@ -104,8 +114,7 @@ Returns:
 # ============================================================================
 
 
-@dataclass(frozen=True)
-class ToolTimeouts:
+class ToolTimeouts(BaseModel):
     """Per-tool timeout configuration (seconds).
 
     Each field maps to a tool name.  Pass an instance to any backend's
@@ -113,40 +122,36 @@ class ToolTimeouts:
 
     Defaults are chosen conservatively — actual values should be tuned
     per deployment based on repository size and network latency.
+
+    Use :meth:`get` for type-safe, fallback-aware timeout lookup.
     """
 
-    ls: float = 20.0
-    """``ls`` — directory listing (synchronous SFTP / filesystem call)."""
+    model_config = ConfigDict(frozen=True, extra="allow")
 
-    read: float = 60.0
-    """``read`` — single-file read (SFTP transfer with optional line-number formatting)."""
+    ls: float = Field(default=20.0, description="directory listing (synchronous SFTP / filesystem call).")
+    read: float = Field(default=60.0, description="single-file read (SFTP transfer with optional line-number formatting).")
+    write: float = Field(default=60.0, description="single-file create / overwrite.")
+    edit: float = Field(default=60.0, description="text replacement in an existing file.")
+    grep: float = Field(default=120.0, description="recursive text search.")
+    glob: float = Field(default=60.0, description="recursive pattern match.")
 
-    write: float = 60.0
-    """``write`` — single-file create / overwrite."""
+    _DEFAULT_TIMEOUT: ClassVar[float] = 60.0
 
-    edit: float = 60.0
-    """``edit`` — text replacement in an existing file (remote python3 or local)."""
+    def get(self, tool_name: str, default: float | None = None) -> float:
+        """Type-safe, fallback-aware timeout lookup.
 
-    grep: float = 120.0
-    """``grep`` — recursive text search (may fall back to remote ``os.walk``)."""
+        Args:
+            tool_name: The name of the tool (e.g. ``"read"``, ``"grep"``).
+            default: Override the default fallback timeout.  Falls back
+                to :attr:`_DEFAULT_TIMEOUT` (60 s) when omitted.
 
-    glob: float = 60.0
-    """``glob`` — recursive pattern match (remote ``glob.glob`` or ``find``)."""
-
-    tree: float = 60.0
-    """``tree`` — directory tree render (remote ``os.walk`` or ``find``)."""
-
-    delete: float = 30.0
-    """``delete`` — single-file removal (directories are rejected)."""
-
-    execute: float = 180.0
-    """``execute`` — arbitrary shell command on the remote server."""
-
-    upload: float = 60.0
-    """``upload_files`` — bulk file upload."""
-
-    download: float = 60.0
-    """``download_files`` — bulk file download."""
+        Returns:
+            The configured timeout in seconds.
+        """
+        data = self.model_dump()
+        if tool_name in data:
+            return data[tool_name]
+        return self._DEFAULT_TIMEOUT if default is None else default
 
 
 class ToolTimeoutError(Exception):
@@ -164,193 +169,6 @@ class ToolTimeoutError(Exception):
             f"Try narrowing the scope — use a more specific path, glob "
             f"pattern, or read limit."
         )
-
-
-# ============================================================================
-# Value objects
-# ============================================================================
-
-
-class FileInfo(BaseModel):
-    """Structured file / directory listing entry."""
-
-    model_config = ConfigDict(frozen=True)
-
-    path: str
-    """Absolute virtual path."""
-    is_dir: bool = False
-    size: int = 0
-    """Size in bytes (0 for directories)."""
-    modified_at: str = ""
-    """ISO-8601 timestamp or empty string."""
-    desc: str = ""
-    """Optional human-readable description / summary for the file or directory."""
-
-
-class GrepMatch(BaseModel):
-    """A single match from a grep search."""
-
-    model_config = ConfigDict(frozen=True)
-
-    path: str
-    """File path."""
-    line: int
-    """1-indexed line number."""
-    text: str
-    """Content of the matching line."""
-
-
-# ============================================================================
-# Result types
-# ============================================================================
-
-
-class LsResult(BaseModel):
-    """Result from ``ls()``."""
-
-    error: str | None = None
-    entries: list[FileInfo] | None = None
-
-    def __str__(self) -> str:
-        lines: list[str] = []
-        if self.error is not None:
-            lines.append(f"Warning: {self.error}")
-        if self.entries is not None:
-            for fi in self.entries:
-                desc_part = f"  -- {fi.desc.replace(chr(10), ' ')}" if fi.desc else ""
-                if fi.is_dir:
-                    lines.append(f"{fi.path}/{desc_part}")
-                else:
-                    lines.append(f"{fi.path}({human_size(fi.size)}){desc_part}")
-        if not lines:
-            return "(empty directory)"
-        return "\n".join(lines)
-
-
-class ReadResult(BaseModel):
-    """Result from ``read()``.
-
-    For text files, ``content`` carries plain text (no line numbers by
-    default) and ``encoding`` is ``"utf-8"``.  Pass
-    ``include_line_numbers=True`` to the ``read()`` call to get
-    ``cat -n``-style line-numbered output.  For binary files,
-    ``content`` is base64-encoded and ``encoding`` is ``"base64"``.
-
-    For non-text (multimodal) files, ``file_type`` is set to the
-    appropriate classification (``"image"``, ``"audio"``, ``"video"``,
-    or ``"file"``) and ``mime_type`` provides the IANA media type.
-    """
-
-    error: str | None = None
-    content: str | None = None
-    total_lines: int = 0
-    encoding: str | None = None
-    file_type: FileType = "text"
-    """File type classification for multimodal dispatch."""
-    mime_type: str = ""
-    """IANA media type (e.g. ``"image/png"``) when ``file_type`` is not ``"text"``."""
-
-    @property
-    def is_multimodal(self) -> bool:
-        """Return ``True`` if the file should be delivered as a multimodal content block."""
-        return self.encoding == "base64" and self.file_type != "text"
-
-    def __str__(self) -> str:
-        if self.error is not None:
-            return f"Error: {self.error}"
-        return self.content or ""
-
-
-class WriteResult(BaseModel):
-    """Result from ``write()`` — create or overwrite a file.
-
-    By default ``overwrite=False`` and creating a file that already
-    exists is an error.  Set ``overwrite=True`` to replace the file
-    contents entirely.
-    """
-
-    error: str | None = None
-    path: str | None = None
-
-    def __str__(self) -> str:
-        if self.error is not None:
-            return f"Error: {self.error}"
-        return f"File written: {self.path}"
-
-
-class EditResult(BaseModel):
-    """Result from ``edit()`` — replace text in an existing file."""
-
-    error: str | None = None
-    path: str | None = None
-    occurrences: int = 0
-
-    def __str__(self) -> str:
-        if self.error is not None:
-            return f"Error: {self.error}"
-        return f"File edited: {self.path} ({self.occurrences} replacement(s))"
-
-
-class GrepResult(BaseModel):
-    """Result from ``grep()``."""
-
-    error: str | None = None
-    matches: list[GrepMatch] | None = None
-    truncated: bool = False
-    """``True`` when the result was truncated by ``max_grep_matches`` or offset/limit."""
-    total_matches: int = 0
-    """Total number of matches found before offset/limit slicing."""
-
-    def __str__(self) -> str:
-        lines: list[str] = []
-        if self.error is not None:
-            lines.append(f"Warning: {self.error}")
-        if self.matches:
-            lines.extend(f"{m.path}:{m.line}: {m.text}" for m in self.matches)
-        if not lines:
-            return "No matches found."
-        if self.truncated:
-            shown = len(self.matches) if self.matches else 0
-            total = self.total_matches
-            lines.append(
-                f"\n[Truncated: showing {shown} of {total} matches. "
-                f"Use a narrower pattern/path/glob or adjust offset/limit to paginate.]"
-            )
-        return "\n".join(lines)
-
-
-class GlobResult(BaseModel):
-    """Result from ``glob()``."""
-
-    error: str | None = None
-    matches: list[FileInfo] | None = None
-
-    def __str__(self) -> str:
-        lines: list[str] = []
-        if self.error is not None:
-            lines.append(f"Warning: {self.error}")
-        if self.matches:
-            for fi in self.matches:
-                desc_part = f"  -- {fi.desc.replace(chr(10), ' ')}" if fi.desc else ""
-                lines.append(f"{fi.path}({human_size(fi.size)}){desc_part}")
-        if not lines:
-            return "No files found."
-        return "\n".join(lines)
-
-
-class UploadFileResult(BaseModel):
-    """Result for a single file in a bulk upload."""
-
-    path: str
-    error: str | None = None
-
-
-class DownloadFileResult(BaseModel):
-    """Result for a single file in a bulk download."""
-
-    path: str
-    content: bytes | None = None
-    error: str | None = None
 
 
 # ============================================================================
@@ -399,7 +217,7 @@ class BackendProtocol(abc.ABC):
     # Workspace root
     # ------------------------------------------------------------------
 
-    workspace_root: str = "/workspace"
+    workspace_root: VirtualPath = VirtualPath("/workspace")
     """The virtual path prefix that serves as the root of the workspace.
 
     All file operations must target paths under this prefix (e.g.
@@ -474,9 +292,10 @@ class BackendProtocol(abc.ABC):
     def _timeout_for(self, tool_name: str) -> float:
         """Return the timeout (seconds) configured for *tool_name*.
 
-        Falls back to 60 s for unknown tool names.
+        Delegates to :meth:`ToolTimeouts.get` for type-safe lookup with
+        a 60 s fallback for tool names not explicitly configured.
         """
-        return getattr(self._tool_timeouts, tool_name, 60.0)
+        return self._tool_timeouts.get(tool_name)
 
     _T = TypeVar("_T")
 
@@ -597,7 +416,7 @@ class BackendProtocol(abc.ABC):
         return _safe
 
     @staticmethod
-    def _default_summarizer(file_path: str, content: str, max_chars: int) -> str:
+    def _default_summarizer(file_path: VirtualPath, content: str, max_chars: int) -> str:
         """Default summarizer: prompt the caller to specify offset + limit."""
         total_lines = content.count("\n") + 1
         return (
@@ -607,7 +426,7 @@ class BackendProtocol(abc.ABC):
             f"示例: read(file_path='{file_path}', offset=0, limit=500)]"
         )
 
-    def _apply_read_limit(self, result: ReadResult, file_path: str) -> ReadResult:
+    def _apply_read_limit(self, result: ReadResult, file_path: VirtualPath) -> ReadResult:
         """Apply character-limit to a text ``ReadResult``.
 
         Binary / multimodal files are never truncated.  When the text
@@ -659,18 +478,16 @@ class BackendProtocol(abc.ABC):
     # ------------------------------------------------------------------
 
     @abc.abstractmethod
-    def ls(self, path: str) -> LsResult:
+    def ls(self, path: VirtualPath) -> LsResult:
         """List files and directories in *path* (non-recursive)."""
         ...
 
     def read(
         self,
-        file_path: str,
+        file_path: VirtualPath,
         offset: int = 0,
         limit: int = 2000,
         include_line_numbers: bool = False,
-        *,
-        _apply_max_chars: bool = True,
     ) -> ReadResult:
         """Read the contents of *file_path*.
 
@@ -681,24 +498,26 @@ class BackendProtocol(abc.ABC):
 
         Text files exceeding ``max_read_chars`` are summarized using
         the configured ``summarizer`` callback.  Binary / multimodal
-        files are never truncated.  Pass ``_apply_max_chars=False`` to
-        bypass the limit (used internally by ``download_files``).
+        files are never truncated.
+
+        This is the LLM-facing safe wrapper — it delegates to
+        :meth:`read_raw` and then applies ``max_read_chars`` enforcement.
+        For internal use (e.g. downloading full files), call
+        :meth:`read_raw` directly with ``limit=None``.
         """
         if offset < 0:
             return ReadResult(error=f"offset must be non-negative, got {offset}")
         if limit < 1:
             return ReadResult(error=f"limit must be positive, got {limit}")
         result = self.read_raw(file_path, offset, limit, include_line_numbers)
-        if _apply_max_chars:
-            result = self._apply_read_limit(result, file_path)
-        return result
+        return self._apply_read_limit(result, file_path)
 
     @abc.abstractmethod
     def read_raw(
         self,
-        file_path: str,
+        file_path: VirtualPath,
         offset: int = 0,
-        limit: int = 2000,
+        limit: int | None = 2000,
         include_line_numbers: bool = False,
     ) -> ReadResult:
         """Read file contents **without** character-limit safety checks.
@@ -707,12 +526,15 @@ class BackendProtocol(abc.ABC):
         file I/O.  The returned ``ReadResult`` is the raw, untruncated
         result — the caller (typically :meth:`read`) is responsible for
         applying ``max_read_chars`` limits.
+
+        Pass ``limit=None`` to return the entire file without line-count
+        slicing.  This is used internally by ``download_files``.
         """
         ...
 
     @abc.abstractmethod
     def write(
-        self, file_path: str, content: str, overwrite: bool = False,
+        self, file_path: VirtualPath, content: str, overwrite: bool = False,
     ) -> WriteResult:
         """Create a new file or overwrite an existing one.
 
@@ -725,7 +547,7 @@ class BackendProtocol(abc.ABC):
     @abc.abstractmethod
     def edit(
         self,
-        file_path: str,
+        file_path: VirtualPath,
         old_str: str,
         new_str: str,
         *,
@@ -744,7 +566,7 @@ class BackendProtocol(abc.ABC):
     def grep(
         self,
         pattern: str,
-        path: str = "/workspace",
+        path: VirtualPath,
         glob: str | None = None,
         regex: bool = False,
         offset: int = 0,
@@ -765,7 +587,7 @@ class BackendProtocol(abc.ABC):
         ...
 
     @abc.abstractmethod
-    def glob(self, pattern: str, path: str = "/workspace") -> GlobResult:
+    def glob(self, pattern: str, path: VirtualPath) -> GlobResult:
         """Find files matching a glob pattern under *path*."""
         ...
 
@@ -773,18 +595,16 @@ class BackendProtocol(abc.ABC):
     # Async core file operations
     # ------------------------------------------------------------------
 
-    async def als(self, path: str) -> LsResult:
+    async def als(self, path: VirtualPath) -> LsResult:
         """Async: List files and directories in *path* (non-recursive)."""
         return await asyncio.to_thread(self.ls, path)
 
     async def aread(
         self,
-        file_path: str,
+        file_path: VirtualPath,
         offset: int = 0,
         limit: int = 2000,
         include_line_numbers: bool = False,
-        *,
-        _apply_max_chars: bool = True,
     ) -> ReadResult:
         """Async: Read the contents of *file_path*.
 
@@ -792,18 +612,17 @@ class BackendProtocol(abc.ABC):
         """
         return await asyncio.to_thread(
             self.read, file_path, offset, limit, include_line_numbers,
-            _apply_max_chars=_apply_max_chars,
         )
 
     async def awrite(
-        self, file_path: str, content: str, overwrite: bool = False,
+        self, file_path: VirtualPath, content: str, overwrite: bool = False,
     ) -> WriteResult:
         """Async: Create a new file or overwrite an existing one."""
         return await asyncio.to_thread(self.write, file_path, content, overwrite)
 
     async def aedit(
         self,
-        file_path: str,
+        file_path: VirtualPath,
         old_str: str,
         new_str: str,
         *,
@@ -817,7 +636,7 @@ class BackendProtocol(abc.ABC):
     async def agrep(
         self,
         pattern: str,
-        path: str = "/workspace",
+        path: VirtualPath,
         glob: str | None = None,
         regex: bool = False,
         offset: int = 0,
@@ -826,7 +645,7 @@ class BackendProtocol(abc.ABC):
         """Async: Search for a text pattern in files under *path*."""
         return await asyncio.to_thread(self.grep, pattern, path, glob, regex, offset, limit)
 
-    async def aglob(self, pattern: str, path: str = "/workspace") -> GlobResult:
+    async def aglob(self, pattern: str, path: VirtualPath) -> GlobResult:
         """Async: Find files matching a glob pattern under *path*."""
         return await asyncio.to_thread(self.glob, pattern, path)
 
@@ -835,7 +654,7 @@ class BackendProtocol(abc.ABC):
     # ------------------------------------------------------------------
 
     def upload_files(
-        self, files: list[tuple[str, bytes]]
+        self, files: list[tuple[VirtualPath, bytes]]
     ) -> list[UploadFileResult]:
         """Upload multiple files as raw bytes.
 
@@ -859,7 +678,7 @@ class BackendProtocol(abc.ABC):
         return results
 
     def download_files(
-        self, paths: list[str]
+        self, paths: list[VirtualPath]
     ) -> list[DownloadFileResult]:
         """Download multiple files as original bytes.
 
@@ -869,7 +688,7 @@ class BackendProtocol(abc.ABC):
         """
         results: list[DownloadFileResult] = []
         for path in paths:
-            r = self.read(path, _apply_max_chars=False)
+            r = self.read_raw(path, limit=None)
             if r.error:
                 results.append(
                     DownloadFileResult(
@@ -891,7 +710,7 @@ class BackendProtocol(abc.ABC):
         return results
 
     async def adownload_files(
-        self, paths: list[str]
+        self, paths: list[VirtualPath]
     ) -> list[DownloadFileResult]:
         """Async: Download multiple files as original bytes."""
         return await asyncio.to_thread(self.download_files, paths)
@@ -926,14 +745,14 @@ class ThreadAwareWorkspace(BackendProtocol, abc.ABC):
     @abc.abstractmethod
     def upload_files(
         self,
-        files: list[tuple[str, bytes]],
+        files: list[tuple[VirtualPath, bytes]],
         *,
         thread_id: str | None = None,
     ) -> list[UploadFileResult]:
         """Upload multiple files with optional thread/session context.
 
         Parameters:
-            files: List of ``(path, raw_bytes)`` tuples.
+            files: List of ``(VirtualPath, raw_bytes)`` tuples.
             thread_id: Thread/session identifier.  Required by backends
                 that isolate state per thread (e.g. StateBackend outside
                 graph context); optional for simple backends.
@@ -943,7 +762,7 @@ class ThreadAwareWorkspace(BackendProtocol, abc.ABC):
     @abc.abstractmethod
     def download_files(
         self,
-        paths: list[str],
+        paths: list[VirtualPath],
         *,
         thread_id: str | None = None,
     ) -> list[DownloadFileResult]:

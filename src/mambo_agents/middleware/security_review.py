@@ -269,8 +269,6 @@ class ActionRequest(BaseModel):
     Carries ``tool_call_id`` so consumers can precisely match each action
     to a specific tool call from the originating ``AIMessage``, even when
     multiple tool calls of the same name are interrupted together.
-
-    Replaces langchain's ``ActionRequest`` TypedDict.
     """
 
     model_config = ConfigDict(frozen=True)
@@ -293,8 +291,6 @@ class ReviewConfig(BaseModel):
 
     Carries ``tool_call_id`` alongside ``action_name`` for unambiguous
     action identification.
-
-    Replaces langchain's ``ReviewConfig`` TypedDict.
     """
 
     model_config = ConfigDict(frozen=True)
@@ -320,8 +316,6 @@ class HITLRequest(BaseModel):
     Each ``ActionRequest`` and ``ReviewConfig`` carries a ``tool_call_id``
     so the consumer can unambiguously associate decisions with specific
     tool calls.
-
-    Replaces langchain's ``HITLRequest`` TypedDict.
     """
 
     model_config = ConfigDict(frozen=True)

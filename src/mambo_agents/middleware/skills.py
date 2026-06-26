@@ -72,6 +72,7 @@ from pathlib import PurePosixPath
 from typing import TYPE_CHECKING, Annotated
 
 import yaml
+from pydantic import BaseModel, ConfigDict, Field
 from langchain.agents.middleware.types import PrivateStateAttr
 
 if TYPE_CHECKING:
@@ -94,6 +95,7 @@ from langchain.agents.middleware.types import (
 )
 from langchain_core.messages import SystemMessage
 from langgraph.prebuilt import ToolRuntime
+from mambo_agents.backends.schemas import VirtualPath
 
 logger = logging.getLogger(__name__)
 
@@ -194,32 +196,50 @@ def _truncate_skill_load_warning(error: str) -> str:
 # ---------------------------------------------------------------------------
 
 
-class SkillMetadata(TypedDict):
+class SkillMetadata(BaseModel):
     """Metadata for a skill per Agent Skills specification."""
 
-    path: str
-    """Path to the SKILL.md file."""
+    model_config = ConfigDict(frozen=True)
 
-    name: str
-    """Skill identifier (1-64 chars, lowercase alphanumeric + hyphens)."""
+    path: str = Field(description="Path to the SKILL.md file.")
 
-    description: str
-    """What the skill does (1-1024 chars)."""
+    name: str = Field(
+        min_length=1,
+        max_length=MAX_SKILL_NAME_LENGTH,
+        description="Skill identifier (1-64 chars, lowercase alphanumeric + hyphens).",
+    )
 
-    license: str | None
-    """License name or reference to bundled license file."""
+    description: str = Field(
+        min_length=1,
+        max_length=MAX_SKILL_DESCRIPTION_LENGTH,
+        description="What the skill does (1-1024 chars).",
+    )
 
-    compatibility: str | None
-    """Environment requirements (1-500 chars if provided)."""
+    license: str | None = Field(
+        default=None,
+        description="License name or reference to bundled license file.",
+    )
 
-    metadata: dict[str, str]
-    """Arbitrary key-value mapping for additional metadata."""
+    compatibility: str | None = Field(
+        default=None,
+        max_length=MAX_SKILL_COMPATIBILITY_LENGTH,
+        description="Environment requirements (1-500 chars if provided).",
+    )
 
-    allowed_tools: list[str]
-    """Tool names the skill recommends using."""
+    metadata: dict[str, str] = Field(
+        default_factory=dict,
+        description="Arbitrary key-value mapping for additional metadata.",
+    )
 
-    module: NotRequired[str | None]
-    """Path to a JS/TS entrypoint file (experimental)."""
+    allowed_tools: list[str] = Field(
+        default_factory=list,
+        description="Tool names the skill recommends using.",
+    )
+
+    module: str | None = Field(
+        default=None,
+        description="Path to a JS/TS entrypoint file (experimental).",
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -404,7 +424,7 @@ def _parse_skill_metadata(
 
     module_path = _validate_module_path(frontmatter_data.get("module"), skill_path)
 
-    result = SkillMetadata(
+    return SkillMetadata(
         name=str(name),
         description=description_str,
         path=skill_path,
@@ -412,10 +432,8 @@ def _parse_skill_metadata(
         license=str(frontmatter_data.get("license", "")).strip() or None,
         compatibility=compatibility_str,
         allowed_tools=allowed_tools,
+        module=module_path,
     )
-    if module_path is not None:
-        result["module"] = module_path
-    return result
 
 
 # ---------------------------------------------------------------------------
@@ -473,7 +491,7 @@ def _list_skills_with_errors(
     """
     skills: list[SkillMetadata] = []
     source_error: str | None = None
-    ls_result = backend.ls(source_path)
+    ls_result = backend.ls(VirtualPath(source_path))
     if ls_result.error:
         msg = f"Cannot load skills from '{source_path}': {ls_result.error}"
         logger.warning("%s", msg)
@@ -568,10 +586,10 @@ async def _alist_skills_with_errors(
 def _format_skill_annotations(skill: SkillMetadata) -> str:
     """Build parenthetical annotation string from optional skill fields."""
     parts: list[str] = []
-    if skill.get("license"):
-        parts.append(f"License: {skill['license']}")
-    if skill.get("compatibility"):
-        parts.append(f"Compatibility: {skill['compatibility']}")
+    if skill.license:
+        parts.append(f"License: {skill.license}")
+    if skill.compatibility:
+        parts.append(f"Compatibility: {skill.compatibility}")
     return ", ".join(parts)
 
 
@@ -733,13 +751,13 @@ class SkillsMiddleware(AgentMiddleware[SkillsState, ContextT, ResponseT]):
         lines = []
         for skill in skills:
             annotations = _format_skill_annotations(skill)
-            desc_line = f"- **{skill['name']}**: {skill['description']}"
+            desc_line = f"- **{skill.name}**: {skill.description}"
             if annotations:
                 desc_line += f" ({annotations})"
             lines.append(desc_line)
-            if skill["allowed_tools"]:
-                lines.append(f"  -> Allowed tools: {', '.join(skill['allowed_tools'])}")
-            lines.append(f"  -> Read `{skill['path']}` for full instructions")
+            if skill.allowed_tools:
+                lines.append(f"  -> Allowed tools: {', '.join(skill.allowed_tools)}")
+            lines.append(f"  -> Read `{skill.path}` for full instructions")
 
         return "\n".join(lines)
 
@@ -837,7 +855,7 @@ class SkillsMiddleware(AgentMiddleware[SkillsState, ContextT, ResponseT]):
             if source_error is not None:
                 skills_load_errors.append(source_error)
             for skill in source_skills:
-                all_skills[skill["name"]] = skill
+                all_skills[skill.name] = skill
 
         skills = list(all_skills.values())
         update: SkillsStateUpdate = {"skills_metadata": skills}
@@ -866,7 +884,7 @@ class SkillsMiddleware(AgentMiddleware[SkillsState, ContextT, ResponseT]):
             if source_error is not None:
                 skills_load_errors.append(source_error)
             for skill in source_skills:
-                all_skills[skill["name"]] = skill
+                all_skills[skill.name] = skill
 
         skills = list(all_skills.values())
         update: SkillsStateUpdate = {"skills_metadata": skills}

@@ -16,6 +16,7 @@ from mambo_agents import (
     create_mambo_agent,
 )
 from mambo_agents.backends.state import StateBackend
+from mambo_agents.backends.schemas import VirtualPath
 from tests.test_state_backend import _simulate_graph
 from mambo_agents.middleware.summarization import (
     DEFAULT_MAMBO_CHAINED_SUMMARY_PROMPT,
@@ -242,7 +243,7 @@ class TestGetHistoryPath:
         mw = MamboSummarizationMiddleware(model=model)
         runtime = MagicMock(spec=[])
         path = mw._get_history_path(runtime)
-        assert path.startswith("/.mambo/conversation_history/session_")
+        assert str(path).startswith("/.mambo/conversation_history/session_")
         assert path.endswith(".md")
 
 

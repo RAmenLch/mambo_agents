@@ -11,6 +11,7 @@ from langchain_core.messages import SystemMessage
 from langgraph.runtime import Runtime
 
 from mambo_agents.backends.state import StateBackend
+from mambo_agents.backends.schemas import VirtualPath
 from mambo_agents.middleware.memory import (
     MAMBO_MEMORY_SYSTEM_PROMPT,
     MamboMemoryMiddleware,
@@ -135,15 +136,15 @@ class TestDefaultFormatPrompt:
 class TestMamboMemoryMiddlewareInit:
     def test_basic_init(self):
         backend = StateBackend()
-        mw = MamboMemoryMiddleware(backend=backend, sources=[MEMORY_PATH])
-        assert mw.sources == [MEMORY_PATH]
+        mw = MamboMemoryMiddleware(backend=backend, sources=[VirtualPath(MEMORY_PATH)])
+        assert mw.sources == [VirtualPath(MEMORY_PATH)]
         assert mw.state_schema is MemoryState
 
     def test_multiple_sources(self):
         backend = StateBackend()
         mw = MamboMemoryMiddleware(
             backend=backend,
-            sources=[MEMORY_PATH, "/.mambo/memory/team.md"],
+            sources=[VirtualPath(MEMORY_PATH), VirtualPath("/.mambo/memory/team.md")],
         )
         assert len(mw.sources) == 2
 
@@ -155,7 +156,7 @@ class TestMamboMemoryMiddlewareInit:
 
         mw = MamboMemoryMiddleware(
             backend=backend,
-            sources=["/test/AGENTS.md"],
+            sources=[VirtualPath("/test/AGENTS.md")],
             format_prompt=custom_fmt,
         )
         result = mw._format_prompt({"/test/AGENTS.md": "hello"})
@@ -171,7 +172,7 @@ class TestMamboMemoryMiddlewareInit:
 
         mw = MamboMemoryMiddleware(
             backend=factory,
-            sources=[MEMORY_PATH],
+            sources=[VirtualPath(MEMORY_PATH)],
         )
         rt = _make_runtime()
         result = mw._get_backend({}, rt, {"configurable": {}})
@@ -187,7 +188,7 @@ class TestMamboMemoryMiddlewareInit:
 class TestBeforeAgent:
     def test_skips_when_already_loaded(self):
         backend = StateBackend()
-        mw = MamboMemoryMiddleware(backend=backend, sources=[MEMORY_PATH])
+        mw = MamboMemoryMiddleware(backend=backend, sources=[VirtualPath(MEMORY_PATH)])
         state: dict = {"memory_contents": {MEMORY_PATH: "cached"}}
         rt = _make_runtime()
         result = mw.before_agent(state, rt, {"configurable": {}})
@@ -197,9 +198,9 @@ class TestBeforeAgent:
         memory_text = "# My Memory\n\nThis is the agent memory."
         backend = StateBackend()
         with _simulate_graph(backend, thread_id="mem_test"):
-            backend.write(MEMORY_PATH, memory_text, overwrite=True)
+            backend.write(VirtualPath(MEMORY_PATH), memory_text, overwrite=True)
 
-        mw = MamboMemoryMiddleware(backend=backend, sources=[MEMORY_PATH])
+        mw = MamboMemoryMiddleware(backend=backend, sources=[VirtualPath(MEMORY_PATH)])
         rt = _make_runtime()
         with _simulate_graph(backend, thread_id="mem_test"):
             result = mw.before_agent({}, rt, {"configurable": {}})
@@ -212,7 +213,7 @@ class TestBeforeAgent:
 
     def test_file_not_found_silent_skip(self):
         backend = StateBackend()
-        mw = MamboMemoryMiddleware(backend=backend, sources=[MEMORY_PATH])
+        mw = MamboMemoryMiddleware(backend=backend, sources=[VirtualPath(MEMORY_PATH)])
         rt = _make_runtime()
         with _simulate_graph(backend, thread_id="mem_not_found"):
             result = mw.before_agent({}, rt, {"configurable": {}})
@@ -224,11 +225,11 @@ class TestBeforeAgent:
     def test_partial_sources_some_found(self):
         backend = StateBackend()
         with _simulate_graph(backend, thread_id="mem_test"):
-            backend.write(MEMORY_PATH, "my memory", overwrite=True)
+            backend.write(VirtualPath(MEMORY_PATH), "my memory", overwrite=True)
 
         mw = MamboMemoryMiddleware(
             backend=backend,
-            sources=["/.mambo/memory/AGENTS.md", MEMORY_PATH],
+            sources=[VirtualPath("/.mambo/memory/AGENTS.md"), VirtualPath(MEMORY_PATH)],
         )
         rt = _make_runtime()
         with _simulate_graph(backend, thread_id="mem_test"):
@@ -258,7 +259,7 @@ class TestBeforeAgent:
 class TestModifyRequest:
     def test_injects_memory_into_system_message(self):
         backend = StateBackend()
-        mw = MamboMemoryMiddleware(backend=backend, sources=[MEMORY_PATH])
+        mw = MamboMemoryMiddleware(backend=backend, sources=[VirtualPath(MEMORY_PATH)])
 
         req = _make_request(
             system_message=SystemMessage(content="base prompt"),
@@ -277,7 +278,7 @@ class TestModifyRequest:
 
     def test_no_memory_contents_shows_empty(self):
         backend = StateBackend()
-        mw = MamboMemoryMiddleware(backend=backend, sources=[MEMORY_PATH])
+        mw = MamboMemoryMiddleware(backend=backend, sources=[VirtualPath(MEMORY_PATH)])
 
         req = _make_request(
             system_message=SystemMessage(content="base"),
@@ -291,7 +292,7 @@ class TestModifyRequest:
 
     def test_empty_memory_contents_shows_empty(self):
         backend = StateBackend()
-        mw = MamboMemoryMiddleware(backend=backend, sources=[MEMORY_PATH])
+        mw = MamboMemoryMiddleware(backend=backend, sources=[VirtualPath(MEMORY_PATH)])
 
         req = _make_request(
             system_message=SystemMessage(content="base"),
@@ -312,7 +313,7 @@ class TestModifyRequest:
 
         mw = MamboMemoryMiddleware(
             backend=backend,
-            sources=["/test/AGENTS.md"],
+            sources=[VirtualPath("/test/AGENTS.md")],
             format_prompt=custom_fmt,
         )
 
@@ -336,7 +337,7 @@ class TestModifyRequest:
 class TestWrapModelCall:
     def test_handles_system_message_is_none(self):
         backend = StateBackend()
-        mw = MamboMemoryMiddleware(backend=backend, sources=[MEMORY_PATH])
+        mw = MamboMemoryMiddleware(backend=backend, sources=[VirtualPath(MEMORY_PATH)])
 
         req = _make_request(
             system_message=None,  # type: ignore[arg-type]

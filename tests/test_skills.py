@@ -8,6 +8,7 @@ from unittest.mock import MagicMock
 import pytest
 
 from mambo_agents.backends.state import StateBackend
+from mambo_agents.backends.schemas import VirtualPath
 from mambo_agents.middleware.skills import (
     MAX_SKILL_DESCRIPTION_LENGTH,
     MAX_SKILL_FILE_SIZE,
@@ -240,10 +241,10 @@ class TestParseSkillMetadata:
             _VALID_FRONTMATTER, "/skills/user/web-research/SKILL.md", "web-research"
         )
         assert result is not None
-        assert result["name"] == "web-research"
-        assert result["description"] == "Research topics online"
-        assert result["license"] == "MIT"
-        assert result["path"] == "/skills/user/web-research/SKILL.md"
+        assert result.name == "web-research"
+        assert result.description == "Research topics online"
+        assert result.license == "MIT"
+        assert result.path == "/skills/user/web-research/SKILL.md"
 
     def test_name_must_match_directory(self):
         """Name mismatch with directory → warning but still returns metadata for backwards compat."""
@@ -252,7 +253,7 @@ class TestParseSkillMetadata:
         )
         # The implementation logs a warning but still returns metadata
         assert result is not None
-        assert result["name"] == "web-research"
+        assert result.name == "web-research"
 
     def test_no_frontmatter(self):
         result = _parse_skill_metadata(
@@ -290,14 +291,14 @@ class TestParseSkillMetadata:
         content = f"---\nname: test\ndescription: {long_desc}\n---\n"
         result = _parse_skill_metadata(content, "/path/SKILL.md", "test")
         assert result is not None
-        assert len(result["description"]) == MAX_SKILL_DESCRIPTION_LENGTH
+        assert len(result.description) == MAX_SKILL_DESCRIPTION_LENGTH
 
     def test_allowed_tools_parsed(self):
         result = _parse_skill_metadata(
             _FRONTMATTER_WITH_TOOLS, "/skills/user/web-research/SKILL.md", "web-research"
         )
         assert result is not None
-        assert result["allowed_tools"] == ["grep", "read", "write"]
+        assert result.allowed_tools == ["grep", "read", "write"]
 
     def test_allowed_tools_non_string_ignored(self):
         content = """---
@@ -308,31 +309,31 @@ allowed-tools: [1, 2, 3]
 """
         result = _parse_skill_metadata(content, "/path/SKILL.md", "test")
         assert result is not None
-        assert result["allowed_tools"] == []
+        assert result.allowed_tools == []
 
     def test_module_extracted(self):
         result = _parse_skill_metadata(
             _FRONTMATTER_WITH_MODULE, "/path/SKILL.md", "custom"
         )
         assert result is not None
-        assert result.get("module") == "helper.js"
+        assert result.module == "helper.js"
 
     def test_compatibility_truncated(self):
         long_comp = "C" * 1000
         content = f"---\nname: test\ndescription: d\ncompatibility: {long_comp}\n---\n"
         result = _parse_skill_metadata(content, "/path/SKILL.md", "test")
         assert result is not None
-        assert result["compatibility"] == "C" * 500
+        assert result.compatibility == "C" * 500
 
     def test_default_values(self):
         result = _parse_skill_metadata(
             _MINIMAL_FRONTMATTER, "/path/SKILL.md", "web-research"
         )
         assert result is not None
-        assert result["license"] is None
-        assert result["compatibility"] is None
-        assert result["metadata"] == {}
-        assert result["allowed_tools"] == []
+        assert result.license is None
+        assert result.compatibility is None
+        assert result.metadata == {}
+        assert result.allowed_tools == []
 
 
 # ============================================================================
@@ -342,39 +343,39 @@ allowed-tools: [1, 2, 3]
 
 class TestFormatSkillAnnotations:
     def test_empty(self):
-        skill: SkillMetadata = {
-            "name": "test",
-            "description": "desc",
-            "path": "/p/SKILL.md",
-            "license": None,
-            "compatibility": None,
-            "metadata": {},
-            "allowed_tools": [],
-        }
+        skill = SkillMetadata(
+            name="test",
+            description="desc",
+            path="/p/SKILL.md",
+            license=None,
+            compatibility=None,
+            metadata={},
+            allowed_tools=[],
+        )
         assert _format_skill_annotations(skill) == ""
 
     def test_license_only(self):
-        skill: SkillMetadata = {
-            "name": "test",
-            "description": "desc",
-            "path": "/p/SKILL.md",
-            "license": "MIT",
-            "compatibility": None,
-            "metadata": {},
-            "allowed_tools": [],
-        }
+        skill = SkillMetadata(
+            name="test",
+            description="desc",
+            path="/p/SKILL.md",
+            license="MIT",
+            compatibility=None,
+            metadata={},
+            allowed_tools=[],
+        )
         assert "License: MIT" in _format_skill_annotations(skill)
 
     def test_both(self):
-        skill: SkillMetadata = {
-            "name": "test",
-            "description": "desc",
-            "path": "/p/SKILL.md",
-            "license": "MIT",
-            "compatibility": "python>=3.10",
-            "metadata": {},
-            "allowed_tools": [],
-        }
+        skill = SkillMetadata(
+            name="test",
+            description="desc",
+            path="/p/SKILL.md",
+            license="MIT",
+            compatibility="python>=3.10",
+            metadata={},
+            allowed_tools=[],
+        )
         result = _format_skill_annotations(skill)
         assert "License: MIT" in result
         assert "Compatibility: python>=3.10" in result
@@ -446,15 +447,15 @@ class TestFormatSkillsList:
     def test_single_skill(self):
         backend = StateBackend()
         mw = SkillsMiddleware(backend=backend, sources=["/skills/user/"])
-        skill: SkillMetadata = {
-            "name": "research",
-            "description": "Research topics",
-            "path": "/skills/user/research/SKILL.md",
-            "license": None,
-            "compatibility": None,
-            "metadata": {},
-            "allowed_tools": [],
-        }
+        skill = SkillMetadata(
+            name="research",
+            description="Research topics",
+            path="/skills/user/research/SKILL.md",
+            license=None,
+            compatibility=None,
+            metadata={},
+            allowed_tools=[],
+        )
         result = mw._format_skills_list([skill])
         assert "research" in result
         assert "Research topics" in result
@@ -463,15 +464,15 @@ class TestFormatSkillsList:
     def test_skill_with_allowed_tools(self):
         backend = StateBackend()
         mw = SkillsMiddleware(backend=backend, sources=["/skills/user/"])
-        skill: SkillMetadata = {
-            "name": "tool-user",
-            "description": "Uses tools",
-            "path": "/p/SKILL.md",
-            "license": None,
-            "compatibility": None,
-            "metadata": {},
-            "allowed_tools": ["grep", "read"],
-        }
+        skill = SkillMetadata(
+            name="tool-user",
+            description="Uses tools",
+            path="/p/SKILL.md",
+            license=None,
+            compatibility=None,
+            metadata={},
+            allowed_tools=["grep", "read"],
+        )
         result = mw._format_skills_list([skill])
         assert "grep, read" in result
 
@@ -528,7 +529,7 @@ description: A test skill
 # Test Skill
 """
         with _simulate_graph(backend, thread_id="skill_load"):
-            backend.write("/skills/user/test-skill/SKILL.md", skill_content, overwrite=True)
+            backend.write(VirtualPath("/skills/user/test-skill/SKILL.md"), skill_content, overwrite=True)
 
         from langgraph.runtime import Runtime
         rt = Runtime(

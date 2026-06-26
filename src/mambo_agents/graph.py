@@ -25,6 +25,7 @@ from langgraph.store.base import BaseStore
 from mambo_agents._version import __version__
 from mambo_agents.backends.protocol import BackendProtocol
 from mambo_agents.backends.readonly import ReadOnlyBackend
+from mambo_agents.backends.schemas import VirtualPath
 from mambo_agents.backends.state import StateBackend
 from mambo_agents.middleware.backend_tools import (
     BackendToolsMiddleware,
@@ -84,11 +85,11 @@ def create_mambo_agent(
     include_general_purpose: bool = False,
     async_subagents: Sequence[SubAgent | CompiledSubAgent] | None = None,
     async_subagent_timeout: float = 3600.0,
-    event_granularity: EventGranularity = "updates",
+    subagent_event_granularity: EventGranularity = "updates",
     middleware: Sequence[AgentMiddleware] | None = None,
     summarization: SummarizationConfig | None = None,
     skills: Sequence[SkillSource] | None = None,
-    memory_sources: list[str] | None = None,
+    memory_sources: list[VirtualPath] | None = None,
     tools: Sequence[BaseTool] | None = None,
     interrupt_on: dict[str, bool | InterruptOnConfig] | None = None,
     security_review: SecurityReviewConfig | None = None,
@@ -116,7 +117,7 @@ def create_mambo_agent(
             ``report_progress`` tool for intermediate progress reporting.
         async_subagent_timeout: Maximum seconds an async subagent may run
             before being force-cancelled.  Default: ``3600`` (1 hour).
-        event_granularity: Streaming detail level for subagent custom
+        subagent_event_granularity: Streaming detail level for subagent custom
             events. ``"messages"`` (finest, token-level), ``"updates"``
             (default, per-node), ``"values"`` (coarsest, per-step).
         middleware: Additional middleware to include.
@@ -251,15 +252,15 @@ def create_mambo_agent(
             "gpt-4o",
             backend=StateBackend(),
             subagents=[
-                {
-                    "name": "researcher",
-                    "description": "Research topics thoroughly",
-                    "system_prompt": "You are a researcher...",
-                    "model": "gpt-4o",
-                    "tools": [],
-                },
+                SubAgent(
+                    name="researcher",
+                    description="Research topics thoroughly",
+                    system_prompt="You are a researcher...",
+                    model="gpt-4o",
+                    tools=[],
+                ),
             ],
-            event_granularity="messages",
+            subagent_event_granularity="messages",
         )
         async for event in agent.astream(
             {"messages": [HumanMessage("Research Python async patterns")]},
@@ -273,13 +274,13 @@ def create_mambo_agent(
             "gpt-4o",
             backend=LocalBackend(),
             async_subagents=[
-                {
-                    "name": "deployer",
-                    "description": "Deploy services to Kubernetes",
-                    "system_prompt": "You are a deployment expert...",
-                    "model": "gpt-4o",
-                    "tools": [kubectl_tool, helm_tool],
-                },
+                SubAgent(
+                    name="deployer",
+                    description="Deploy services to Kubernetes",
+                    system_prompt="You are a deployment expert...",
+                    model="gpt-4o",
+                    tools=[kubectl_tool, helm_tool],
+                ),
             ],
             async_subagent_timeout=1800,  # 30 minutes
         )
@@ -324,12 +325,12 @@ def create_mambo_agent(
 
     # ---- Summarization (opt-in) --------------------------------------------
     if summarization is not None:
+        # Accept dict for convenience, convert to SummarizationConfig
+        if isinstance(summarization, dict):
+            summarization = SummarizationConfig(**summarization)
+
         # Pre-scan user middleware for summary hooks (e.g. Plan)
-        _summary_hooks: list[SummaryHook] = []
-        # Include potential user-supplied hooks from the config
-        _config_hooks = summarization.get("summary_hooks")
-        if _config_hooks is not None:
-            _summary_hooks.extend(_config_hooks)
+        _summary_hooks: list[SummaryHook] = list(summarization.summary_hooks or [])
 
         # Auto-detect MamboPlanMiddleware and wire its hook
         for mw_item in middleware or []:
@@ -337,29 +338,24 @@ def create_mambo_agent(
                 _summary_hooks.append(mw_item.build_summary_hook())
                 break  # One hook is sufficient
 
-        _summary_model: str | BaseChatModel = summarization.get(
-            "model", model
-        )  # type: ignore[assignment]
-        _summary_backend = summarization.get("backend", backend)
+        _summary_model: str | BaseChatModel = summarization.model or model  # type: ignore[assignment]
+        _summary_backend = summarization.backend or backend
         mw.append(
             MamboSummarizationMiddleware(
                 model=_summary_model,
-                trigger=summarization.get("trigger"),
-                keep=summarization.get("keep", ("messages", 20)),
-                summary_prompt=summarization.get(
-                    "summary_prompt", DEFAULT_MAMBO_SUMMARY_PROMPT
+                trigger=summarization.trigger,
+                keep=summarization.keep,
+                summary_prompt=summarization.summary_prompt,
+                chained_summary_prompt=(
+                    summarization.chained_summary_prompt
+                    or DEFAULT_MAMBO_CHAINED_SUMMARY_PROMPT
                 ),
-                chained_summary_prompt=summarization.get(
-                    "chained_summary_prompt", DEFAULT_MAMBO_CHAINED_SUMMARY_PROMPT
-                ),
-                trim_tokens_to_summarize=summarization.get(
-                    "trim_tokens_to_summarize", 4000
-                ),
-                token_counter=summarization.get("token_counter"),
-                chars_per_token=summarization.get("chars_per_token"),
-                offload_to_backend=summarization.get("offload_to_backend", False),
+                trim_tokens_to_summarize=summarization.trim_tokens_to_summarize,
+                token_counter=summarization.token_counter,
+                chars_per_token=summarization.chars_per_token,
+                offload_to_backend=summarization.offload_to_backend,
                 backend=_summary_backend,
-                summary_hooks=_summary_hooks if _summary_hooks else None,
+                summary_hooks=_summary_hooks or None,
             )
         )
 
@@ -425,22 +421,21 @@ def create_mambo_agent(
     inline_subagents = list(subagents or [])
 
     if include_general_purpose and not any(
-        (s.get("name") if isinstance(s, dict) else getattr(s, "name", None))
-        == GENERAL_PURPOSE_NAME
+        s.name == GENERAL_PURPOSE_NAME
         for s in inline_subagents
     ):
         gp_middleware: list[AgentMiddleware] = [BackendToolsMiddleware(backend)]
         if _security_review_middleware is not None:
             gp_middleware.append(_security_review_middleware)
 
-        gp_spec: SubAgent = {
-            "name": GENERAL_PURPOSE_NAME,
-            "description": DEFAULT_GENERAL_PURPOSE_DESCRIPTION,
-            "system_prompt": DEFAULT_SUBAGENT_PROMPT,
-            "model": model,
-            "tools": list(tools or []),
-            "middleware": gp_middleware,
-        }
+        gp_spec = SubAgent(
+            name=GENERAL_PURPOSE_NAME,
+            description=DEFAULT_GENERAL_PURPOSE_DESCRIPTION,
+            system_prompt=DEFAULT_SUBAGENT_PROMPT,
+            model=model,
+            tools=list(tools or []),
+            middleware=gp_middleware,
+        )
         inline_subagents.insert(0, gp_spec)
 
     if inline_subagents:
@@ -448,7 +443,7 @@ def create_mambo_agent(
             SubAgentMiddleware(
                 backend=backend,
                 subagents=inline_subagents,
-                event_granularity=event_granularity,
+                event_granularity=subagent_event_granularity,
             )
         )
 

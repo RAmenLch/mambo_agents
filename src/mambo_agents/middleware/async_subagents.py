@@ -26,7 +26,7 @@ import threading
 import time
 import uuid
 from collections.abc import Awaitable, Callable, Sequence
-from typing import Annotated, Any, Literal, NotRequired, TypedDict, cast
+from typing import Annotated, Any, Literal, NotRequired
 
 from langchain.agents.factory import create_agent as _langchain_create_agent
 from langchain.agents.middleware.types import (
@@ -46,6 +46,7 @@ from langgraph.types import Command
 from pydantic import BaseModel, ConfigDict, Field
 
 from mambo_agents.backends.protocol import BackendProtocol
+from mambo_agents.middleware.subagents import CompiledSubAgent, SubAgent, _SubagentSpec
 
 # ---------------------------------------------------------------------------
 # Pydantic models
@@ -665,7 +666,6 @@ def _build_async_list_tool(tracker: _AsyncTaskTracker) -> StructuredTool:
         if not tasks:
             return "当前没有异步子代理任务。"
 
-        # Build message
         lines = [f"共 {len(tasks)} 个异步任务：\n"]
         for t in tasks:
             icon = {
@@ -775,9 +775,6 @@ def _build_async_cancel_tool(tracker: _AsyncTaskTracker) -> StructuredTool:
 # Background thread runner
 # ---------------------------------------------------------------------------
 
-_INTERRUPTED_MESSAGE = "子代理被取消"
-
-
 def _run_subagent_in_thread(
     runnable: Runnable,
     state: dict[str, Any],
@@ -875,19 +872,6 @@ ASYNC_TASK_SYSTEM_PROMPT = """## 异步子代理 (async_task / async_status / as
 
 
 # ---------------------------------------------------------------------------
-# Internal spec type
-# ---------------------------------------------------------------------------
-
-
-class _SubagentSpec(TypedDict):
-    """Internal spec for building an async subagent runnable."""
-
-    name: str
-    description: str
-    runnable: Runnable
-
-
-# ---------------------------------------------------------------------------
 # Subagent construction (shared logic with SubAgentMiddleware)
 # ---------------------------------------------------------------------------
 
@@ -902,7 +886,7 @@ _EXCLUDED_STATE_KEYS = {
 
 
 def _build_subagent_specs(
-    subagents: Sequence[dict[str, Any]],
+    subagents: Sequence[SubAgent | CompiledSubAgent],
     tracker: _AsyncTaskTracker,
 ) -> list[_SubagentSpec]:
     """Build runnable subagents from specs, injecting ``report_progress``.
@@ -917,49 +901,45 @@ def _build_subagent_specs(
     specs: list[_SubagentSpec] = []
 
     for spec in subagents:
-        if "runnable" in spec:
-            compiled = cast("dict[str, Any]", spec)
-            runnable = compiled["runnable"].with_config(
+        if isinstance(spec, CompiledSubAgent):
+            runnable = spec.runnable.with_config(
                 {
-                    "metadata": {"lc_agent_name": compiled["name"]},
-                    "run_name": compiled["name"],
+                    "metadata": {"lc_agent_name": spec.name},
+                    "run_name": spec.name,
                 }
             )
             specs.append(
-                {
-                    "name": compiled["name"],
-                    "description": compiled["description"],
-                    "runnable": runnable,
-                }
+                _SubagentSpec(
+                    name=spec.name,
+                    description=spec.description,
+                    runnable=runnable,
+                )
             )
             continue
 
         # SubAgent
-        if "model" not in spec:
-            raise ValueError(f"SubAgent '{spec['name']}' must specify 'model'")
-        if "tools" not in spec:
-            raise ValueError(f"SubAgent '{spec['name']}' must specify 'tools'")
+        if spec.model is None:
+            raise ValueError(f"SubAgent '{spec.name}' must specify 'model'")
 
-        middleware: list[Any] = list(spec.get("middleware", []))
-        interrupt_on = spec.get("interrupt_on")
-        if interrupt_on:
-            middleware.append(HumanInTheLoopMiddleware(interrupt_on=interrupt_on))
+        middleware: list[Any] = list(spec.middleware)
+        if spec.interrupt_on:
+            middleware.append(HumanInTheLoopMiddleware(interrupt_on=spec.interrupt_on))
 
         # Inject report_progress
-        tools = list(spec["tools"]) + [report_progress_tool]
+        tools = list(spec.tools) + [report_progress_tool]
 
         specs.append(
-            {
-                "name": spec["name"],
-                "description": spec["description"],
-                "runnable": _langchain_create_agent(
-                    spec["model"],
-                    system_prompt=spec["system_prompt"],
+            _SubagentSpec(
+                name=spec.name,
+                description=spec.description,
+                runnable=_langchain_create_agent(
+                    spec.model,
+                    system_prompt=spec.system_prompt,
                     tools=tools,  # type: ignore[arg-type]
                     middleware=middleware,
-                    name=spec["name"],
+                    name=spec.name,
                 ),
-            }
+            )
         )
 
     return specs
@@ -1017,7 +997,7 @@ class AsyncSubAgentMiddleware(AgentMiddleware[AgentState, ContextT, ResponseT]):
         self,
         *,
         backend: BackendProtocol,
-        async_subagents: Sequence[dict[str, Any]],
+        async_subagents: Sequence[SubAgent | CompiledSubAgent],
         system_prompt: str | None = ASYNC_TASK_SYSTEM_PROMPT,
         default_timeout: float = 3600.0,
     ) -> None:
@@ -1025,7 +1005,7 @@ class AsyncSubAgentMiddleware(AgentMiddleware[AgentState, ContextT, ResponseT]):
         if not async_subagents:
             raise ValueError("At least one async_subagent must be specified")
 
-        names = [a["name"] for a in async_subagents]
+        names = [a.name for a in async_subagents]
         dupes = {n for n in names if names.count(n) > 1}
         if dupes:
             raise ValueError(f"Duplicate async subagent names: {dupes}")
@@ -1036,9 +1016,9 @@ class AsyncSubAgentMiddleware(AgentMiddleware[AgentState, ContextT, ResponseT]):
 
         # Build subagent specs + inject report_progress
         subagent_specs = _build_subagent_specs(async_subagents, self._tracker)
-        subagent_graphs = {s["name"]: s["runnable"] for s in subagent_specs}
+        subagent_graphs = {s.name: s.runnable for s in subagent_specs}
         subagent_descriptions = "\n".join(
-            f"- {s['name']}: {s['description']}" for s in subagent_specs
+            f"- {s.name}: {s.description}" for s in subagent_specs
         )
 
         # Build tools
@@ -1057,7 +1037,7 @@ class AsyncSubAgentMiddleware(AgentMiddleware[AgentState, ContextT, ResponseT]):
         # Build system prompt
         if system_prompt and subagent_specs:
             agents_desc = "\n".join(
-                f"- {s['name']}: {s['description']}" for s in subagent_specs
+                f"- {s.name}: {s.description}" for s in subagent_specs
             )
             self._system_prompt = (
                 system_prompt

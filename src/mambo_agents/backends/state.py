@@ -39,12 +39,10 @@ from mambo_agents.backends.protocol import (
 )
 from mambo_agents.backends.state_schema import FileData
 from mambo_agents.backends.utils import (
-    LINE_NUMBER_WIDTH,
-    MAX_LINE_LENGTH,
     detect_trailing_newline_mismatch,
     format_with_line_numbers,
-    human_size,
 )
+from mambo_agents.backends.schemas import VirtualPath,human_size
 
 # ---------------------------------------------------------------------------
 # StateBackend
@@ -93,26 +91,21 @@ class StateBackend(ThreadAwareWorkspace):
         #     (only for paths NOT already in the checkpoint) ---
         self._initial_files: dict[str, FileData] = {}
         if initial_files:
-            for path, content_ in initial_files.items():
-                encoding = "base64" if _get_file_type(path) != "text" else "utf-8"
-                self._initial_files[path] = FileData(
+            for raw_path, content_ in initial_files.items():
+                vp = VirtualPath(raw_path)  # validate absolute, no "..", no "//"
+                if vp.value.endswith("/"):
+                    raise ValueError(
+                        f"initial_files path must not end with '/': {raw_path!r} "
+                        f"(directories are not supported)"
+                    )
+                encoding = "base64" if _get_file_type(vp.normalized) != "text" else "utf-8"
+                self._initial_files[vp.normalized] = FileData(
                     content=content_, encoding=encoding,
                 )
 
     # ------------------------------------------------------------------
-    # Per-thread read / write (graph context only; outside-graph ops use
-    # upload_files / download_files with explicit thread_id)
+    # Per-thread read / write — graph context vs. outside-graph
     # ------------------------------------------------------------------
-    #
-    # **Snapshot pattern**: ``_snapshots[tid]`` mirrors the Pregel
-    # ``files`` channel faithfully.  ``_read_files()`` **fully replaces**
-    # the snapshot with channel data — never incrementally merges — so
-    # checkpoint rollbacks, branch switches, and file deletions are
-    # automatically reflected.
-    #
-    # Graph-outside uploads are queued in ``_pending_uploads[tid]`` and
-    # flushed to the channel (together with ``_initial_files``) on the
-    # first ``_read_files()`` for that thread.
 
     def _get_config(self) -> RunnableConfig:
         """Return the current LangGraph config, or raise a clear error.
@@ -317,7 +310,7 @@ class StateBackend(ThreadAwareWorkspace):
                 ),
                 args_schema=create_model(
                     "TreeSchema",
-                    path=(str, Field(default="/", description="Root directory to display")),
+                    path=(str, Field(..., description="Root directory to display")),
                     depth=(int, Field(default=3, description="Maximum recursion depth")),
                 ),
                 func=lambda **kwargs: self.tree(**kwargs),
@@ -329,12 +322,12 @@ class StateBackend(ThreadAwareWorkspace):
     # Core file operations
     # ------------------------------------------------------------------
 
-    def ls(self, path: str) -> LsResult:
-        normalized = path.rstrip("/") + "/" if path != "/" else "/"
+    def ls(self, path: VirtualPath) -> LsResult:
+        normalized = path.normalized + "/"
 
         files = self._read_files()
         # Check if path itself is a file, not a directory
-        if path.rstrip("/") in files:
+        if path.normalized in files:
             return LsResult(error=f"'{path}' is a file, not a directory")
 
         infos: list[FileInfo] = []
@@ -359,13 +352,15 @@ class StateBackend(ThreadAwareWorkspace):
 
     def read_raw(
         self,
-        file_path: str,
+        file_path: VirtualPath,
         offset: int = 0,
-        limit: int = 2000,
+        limit: int | None = 2000,
         include_line_numbers: bool = False,
     ) -> ReadResult:
+        if file_path.value.endswith("/"):
+            return ReadResult(error=f"Cannot read '{file_path}': looks like a directory")
         files = self._read_files()
-        fd = files.get(file_path)
+        fd = files.get(file_path.normalized)
         if fd is None:
             return ReadResult(error=f"File '{file_path}' not found")
 
@@ -373,13 +368,13 @@ class StateBackend(ThreadAwareWorkspace):
         encoding = fd.get("encoding", "utf-8")
 
         if encoding == "base64":
-            file_type = _get_file_type(file_path)
+            file_type = _get_file_type(file_path.normalized)
             return ReadResult(
                 content=content,
                 total_lines=1,
                 encoding="base64",
                 file_type=file_type,
-                mime_type=_get_mime_type(file_path),
+                mime_type=_get_mime_type(file_path.normalized),
             )
 
         lines = content.split("\n")
@@ -387,7 +382,8 @@ class StateBackend(ThreadAwareWorkspace):
             lines = lines[:-1]
         total = len(lines)
 
-        sliced = lines[offset: offset + limit]
+        end = offset + limit if limit is not None else None
+        sliced = lines[offset:end]
         raw_slice = "\n".join(sliced)
         content = (
             format_with_line_numbers(raw_slice, start_line=offset + 1)
@@ -401,17 +397,19 @@ class StateBackend(ThreadAwareWorkspace):
         )
 
     def write(
-        self, file_path: str, content: str, overwrite: bool = False,
+        self, file_path: VirtualPath, content: str, overwrite: bool = False,
     ) -> WriteResult:
+        if file_path.value.endswith("/"):
+            return WriteResult(error=f"'{file_path}' looks like a directory — use ls() to list it")
         files = self._read_files()
         # Check if file_path is a "directory" (contains child files)
-        prefix = file_path.rstrip("/") + "/"
+        prefix = file_path.normalized + "/"
         for fpath in files:
             if fpath.startswith(prefix):
                 return WriteResult(
                     error=f"'{file_path}' is a directory, cannot write to it"
                 )
-        if file_path in files and not overwrite:
+        if file_path.normalized in files and not overwrite:
             return WriteResult(
                 error=(
                     f"Cannot write '{file_path}': file already exists. "
@@ -419,30 +417,32 @@ class StateBackend(ThreadAwareWorkspace):
                     "or use overwrite=True to replace the file."
                 ),
             )
-        encoding = "base64" if _get_file_type(file_path) != "text" else "utf-8"
+        encoding = "base64" if _get_file_type(file_path.normalized) != "text" else "utf-8"
         fd: FileData = {"content": content, "encoding": encoding}
-        self._send_files_update({file_path: fd})
-        return WriteResult(path=file_path)
+        self._send_files_update({file_path.normalized: fd})
+        return WriteResult(path=file_path.normalized)
 
     def edit(
         self,
-        file_path: str,
+        file_path: VirtualPath,
         old_str: str,
         new_str: str,
         *,
         replace_all: bool = False,
     ) -> EditResult:
+        if file_path.value.endswith("/"):
+            return EditResult(error=f"'{file_path}' looks like a directory — use ls() to list it")
         if not old_str:
             return EditResult(error="old_str must not be empty")
         files = self._read_files()
         # Check if file_path is a "directory" (contains child files)
-        prefix = file_path.rstrip("/") + "/"
+        prefix = file_path.normalized + "/"
         for fpath in files:
             if fpath.startswith(prefix):
                 return EditResult(
                     error=f"'{file_path}' is a directory, cannot edit it"
                 )
-        existing_fd = files.get(file_path)
+        existing_fd = files.get(file_path.normalized)
         if existing_fd is None:
             return EditResult(
                 error=(
@@ -466,7 +466,7 @@ class StateBackend(ThreadAwareWorkspace):
             # Detect trailing-newline mismatch: model adds \n to old_str
             # but the file does not end with a newline.
             mismatch = detect_trailing_newline_mismatch(
-                file_path, old_str, existing_content,
+                file_path.normalized, old_str, existing_content,
             )
             if mismatch is not None:
                 return mismatch
@@ -490,13 +490,13 @@ class StateBackend(ThreadAwareWorkspace):
             "content": existing_content.replace(old_str, new_str),
             "encoding": existing_fd.get("encoding", "utf-8"),
         }
-        self._send_files_update({file_path: fd})
-        return EditResult(path=file_path, occurrences=occurrences)
+        self._send_files_update({file_path.normalized: fd})
+        return EditResult(path=file_path.normalized, occurrences=occurrences)
 
     def grep(
         self,
         pattern: str,
-        path: str = "/",
+        path: VirtualPath,
         glob: str | None = None,
         regex: bool = False,
         offset: int = 0,
@@ -505,23 +505,23 @@ class StateBackend(ThreadAwareWorkspace):
         if not pattern:
             return GrepResult(error="pattern must not be empty")
         files = self._read_files()
-        raw_matches = _grep_in_memory(files, pattern, path, glob, regex, self._max_grep_matches)
+        raw_matches = _grep_in_memory(files, pattern, path.normalized, glob, regex, self._max_grep_matches)
         return self._apply_grep_limit(raw_matches, offset, limit)
 
-    def glob(self, pattern: str, path: str = "/") -> GlobResult:
+    def glob(self, pattern: str, path: VirtualPath) -> GlobResult:
         files = self._read_files()
-        return _glob_in_memory(files, pattern, path)
+        return _glob_in_memory(files, pattern, path.normalized)
 
     # ------------------------------------------------------------------
     # Extra operations
     # ------------------------------------------------------------------
 
-    def tree(self, path: str = "/", depth: int = 3) -> str:
+    def tree(self, path: VirtualPath, depth: int = 3) -> str:
         """Render a directory tree by recursively calling ``ls()``."""
         entries = _collect_tree_entries(self, path, depth)
         return _format_tree(entries)
 
-    async def atree(self, path: str = "/", depth: int = 3) -> str:
+    async def atree(self, path: VirtualPath, depth: int = 3) -> str:
         """Async: Render a directory tree."""
         return await asyncio.to_thread(self.tree, path, depth)
 
@@ -531,7 +531,7 @@ class StateBackend(ThreadAwareWorkspace):
 
     def upload_files(
         self,
-        files: list[tuple[str, bytes]],
+        files: list[tuple[VirtualPath, bytes]],
         *,
         thread_id: str | None = None,
     ) -> list[UploadFileResult]:
@@ -566,8 +566,8 @@ class StateBackend(ThreadAwareWorkspace):
                 text = base64.b64encode(raw_content).decode("ascii")
                 encoding = "base64"
             fd: FileData = {"content": text, "encoding": encoding}
-            update[path] = fd
-            results.append(UploadFileResult(path=path, error=None))
+            update[path.normalized] = fd
+            results.append(UploadFileResult(path=path.normalized, error=None))
 
         # Branch: graph-in → write channel + snapshot; graph-out → queue
         if self._in_graph_context():
@@ -581,7 +581,7 @@ class StateBackend(ThreadAwareWorkspace):
 
     def download_files(
         self,
-        paths: list[str],
+        paths: list[VirtualPath],
         *,
         thread_id: str | None = None,
     ) -> list[DownloadFileResult]:
@@ -623,10 +623,10 @@ class StateBackend(ThreadAwareWorkspace):
                 files.update(pending)
 
         for path in paths:
-            fd = files.get(path)
+            fd = files.get(path.normalized)
             if fd is None:
                 results.append(
-                    DownloadFileResult(path=path, content=None, error="file_not_found")
+                    DownloadFileResult(path=path.normalized, content=None, error="file_not_found")
                 )
                 continue
             content = fd.get("content", "")
@@ -636,7 +636,7 @@ class StateBackend(ThreadAwareWorkspace):
             else:
                 content_bytes = base64.standard_b64decode(content)
             results.append(
-                DownloadFileResult(path=path, content=content_bytes, error=None)
+                DownloadFileResult(path=path.normalized, content=content_bytes, error=None)
             )
         return results
 
@@ -708,7 +708,7 @@ def _glob_in_memory(
 
 def _collect_tree_entries(
     backend: StateBackend,
-    path: str,
+    path: VirtualPath,
     depth: int,
 ) -> list[tuple[str, bool, int]]:
     """Recurse via ``ls()`` and collect ``(path, is_dir, size)`` tuples."""
@@ -719,16 +719,17 @@ def _collect_tree_entries(
     entries: list[tuple[str, bool, int]] = []
     for fi in result.entries:
         if fi.is_dir and depth > 1:
+            sub_path = fi.path.value if fi.path.value.endswith("/") else fi.path.value + "/"
             entries.extend(
                 _collect_tree_entries(
                     backend,
-                    fi.path if fi.path.endswith("/") else fi.path + "/",
+                    VirtualPath(sub_path),
                     depth - 1,
                 )
             )
     # Direct children after subdirectories (visual order)
     for fi in result.entries:
-        entries.append((fi.path, fi.is_dir, fi.size))
+        entries.append((str(fi.path), fi.is_dir, fi.size))
     return entries
 
 

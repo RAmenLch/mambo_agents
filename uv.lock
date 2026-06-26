@@ -670,12 +670,14 @@ wheels = [
 
 [[package]]
 name = "mambo-agents"
-version = "0.2.0a35"
+version = "0.2.0a36"
 source = { editable = "." }
 dependencies = [
     { name = "langchain" },
+    { name = "langchain-core" },
     { name = "langgraph" },
     { name = "paramiko" },
+    { name = "pydantic" },
     { name = "tree-sitter" },
     { name = "tree-sitter-c" },
     { name = "tree-sitter-cpp" },
@@ -698,8 +700,10 @@ dev = [
 [package.metadata]
 requires-dist = [
     { name = "langchain", specifier = ">=1.2,<2" },
+    { name = "langchain-core", specifier = ">=1.4,<2" },
     { name = "langgraph", specifier = ">=1.1,<2" },
     { name = "paramiko", specifier = ">=4.0,<5" },
+    { name = "pydantic", specifier = ">2.13,<3.0" },
     { name = "tree-sitter", specifier = ">=0.25,<0.26" },
     { name = "tree-sitter-c", specifier = ">=0.24.2,<0.25" },
     { name = "tree-sitter-cpp", specifier = ">=0.23.4,<0.24" },

@@ -6,6 +6,7 @@ import re
 from pathlib import PurePosixPath
 
 from mambo_agents.backends.protocol import ReadSummarizer
+from mambo_agents.backends.schemas import VirtualPath
 
 _HEADING_RE = re.compile(r"^(#{1,6})\s+(.+)$", re.MULTILINE)
 _LINE_LIMIT = 200
@@ -20,8 +21,8 @@ def markdown_summarizer() -> ReadSummarizer:
     so the LLM can navigate to specific sections.
     """
 
-    def _summarize(file_path: str, content: str, max_chars: int) -> str:
-        suffix = PurePosixPath(file_path).suffix.lower()
+    def _summarize(file_path: VirtualPath, content: str, max_chars: int) -> str:
+        suffix = PurePosixPath(file_path.value).suffix.lower()
         if suffix not in _MD_SUFFIXES:
             return _fallback(file_path, content, max_chars)
         return _summarize_md(file_path, content, max_chars)
@@ -34,7 +35,7 @@ def markdown_summarizer() -> ReadSummarizer:
 # ---------------------------------------------------------------------------
 
 
-def _fallback(file_path: str, content: str, max_chars: int) -> str:
+def _fallback(file_path: VirtualPath, content: str, max_chars: int) -> str:
     total_lines = content.count("\n") + 1
     return (
         f"[返回结果过大（{len(content):,} 字符，{total_lines:,} 行），"
@@ -44,7 +45,7 @@ def _fallback(file_path: str, content: str, max_chars: int) -> str:
     )
 
 
-def _summarize_md(file_path: str, content: str, max_chars: int) -> str:
+def _summarize_md(file_path: VirtualPath, content: str, max_chars: int) -> str:
     total_lines = content.count("\n") + 1
     lines_of_content = content.split("\n")
 

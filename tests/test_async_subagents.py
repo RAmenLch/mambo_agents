@@ -10,6 +10,7 @@ import pytest
 from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
 from langchain_core.runnables import Runnable, RunnableLambda
 
+from mambo_agents.backends.schemas import VirtualPath
 from mambo_agents.middleware.async_subagents import (
     ASYNC_TASK_SYSTEM_PROMPT,
     AsyncSubAgentMiddleware,
@@ -32,6 +33,7 @@ from mambo_agents.middleware.async_subagents import (
     _get_current_async_task,
     _append_to_system_message,
 )
+from mambo_agents.middleware.subagents import CompiledSubAgent
 from mambo_agents.backends.state import StateBackend
 
 
@@ -86,12 +88,12 @@ def _make_stub_runnable(
 
 
 def _stub_subagent_spec(name: str = "test-agent", description: str = "A test agent"):
-    """Build a minimal SubAgent-like dict with a stub runnable."""
-    return {
-        "name": name,
-        "description": description,
-        "runnable": _make_stub_runnable(name),
-    }
+    """Build a minimal CompiledSubAgent with a stub runnable."""
+    return CompiledSubAgent(
+        name=name,
+        description=description,
+        runnable=_make_stub_runnable(name),
+    )
 
 
 # ---------------------------------------------------------------------------
