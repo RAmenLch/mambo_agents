@@ -1,14 +1,17 @@
 """Tests for MamboPlanMiddleware and Summarization hook integration."""
 
 import os
+from typing import Annotated, get_args, get_origin, get_type_hints
 from unittest.mock import MagicMock
 
 import pytest
+from langchain.agents.middleware.types import AgentState
 from langchain_core.messages import (
     AIMessage,
     HumanMessage,
     ToolMessage,
 )
+from langgraph.types import Overwrite
 
 from mambo_agents import (
     MamboPlanMiddleware,
@@ -796,3 +799,252 @@ class TestPlanSummarizationE2E:
                 break
         assert last_ai is not None
         assert "ALL_DONE" in (last_ai.content or "").upper()
+
+
+# =============================================================================
+# PlanningState schema regression — Overwrite leak bug
+# =============================================================================
+
+
+class TestPlanningStateSchema:
+    """Verify PlanningState correctly inherits AgentState with ``add_messages``.
+
+    Regression test for: ``PlanningState`` was an independent ``TypedDict`` that
+    re-declared ``messages`` with ``...`` (Ellipsis) instead of the ``add_messages``
+    reducer.  When the factory merged multiple middleware state schemas with
+    "last wins" semantics, the reducer-less annotation could overwrite the correct
+    one, degrading the ``messages`` channel from ``BinaryOperatorAggregate`` to
+    ``LastValue``.  ``LastValue`` does not recognise ``Overwrite``, so the raw
+    ``Overwrite`` object leaked into ``state["messages"]`` and caused
+    ``TypeError: 'Overwrite' object is not iterable`` downstream.
+    """
+
+    # ------------------------------------------------------------------
+    # Schema structure
+    # ------------------------------------------------------------------
+
+    def test_planning_state_inherits_from_agent_state(self):
+        """PlanningState must be a subclass of AgentState (not an isolated TypedDict).
+
+        Uses ``__orig_bases__`` because TypedDict's metaclass rewrites
+        ``__bases__`` to ``(Generic, dict)`` at runtime.
+        """
+        from mambo_agents.middleware.planning import PlanningState
+
+        orig_bases = getattr(PlanningState, "__orig_bases__", ())
+        assert AgentState in orig_bases, (
+            "PlanningState must inherit AgentState so that 'messages' gets the "
+            "add_messages reducer. Found orig_bases: {orig_bases}"
+        )
+
+    def test_messages_field_has_callable_reducer(self):
+        """messages annotation on PlanningState must carry a callable reducer."""
+        from mambo_agents.middleware.planning import PlanningState
+
+        hints = get_type_hints(PlanningState, include_extras=True)
+        assert "messages" in hints, (
+            "PlanningState must expose 'messages' (inherited from AgentState)"
+        )
+
+        msg_type = hints["messages"]
+        metadata = _get_annotated_metadata(msg_type)
+
+        assert any(callable(m) for m in metadata), (
+            "messages must have a callable reducer (add_messages), "
+            f"got metadata: {metadata}"
+        )
+
+    def test_planning_state_does_not_redeclare_messages_without_reducer(self):
+        """PlanningState must not redeclare ``messages`` with a non-callable reducer.
+
+        Before the fix it redundantly declared
+        ``messages: Annotated[list[AnyMessage], ...]`` (Ellipsis instead of
+        ``add_messages``).  After the fix it simply inherits from AgentState.
+        """
+        from mambo_agents.middleware.planning import PlanningState
+
+        own_anns = getattr(PlanningState, "__annotations__", {})
+        assert "messages" in own_anns, "PlanningState must inherit 'messages' from AgentState"
+
+        # Check the raw annotation string — it must reference add_messages,
+        # not Ellipsis (which would appear as '...' or 'Ellipsis').
+        raw = own_anns["messages"]
+        raw_str = str(raw)
+        assert "add_messages" in raw_str, (
+            f"messages annotation must reference add_messages, got: {raw_str[:120]}"
+        )
+
+    # ------------------------------------------------------------------
+    # Factory schema-merge simulation
+    # ------------------------------------------------------------------
+
+    def test_schema_merge_preserves_reducer_in_all_orders(self):
+        """Simulate factory ``_resolve_schema`` — messages always has a reducer.
+
+        The factory collects middleware ``state_schema`` values into a ``set``,
+        then iterates with ``all_annotations[name] = type`` (last wins).
+        This test verifies that **regardless of iteration order**, the
+        ``messages`` annotation always carries a callable reducer.
+        """
+        from mambo_agents.backends.state_schema import FilesystemState
+        from mambo_agents.middleware.memory import MemoryState
+        from mambo_agents.middleware.planning import PlanningState
+        from mambo_agents.middleware.skills import SkillsState
+        from mambo_agents.middleware.summarization import SummarizationState
+
+        schemas = [
+            AgentState,
+            MemoryState,
+            SummarizationState,
+            SkillsState,
+            FilesystemState,
+            PlanningState,
+        ]
+
+        # Try three different iteration orders
+        orders = [
+            schemas,                        # natural order
+            list(reversed(schemas)),        # reversed
+            [s for s in schemas if s is not PlanningState] + [PlanningState],  # planning last
+        ]
+
+        for order in orders:
+            all_annotations: dict = {}
+            for schema in order:
+                hints = get_type_hints(schema, include_extras=True)
+                for fname, ftype in hints.items():
+                    all_annotations[fname] = ftype  # last-wins
+
+            assert "messages" in all_annotations
+            msg_type = all_annotations["messages"]
+            metadata = _get_annotated_metadata(msg_type)
+
+            assert any(callable(m) for m in metadata), (
+                f"messages must have callable reducer in all merge orders. "
+                f"Order: {[s.__name__ for s in order]}, "
+                f"metadata: {metadata}"
+            )
+
+    # ------------------------------------------------------------------
+    # LangGraph channel behaviour
+    # ------------------------------------------------------------------
+
+    def test_binary_operator_aggregate_unwraps_overwrite(self):
+        """``BinaryOperatorAggregate`` (created by ``add_messages``) unwraps ``Overwrite``.
+
+        This is the healthy behaviour — when the channel sees an ``Overwrite``
+        it stores the inner value, not the wrapper.
+        """
+        from langgraph.graph.message import add_messages
+        from langgraph.channels.binop import BinaryOperatorAggregate
+
+        channel = BinaryOperatorAggregate(typ=list, operator=add_messages)
+
+        # Normal update
+        channel.update([[HumanMessage(content="first")]])
+        assert isinstance(channel.get(), list)
+        assert len(channel.get()) == 1
+
+        # Overwrite — must be unwrapped
+        channel.update([Overwrite(value=[HumanMessage(content="replaced")])])
+        result = channel.get()
+        assert isinstance(result, list), (
+            f"BinaryOperatorAggregate must unwrap Overwrite, got {type(result)}"
+        )
+        assert len(result) == 1
+        assert result[0].content == "replaced"
+
+    def test_last_value_channel_leaks_overwrite(self):
+        """Document the failure mode: ``LastValue`` channel leaks ``Overwrite``.
+
+        When ``PlanningState`` did **not** carry ``add_messages``, LangGraph
+        created a ``LastValue`` channel for ``messages``.  ``LastValue`` stores
+        ``Overwrite`` as-is, causing ``TypeError`` downstream.
+        """
+        from langgraph.channels.last_value import LastValue
+
+        channel = LastValue(typ=object)
+
+        # Normal update
+        channel.update([[HumanMessage(content="first")]])
+
+        # Overwrite — LastValue stores the wrapper (the bug)
+        channel.update([Overwrite(value=[HumanMessage(content="replaced")])])
+        result = channel.get()
+
+        assert isinstance(result, Overwrite), (
+            "LastValue should NOT unwrap Overwrite — this is the documented failure"
+        )
+        with pytest.raises(TypeError, match="not iterable"):
+            list(result)
+
+    # ------------------------------------------------------------------
+    # Defensive unwrap in summarization middleware
+    # ------------------------------------------------------------------
+
+    def test__apply_event__unwraps_overwrite(self):
+        """``_apply_event_to_messages`` defensively unwraps ``Overwrite`` input."""
+        from mambo_agents.middleware.summarization import MamboSummarizationMiddleware
+
+        # Call the static method directly
+        messages = [HumanMessage(content="hi"), AIMessage(content="hey")]
+        result = MamboSummarizationMiddleware._apply_event_to_messages(messages, None)
+        assert result == messages
+
+        # When messages accidentally arrive as Overwrite (defense)
+        wrapped = Overwrite(value=messages)
+        result = MamboSummarizationMiddleware._apply_event_to_messages(wrapped, None)
+        assert result == messages
+
+    def test__apply_event__with_summarization_event__unwraps_overwrite(self):
+        """``_apply_event_to_messages`` handles Overwrite + summarization event."""
+        from mambo_agents.middleware.summarization import MamboSummarizationMiddleware
+
+        summary_msg = AIMessage(content="Summary so far...")
+        event = {
+            "summary_message": summary_msg,
+            "cutoff_index": 1,
+        }
+        messages = [
+            HumanMessage(content="U1"),
+            HumanMessage(content="U2"),
+            HumanMessage(content="U3"),
+        ]
+
+        # Normal path
+        result = MamboSummarizationMiddleware._apply_event_to_messages(messages, event)
+        assert isinstance(result, list)
+        assert result[0] is summary_msg
+        assert result[1:] == messages[1:]
+
+        # Defensive Overwrite unwrap with event
+        wrapped = Overwrite(value=messages)
+        result = MamboSummarizationMiddleware._apply_event_to_messages(wrapped, event)
+        assert isinstance(result, list)
+        assert result[0] is summary_msg
+        assert result[1:] == messages[1:]
+
+
+# ---------------------------------------------------------------------------
+# Shared helpers
+# ---------------------------------------------------------------------------
+
+
+def _get_annotated_metadata(hint):
+    """Return metadata list from an ``Annotated[T, m1, m2, ...]`` type.
+
+    Unwraps ``Required`` / ``NotRequired`` wrappers that TypedDict fields
+    commonly carry (e.g. ``Required[Annotated[list[AnyMessage], add_messages]]``).
+
+    Returns an empty list if *hint* is not ``Annotated`` (even after unwrapping).
+    """
+    # Unwrap Required / NotRequired
+    origin = get_origin(hint)
+    if origin is not None:
+        origin_name = getattr(origin, "__name__", str(origin))
+        if origin_name in ("Required", "NotRequired"):
+            hint = get_args(hint)[0]
+
+    if get_origin(hint) is Annotated:
+        return list(get_args(hint))[1:]
+    return []

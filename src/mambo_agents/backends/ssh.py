@@ -307,11 +307,12 @@ class SshBackend(BackendProtocol):
     ) -> tuple[str, str, int]:
         """Execute *command* on the remote server via SSH.
 
-        Sets a real timeout on the channel so ``recv_exit_status()`` does
-        not block indefinitely.  Reads stdout and stderr concurrently in
-        background threads to avoid pipe-buffer deadlocks (where the
-        remote process blocks on a full stderr pipe while we are still
-        waiting for stdout EOF).
+        Enforces a hard timeout via a background watchdog timer that
+        forcibly closes the channel after *timeout* seconds, guarding
+        against cases where ``channel.settimeout()`` is defeated by
+        SSH keep-alive traffic (e.g. ``sleep N`` produces no I/O
+        stalls).  Reads stdout and stderr concurrently in background
+        threads to avoid pipe-buffer deadlocks.
 
         Returns:
             ``(stdout, stderr, exit_code)`` tuple.
@@ -321,6 +322,17 @@ class SshBackend(BackendProtocol):
 
         channel = stdout.channel
         channel.settimeout(t)
+
+        # Hard-timeout watchdog: force-close the channel after *t* seconds
+        # even if SSH keep-alive traffic prevents socket.timeout from firing.
+        def _close_channel() -> None:
+            try:
+                channel.close()
+            except Exception:
+                pass
+
+        _hard_timer = threading.Timer(t, _close_channel)
+        _hard_timer.start()
 
         # Read stdout / stderr in background threads to prevent pipe-
         # buffer deadlock: if the remote process writes a lot to stderr
@@ -344,19 +356,22 @@ class SshBackend(BackendProtocol):
         err_thread.start()
 
         try:
-            exit_code = channel.recv_exit_status()
-        except socket.timeout:
-            channel.close()
-            # Give drain threads a brief window to collect partial data
-            out_thread.join(timeout=3)
-            err_thread.join(timeout=3)
-            partial_out = b"".join(out_chunks).decode(errors="replace")
-            partial_err = b"".join(err_chunks).decode(errors="replace")
-            hint = f"\n(stderr) {partial_err}" if partial_err.strip() else ""
-            return (partial_out, f"Command timed out after {t}s.{hint}", -1)
-        except Exception as exc:
-            channel.close()
-            return ("", f"Command execution error: {exc}", -1)
+            try:
+                exit_code = channel.recv_exit_status()
+            except socket.timeout:
+                channel.close()
+                # Give drain threads a brief window to collect partial data
+                out_thread.join(timeout=3)
+                err_thread.join(timeout=3)
+                partial_out = b"".join(out_chunks).decode(errors="replace")
+                partial_err = b"".join(err_chunks).decode(errors="replace")
+                hint = f"\n(stderr) {partial_err}" if partial_err.strip() else ""
+                return (partial_out, f"Command timed out after {t}s.{hint}", -1)
+            except Exception as exc:
+                channel.close()
+                return ("", f"Command execution error: {exc}", -1)
+        finally:
+            _hard_timer.cancel()
 
         out_thread.join(timeout=5)
         err_thread.join(timeout=5)

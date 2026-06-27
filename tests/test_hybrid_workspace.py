@@ -640,6 +640,7 @@ class TestDescription:
         assert hws.description.startswith("!!! CUSTOM !!!")
 
     def test_lists_core_tools_only(self):
+        # Without execute tool, no "NOT target" warning
         hws = HybridWorkspaceBackend(real_backend=_FakeBackend())
         desc = hws.description
         assert "ls" in desc
@@ -648,8 +649,23 @@ class TestDescription:
         assert "edit" in desc
         assert "grep" in desc
         assert "glob" in desc
-        # tree / delete now appear in description as having path translation;
-        # execute is the only extra tool that still gets the "NOT target" warning
+        assert "do NOT target" not in desc
+
+    def test_execute_tool_warning(self):
+        """When real backend provides execute, description warns about paths."""
+        execute_tool = StructuredTool(
+            name="execute",
+            description="Run a shell command",
+            args_schema=create_model(
+                "ExecSchema",
+                command=(str, Field(description="Command to run")),
+            ),
+            func=lambda command: f"executed: {command}",
+        )
+        hws = HybridWorkspaceBackend(
+            real_backend=_FakeBackend(extra_tools=[execute_tool])
+        )
+        desc = hws.description
         assert "do NOT target" in desc
 
 

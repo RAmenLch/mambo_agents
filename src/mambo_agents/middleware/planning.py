@@ -26,13 +26,13 @@ from langchain.agents.middleware.types import (
     OmitFromInput,
     ResponseT,
 )
-from langchain_core.messages import AIMessage, AnyMessage, SystemMessage, ToolMessage
+from langchain_core.messages import AIMessage, SystemMessage, ToolMessage
 from langchain_core.tools import InjectedToolCallId, StructuredTool
 from langgraph.runtime import Runtime
 from langgraph.types import Command
 from langgraph.typing import ContextT
 from pydantic import BaseModel, ConfigDict, Field
-from typing_extensions import NotRequired, TypedDict, override
+from typing_extensions import NotRequired, override
 
 
 # ---------------------------------------------------------------------------
@@ -70,7 +70,7 @@ class WritePlansInput(BaseModel):
 # ---------------------------------------------------------------------------
 
 
-class PlanningState(TypedDict, total=False):
+class PlanningState(AgentState):
     """State schema for the planning middleware.
 
     ``plans`` is excluded from user-facing input so callers never need to
@@ -78,7 +78,6 @@ class PlanningState(TypedDict, total=False):
     ``write_plans`` tool.
     """
 
-    messages: Annotated[list[AnyMessage], ...]  # inherited from AgentState
     plans: Annotated[NotRequired[list[Plan]], OmitFromInput]
     """Structured task list written by the agent via ``write_plans``."""
 

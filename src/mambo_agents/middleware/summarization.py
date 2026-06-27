@@ -84,6 +84,7 @@ from typing_extensions import NotRequired, TypedDict
 
 from mambo_agents.backends.protocol import BackendProtocol
 from mambo_agents.backends.schemas import VirtualPath
+from mambo_agents.middleware.patch_tool_calls import _unwrap_overwrite
 
 logger = logging.getLogger(__name__)
 
@@ -908,6 +909,10 @@ class MamboSummarizationMiddleware(AgentMiddleware[SummarizationState, ContextT,
             Effective message list: ``[summary_msg, *messages[cutoff_idx:]]``
             if an event exists, otherwise a shallow copy of ``messages``.
         """
+        # Defensive unwrap: if messages leaked as Overwrite due to a
+        # reducer mismatch (e.g., PlanningState bug), unwrap to the real list.
+        messages = _unwrap_overwrite(messages)
+
         if event is None:
             return list(messages)
 
