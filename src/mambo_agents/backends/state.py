@@ -527,11 +527,15 @@ class StateBackend(ThreadAwareWorkspace):
 
     def tree(self, path: VirtualPath, depth: int = 3) -> str:
         """Render a directory tree by recursively calling ``ls()``."""
+        if isinstance(path, str):
+            path = VirtualPath(path)
         entries = _collect_tree_entries(self, path, depth)
         return _format_tree(entries)
 
     async def atree(self, path: VirtualPath, depth: int = 3) -> str:
         """Async: Render a directory tree."""
+        if isinstance(path, str):
+            path = VirtualPath(path)
         return await asyncio.to_thread(self.tree, path, depth)
 
     # ------------------------------------------------------------------

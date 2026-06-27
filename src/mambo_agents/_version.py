@@ -1,3 +1,3 @@
 """Mambo Agents version."""
 
-__version__ = "0.2.0a41"
+__version__ = "0.2.0a43"
