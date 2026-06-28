@@ -150,8 +150,10 @@ def _source_path(source: SkillSource) -> str:
     return source[0]
 
 
-def to_posix_path(p: str) -> str:
+def to_posix_path(p: str | VirtualPath) -> str:
     """Normalize a path to POSIX conventions (forward slashes)."""
+    if isinstance(p, VirtualPath):
+        p = p.value
     return p.replace("\\", "/")
 
 
@@ -350,7 +352,7 @@ def _validate_module_path(raw: object, skill_path: str) -> str | None:
 
 def _parse_skill_metadata(
     content: str,
-    skill_path: str,
+    skill_path: str | VirtualPath,
     directory_name: str,
 ) -> SkillMetadata | None:
     """Parse YAML frontmatter from SKILL.md content."""
@@ -427,7 +429,7 @@ def _parse_skill_metadata(
     return SkillMetadata(
         name=str(name),
         description=description_str,
-        path=skill_path,
+        path=str(skill_path),
         metadata=_validate_metadata(frontmatter_data.get("metadata", {}), skill_path),
         license=str(frontmatter_data.get("license", "")).strip() or None,
         compatibility=compatibility_str,
@@ -443,8 +445,8 @@ def _parse_skill_metadata(
 
 def _skill_metadata_from_response(
     response: "DownloadFileResult",
-    skill_dir_path: str,
-    skill_md_path: str,
+    skill_dir_path: VirtualPath,
+    skill_md_path: VirtualPath,
 ) -> SkillMetadata | None:
     """Decode a SKILL.md download response into SkillMetadata (or None)."""
     if response.error:
@@ -500,7 +502,7 @@ def _list_skills_with_errors(
     items = ls_result.entries
 
     # Find all skill directories (directories that may contain SKILL.md)
-    skill_dirs: list[str] = []
+    skill_dirs: list[VirtualPath] = []
     for item in (items or []):
         if not item.is_dir:
             continue
@@ -547,7 +549,7 @@ async def _alist_skills_with_errors(
 
     items = ls_result.entries
 
-    skill_dirs: list[str] = []
+    skill_dirs: list[VirtualPath] = []
     for item in (items or []):
         if not item.is_dir:
             continue

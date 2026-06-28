@@ -345,6 +345,9 @@ class StateBackend(ThreadAwareWorkspace):
                 )
 
         if not infos and not subdirs:
+            # workspace_root always exists even when empty
+            if path.normalized == self.workspace_root.normalized:
+                return LsResult(entries=[])
             return LsResult(error=f"Path '{path}' not found")
 
         for sd in sorted(subdirs):
