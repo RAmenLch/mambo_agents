@@ -1701,6 +1701,20 @@ class SshBackend(BackendProtocol):
         async with self._async_lock:
             return await asyncio.to_thread(self.execute, command, timeout=timeout)
 
+    async def aupload_files(
+        self,
+        files: list[tuple[VirtualPath, bytes]],
+    ) -> list[UploadFileResult]:
+        async with self._async_lock:
+            return await asyncio.to_thread(self.upload_files, files)
+
+    async def adownload_files(
+        self,
+        paths: list[VirtualPath],
+    ) -> list[DownloadFileResult]:
+        async with self._async_lock:
+            return await asyncio.to_thread(self.download_files, paths)
+
     # ------------------------------------------------------------------
     # Developer API — bulk upload / download
     # ------------------------------------------------------------------

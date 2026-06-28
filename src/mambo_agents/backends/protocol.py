@@ -709,11 +709,19 @@ class BackendProtocol(abc.ABC):
             )
         return results
 
+    async def aupload_files(
+        self, files: list[tuple[VirtualPath, bytes]]
+    ) -> list[UploadFileResult]:
+        """Async: Upload multiple files as raw bytes."""
+        return await asyncio.to_thread(self.upload_files, files)
+
     async def adownload_files(
         self, paths: list[VirtualPath]
     ) -> list[DownloadFileResult]:
         """Async: Download multiple files as original bytes."""
         return await asyncio.to_thread(self.download_files, paths)
+
+
 
 
 # ============================================================================

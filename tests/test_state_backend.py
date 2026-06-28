@@ -385,7 +385,16 @@ class TestStateBackendLs:
     def test_ls_empty(self):
         backend = StateBackend()
         with _simulate_graph(backend):
+            # workspace_root always exists, even when empty
             result = backend.ls(VirtualPath("/workspace"))
+        assert result.error is None
+        assert result.entries == []
+
+    def test_ls_nonexistent_subdir(self):
+        backend = StateBackend()
+        with _simulate_graph(backend):
+            # Non-root directories without files should return "not found"
+            result = backend.ls(VirtualPath("/workspace/dir"))
         assert result.error is not None
         assert "not found" in result.error
 

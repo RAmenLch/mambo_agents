@@ -1027,3 +1027,119 @@ class HybridWorkspaceBackend(ThreadAwareWorkspace):
                         results.append(results_per_target[target_idx][file_idx])
                         break
         return results
+
+    # ------------------------------------------------------------------
+    # Async bulk — route per-group to each target backend's async method
+    # so that backends with _async_lock (e.g. SshBackend) serialize
+    # SFTP access and avoid paramiko deadlocks.
+    # ------------------------------------------------------------------
+
+    async def aupload_files(
+        self,
+        files: list[tuple[VirtualPath, bytes]],
+        *,
+        thread_id: str | None = None,
+    ) -> list[UploadFileResult]:
+        """Async: upload files, routing each to the correct backend."""
+        # Group files by target backend (same logic as sync upload_files)
+        groups: dict[int, list[tuple[VirtualPath, bytes]]] = {}
+        targets: list[BackendProtocol] = []
+        index_map: list[tuple[int, int, int]] = []
+        routing_errors: dict[int, str] = {}
+
+        for orig_idx, (orig_path, data) in enumerate(files):
+            try:
+                target, stripped = self._route(orig_path)
+            except (ValueError, TypeError) as e:
+                routing_errors[orig_idx] = (
+                    f"路径 '{orig_path}' 无效：{e}。仅可访问：{self._valid_paths_description()}"
+                )
+                continue
+            idx = None
+            for i, t in enumerate(targets):
+                if t is target:
+                    idx = i
+                    break
+            if idx is None:
+                idx = len(targets)
+                targets.append(target)
+                groups[idx] = []
+            groups[idx].append((stripped, data))
+            index_map.append((orig_idx, idx, len(groups[idx]) - 1))
+
+        # Execute uploads per target via each backend's async method
+        results_per_target: dict[int, list[UploadFileResult]] = {}
+        for idx, group_files in groups.items():
+            be = targets[idx]
+            results_per_target[idx] = list(
+                await be.aupload_files(group_files)
+            )
+
+        # Reassemble in original order
+        results: list[UploadFileResult] = []
+        for orig_idx in range(len(files)):
+            if orig_idx in routing_errors:
+                path = files[orig_idx][0]
+                path_str = path.value if isinstance(path, VirtualPath) else str(path)
+                results.append(UploadFileResult(path=path_str, error=routing_errors[orig_idx]))
+            else:
+                for oi, target_idx, file_idx in index_map:
+                    if oi == orig_idx:
+                        results.append(results_per_target[target_idx][file_idx])
+                        break
+        return results
+
+    async def adownload_files(
+        self,
+        paths: list[VirtualPath],
+        *,
+        thread_id: str | None = None,
+    ) -> list[DownloadFileResult]:
+        """Async: download files, routing each to the correct backend."""
+        # Group paths by target backend (same logic as sync download_files)
+        groups: dict[int, list[VirtualPath]] = {}
+        targets: list[BackendProtocol] = []
+        index_map: list[tuple[int, int, int]] = []
+        routing_errors: dict[int, str] = {}
+
+        for orig_idx, orig_path in enumerate(paths):
+            try:
+                target, stripped = self._route(orig_path)
+            except (ValueError, TypeError) as e:
+                routing_errors[orig_idx] = (
+                    f"路径 '{orig_path}' 无效：{e}。仅可访问：{self._valid_paths_description()}"
+                )
+                continue
+            idx = None
+            for i, t in enumerate(targets):
+                if t is target:
+                    idx = i
+                    break
+            if idx is None:
+                idx = len(targets)
+                targets.append(target)
+                groups[idx] = []
+            groups[idx].append(stripped)
+            index_map.append((orig_idx, idx, len(groups[idx]) - 1))
+
+        # Execute downloads per target via each backend's async method
+        results_per_target: dict[int, list[DownloadFileResult]] = {}
+        for idx, group_paths in groups.items():
+            be = targets[idx]
+            results_per_target[idx] = list(
+                await be.adownload_files(group_paths)
+            )
+
+        # Reassemble in original order
+        results: list[DownloadFileResult] = []
+        for orig_idx in range(len(paths)):
+            if orig_idx in routing_errors:
+                path = paths[orig_idx]
+                path_str = path.value if isinstance(path, VirtualPath) else str(path)
+                results.append(DownloadFileResult(path=path_str, error=routing_errors[orig_idx]))
+            else:
+                for oi, target_idx, file_idx in index_map:
+                    if oi == orig_idx:
+                        results.append(results_per_target[target_idx][file_idx])
+                        break
+        return results
