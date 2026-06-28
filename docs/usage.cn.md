@@ -967,7 +967,56 @@ SecurityReviewConfig(
 )
 ```
 
-### 9.4 摘要配置
+### 9.4 HITL 中断 / 恢复协议
+
+当 ``AutoSecurityReviewMiddleware`` 将工具调用上报人工审批时，会通过
+LangGraph 的 ``interrupt()`` 发出如下结构的报文：
+
+```json
+{
+    "source": "mambo_security_review",
+    "action_requests": [
+        {
+            "name": "write",
+            "args": {"file_path": "/etc/hosts", "content": "..."},
+            "tool_call_id": "call_abc123",
+            "description": null
+        }
+    ],
+    "review_configs": [
+        {
+            "action_name": "write",
+            "tool_call_id": "call_abc123",
+            "allowed_decisions": ["approve", "edit", "reject", "respond"]
+        }
+    ]
+}
+```
+
+你的人工审批基础设施在通过 ``Command(resume=...)`` 恢复图执行时，**必须**在
+恢复报文中回传 ``"source"`` 字段：
+
+```json
+{
+    "source": "mambo_security_review",
+    "decisions": [
+        {"tool_call_id": "call_abc123", "decision": "approve"}
+    ]
+}
+```
+
+``source`` 字段有两个用途：
+
+1. **消费者路由：** UI 层可以据此将"安全审查中断"与其他类型的中断（如工具内部自
+   定义的 ``interrupt()`` 调用）区分开。
+2. **重放检测：** 恢复时中间件会以非消费方式读取恢复值，判断是否进入重放
+   分支。只有携带 ``"source": "mambo_security_review"`` 的值才会被识别为
+   本中间件的中断回复。
+
+> **重要：** 省略 ``"source"`` 会导致中间件将恢复视为"非我方"并透明放行。
+> 人类决策不会被应用，工具调用将以原始参数执行。
+
+### 9.5 摘要配置
 
 ```python
 SummarizationConfig = {

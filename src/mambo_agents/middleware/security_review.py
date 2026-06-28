@@ -83,6 +83,19 @@ from mambo_agents.middleware.review_agent import (
 )
 
 # ---------------------------------------------------------------------------
+# Interrupt protocol — source identifier
+# ---------------------------------------------------------------------------
+
+INTERRUPT_SOURCE = "mambo_security_review"
+"""Identifies interrupts originating from :class:`AutoSecurityReviewMiddleware`.
+
+Present in both the outgoing HITLRequest and the expected resume value so
+that consumers can route the request and the middleware can recognize its
+own replay without consuming resume values meant for other components.
+"""
+
+
+# ---------------------------------------------------------------------------
 # Pydantic models
 # ---------------------------------------------------------------------------
 
@@ -316,10 +329,21 @@ class HITLRequest(BaseModel):
     Each ``ActionRequest`` and ``ReviewConfig`` carries a ``tool_call_id``
     so the consumer can unambiguously associate decisions with specific
     tool calls.
+
+    The ``source`` field identifies the interrupt originator so consumers
+    can route the request correctly, and the middleware can recognize its
+    own resume values during replay.  Consumers **must** include
+    ``"source": "mambo_security_review"`` in their resume response.
     """
 
     model_config = ConfigDict(frozen=True)
 
+    source: str = Field(
+        default="mambo_security_review",
+        description="Identifies this interrupt as originating from "
+        "AutoSecurityReviewMiddleware.  Must be echoed back in the "
+        "resume value so the middleware can recognize its own replay.",
+    )
     action_requests: list[ActionRequest] = Field(
         description="A list of agent actions for human review.",
     )
@@ -972,7 +996,16 @@ class AutoSecurityReviewMiddleware(
 
     @staticmethod
     def _detect_replay() -> bool:
-        """Return True if the node is being re-executed after an interrupt."""
+        """Return True if this middleware's own interrupt is being replayed.
+
+        Uses **non-consuming** read of the global resume value via
+        ``get_null_resume(consume=False)`` so that interrupts issued by
+        other tools (e.g. a custom ``ask_user`` tool calling
+        ``interrupt()`` inside its body) are **not** consumed or disturbed.
+
+        Only resume values carrying ``"source": "mambo_security_review"``
+        are recognized as belonging to this middleware.
+        """
         try:
             conf = get_config()["configurable"]
         except RuntimeError:
@@ -980,7 +1013,10 @@ class AutoSecurityReviewMiddleware(
         scratchpad = conf.get(CONFIG_KEY_SCRATCHPAD)
         if scratchpad is None:
             return False
-        return scratchpad.get_null_resume(False) is not None
+        resume_value = scratchpad.get_null_resume(False)
+        if not isinstance(resume_value, dict):
+            return False
+        return resume_value.get("source") == INTERRUPT_SOURCE
 
     def _rebuild_tool_calls(
         self,

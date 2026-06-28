@@ -650,7 +650,9 @@ class TestAfterModelNoOp:
         state = {"messages": [ai_msg]}
 
         scratchpad = MagicMock()
-        scratchpad.resume = ["fake"]
+        scratchpad.get_null_resume.return_value = {
+            "source": "mambo_security_review"
+        }
         with patch(
             "mambo_agents.middleware.security_review.CONFIG_KEY_SCRATCHPAD",
             "_test_scratchpad",

@@ -912,7 +912,57 @@ SecurityReviewConfig(
 )
 ```
 
-### 9.4 Summarization Config
+### 9.4 HITL Interrupt / Resume Protocol
+
+When ``AutoSecurityReviewMiddleware`` escalates tool calls for human review, it
+issues a LangGraph ``interrupt()`` with the following payload structure:
+
+```json
+{
+    "source": "mambo_security_review",
+    "action_requests": [
+        {
+            "name": "write",
+            "args": {"file_path": "/etc/hosts", "content": "..."},
+            "tool_call_id": "call_abc123",
+            "description": null
+        }
+    ],
+    "review_configs": [
+        {
+            "action_name": "write",
+            "tool_call_id": "call_abc123",
+            "allowed_decisions": ["approve", "edit", "reject", "respond"]
+        }
+    ]
+}
+```
+
+Your HITL infrastructure **must** include the ``"source"`` field in the resume
+value when resuming the graph via ``Command(resume=...)``:
+
+```json
+{
+    "source": "mambo_security_review",
+    "decisions": [
+        {"tool_call_id": "call_abc123", "decision": "approve"}
+    ]
+}
+```
+
+The ``source`` field serves two purposes:
+
+1. **Consumer routing:** your UI can distinguish security review interrupts from
+   other interrupt types (e.g. custom ``interrupt()`` calls inside tools).
+2. **Replay detection:** on resume, the middleware inspects the resume value
+   (non-consumingly) to decide whether it should enter the replay branch.
+   Only values carrying ``"source": "mambo_security_review"`` are recognized.
+
+> **Important:** omitting ``"source"`` causes the middleware to treat the resume
+> as "not ours" and transparently pass through.  Human decisions will not be
+> applied and tool calls will execute with their original arguments.
+
+### 9.5 Summarization Config
 
 ```python
 SummarizationConfig = {
