@@ -20,8 +20,6 @@ from langgraph.runtime import Runtime
 from langgraph.types import Overwrite
 from langgraph.typing import ContextT
 
-from mambo_agents.diagnostics import get_tracker, is_enabled
-
 # LangGraph internal key used in the dict-form of Overwrite:
 #   {'__overwrite__': <value>}
 _OVERWRITE_KEY = "__overwrite__"
@@ -57,14 +55,6 @@ class PatchToolCallsMiddleware(AgentMiddleware[AgentState, ContextT, ResponseT])
         """Detect and patch dangling tool calls before each agent turn."""
         raw_messages = state.get("messages")
         messages = _unwrap_overwrite(raw_messages)
-
-        # ---- 诊断：检查 state["messages"] 是否已经是 Overwrite（异常信号） ----
-        if is_enabled() and isinstance(raw_messages, Overwrite):
-            get_tracker().log_state_messages_type_mismatch(
-                source="patch_tool_calls.before_agent",
-                runtime=runtime,
-                value=raw_messages,
-            )
 
         if not messages:
             return None
@@ -105,15 +95,5 @@ class PatchToolCallsMiddleware(AgentMiddleware[AgentState, ContextT, ResponseT])
                                 tool_call_id=tool_call["id"],
                             )
                         )
-
-        # ---- 诊断：记录 Overwrite 被产生 ----
-        if is_enabled():
-            get_tracker().log_overwrite_produced(
-                source="patch_tool_calls.before_agent",
-                runtime=runtime,
-                original_count=len(messages),
-                patched_count=len(patched),
-                dangling_count=len(patched) - len(messages),
-            )
 
         return {"messages": Overwrite(patched)}

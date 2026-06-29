@@ -3,7 +3,7 @@
 import pytest
 
 from mambo_agents.backends.protocol import EditResult
-from mambo_agents.backends.schemas import human_size
+from mambo_agents.backends.schemas import human_size, VirtualPath
 from mambo_agents.backends.utils import (
     TreeEntry,
     check_path_allowed,
@@ -173,29 +173,29 @@ class TestCheckPathAllowed:
         assert check_path_allowed("/any/path.py") is True
 
     def test_whitelist_exact_match(self):
-        assert check_path_allowed("/src/main.py", whitelist=frozenset({"/src/main.py"})) is True
+        assert check_path_allowed("/src/main.py", whitelist=frozenset({VirtualPath("/src/main.py")})) is True
 
     def test_whitelist_prefix_match(self):
-        assert check_path_allowed("/src/sub/file.py", whitelist=frozenset({"/src"})) is True
+        assert check_path_allowed("/src/sub/file.py", whitelist=frozenset({VirtualPath("/src")})) is True
 
     def test_whitelist_block(self):
-        assert check_path_allowed("/build/output.o", whitelist=frozenset({"/src"})) is False
+        assert check_path_allowed("/build/output.o", whitelist=frozenset({VirtualPath("/src")})) is False
 
     def test_whitelist_root_match(self):
-        assert check_path_allowed("/src", whitelist=frozenset({"/src"})) is True
+        assert check_path_allowed("/src", whitelist=frozenset({VirtualPath("/src")})) is True
 
     def test_blacklist_exact_match(self):
-        assert check_path_allowed("/build/output.o", blacklist=frozenset({"/build/output.o"})) is False
+        assert check_path_allowed("/build/output.o", blacklist=frozenset({VirtualPath("/build/output.o")})) is False
 
     def test_blacklist_prefix_match(self):
-        assert check_path_allowed("/build/output.o", blacklist=frozenset({"/build"})) is False
+        assert check_path_allowed("/build/output.o", blacklist=frozenset({VirtualPath("/build")})) is False
 
     def test_blacklist_allow(self):
-        assert check_path_allowed("/src/main.py", blacklist=frozenset({"/build"})) is True
+        assert check_path_allowed("/src/main.py", blacklist=frozenset({VirtualPath("/build")})) is True
 
     def test_blacklist_partial_name_no_match(self):
         """Partial name match should NOT trigger (prefix-based)."""
-        assert check_path_allowed("/build_scripts/run.sh", blacklist=frozenset({"/build"})) is True
+        assert check_path_allowed("/build_scripts/run.sh", blacklist=frozenset({VirtualPath("/build")})) is True
 
 
 # ============================================================================

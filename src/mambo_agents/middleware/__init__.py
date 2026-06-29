@@ -46,6 +46,14 @@ from mambo_agents.middleware.summarization import (
     SummaryHook,
     SummaryHookContext,
 )
+from mambo_agents.middleware.version_control import (
+    Snapshot,
+    VersionControlConfig,
+    VersionControlMiddleware,
+    VersionIndex,
+    VersionRollbackConfig,
+    VersionStore,
+)
 
 __all__ = [
     "AsyncSubAgentMiddleware",
@@ -70,11 +78,17 @@ __all__ = [
     "SkillMetadata",
     "SkillSource",
     "SkillsMiddleware",
+    "Snapshot",
     "SubAgent",
     "SubAgentMiddleware",
     "SummarizationConfig",
     "SummaryHook",
     "SummaryHookContext",
+    "VersionControlConfig",
+    "VersionControlMiddleware",
+    "VersionIndex",
+    "VersionRollbackConfig",
+    "VersionStore",
     "WritePlansInput",
     "create_review_agent",
     "run_review_sync",

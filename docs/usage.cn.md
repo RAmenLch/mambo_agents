@@ -382,6 +382,9 @@ backend = LocalBackend(summarizer=python_summarizer())
 3. [MamboMemoryMiddleware]    ← 记忆加载（memory_sources 非 None 时）
 4. [MamboSummarizationMiddleware]  ← 对话摘要（summarization 非 None 时）
 5. [用户自定义 middleware]      ← 通过 middleware 参数传入
+   ├─ VersionControlMiddleware  ← 文件版本控制
+   ├─ MamboPlanMiddleware       ← 任务规划
+   └─ ...
 6. [SubAgentMiddleware]        ← 同步子代理
 7. [AsyncSubAgentMiddleware]   ← 异步子代理
 8. [AutoSecurityReviewMiddleware | HumanInTheLoopMiddleware]  ← 安全审查
@@ -616,7 +619,137 @@ agent = create_mambo_agent(
                         → 高风险：暂停 → 人工审批
 ```
 
-### 6.8 PatchToolCallsMiddleware & ReorderToolMessagesMiddleware
+### 6.8 VersionControlMiddleware
+
+**功能：** 以 checkpoint 为粒度自动快照文件变更，支持选择性回滚。不向 LLM 暴露任何工具，版本数据仅供调用方（如 Web 应用）查询使用。
+
+**设计原则：**
+- 存储与后端解耦 — 纯本地文件 I/O，写入 `./.mambo_versions/`
+- 即时持久化 — 每次 `wrap_tool_call` 备份同时写入 blob 和 index.json
+- 增量快照 — 只备份 LLM 实际变更的文件
+- 内容寻址 — SHA256 存储，相同内容只存一份
+
+**配置方式：**
+
+```python
+from mambo_agents.middleware.version_control import (
+    VersionStore,
+    VersionControlMiddleware,
+)
+
+store = VersionStore(storage_dir="./.mambo_versions")
+
+agent = create_mambo_agent(
+    "gpt-4o",
+    backend=LocalBackend(),
+    middleware=[
+        VersionControlMiddleware(
+            store=store,
+            backend=...,
+            whitelist_folders=["/workspace/src", "/workspace/tests"],
+            mutating_tool_names=["write", "edit", "delete", "patch"],
+        ),
+    ],
+)
+```
+
+**参数说明：**
+
+| 参数 | 类型 | 默认值 | 说明 |
+|------|------|--------|------|
+| `store` | `VersionStore` | (必填) | 版本数据存储引擎 |
+| `backend` | `BackendProtocol` | (必填) | 文件系统后端（用于读写文件内容） |
+| `whitelist_folders` | `list[str]` | `[]` | **白名单模式** — 仅对此列表内的文件夹进行备份和回滚。空列表 = 不处理任何文件 |
+| `mutating_tool_names` | `list[str]` | `["write", "edit", "delete"]` | 声明哪些工具是"写入/变更"工具，调用前自动触发备份 |
+
+**白名单模式：**
+
+`whitelist_folders` 为虚拟文件系统的绝对路径（如 `/workspace/src`）。只有位于白名单文件夹内的文件才会被备份和允许回滚。默认空列表表示严格白名单模式 — 没有文件会被处理。
+
+```python
+# 只对 src/ 和 tests/ 目录做版本控制
+VersionControlMiddleware(
+    store=store,
+    backend=backend,
+    whitelist_folders=["/workspace/src", "/workspace/tests"],
+)
+
+# 空白名单 = 不处理任何文件
+VersionControlMiddleware(store=store, backend=backend)
+```
+
+**自定义变更工具：**
+
+不同后端可能有不同的变更工具名（如 `patch`、`rename`），通过 `mutating_tool_names` 声明：
+
+```python
+VersionControlMiddleware(
+    store=store,
+    backend=backend,
+    whitelist_folders=["/workspace"],
+    mutating_tool_names=["write", "edit", "delete", "patch", "rename"],
+)
+```
+
+**时间旅行回滚：**
+
+通过 config 中的 `version_rollback` 指定要回滚的文件：
+
+```python
+config = {
+    "configurable": {
+        "thread_id": "session-1",
+        "checkpoint_id": "cp_target",       # 回滚目标 checkpoint
+        "version_rollback": {
+            "files": ["/workspace/src/main.py"],  # 指定文件列表
+            # 或 "all": True 将所有变更文件恢复到该 checkpoint
+        },
+    }
+}
+agent.astream({"messages": [...]}, config)
+```
+
+注意：回滚同样受白名单限制 — 不在白名单内的文件不会被恢复。
+
+**调用方查询 API（`VersionStore`）：**
+
+Web 应用等调用方可通过 `VersionStore` 查询版本历史：
+
+```python
+store = VersionStore(storage_dir="./.mambo_versions")
+
+# 整个对话会话中改过哪些文件（去重）
+all_files = store.get_all_changed_files("thread-123")
+# → frozenset({"/workspace/src/main.py", "/workspace/tests/test.py"})
+
+# 最新一轮改了什么
+latest_files = store.get_latest_changed_files("thread-123")
+# → ["/workspace/src/main.py"]
+
+# 获取最新一轮的完整快照（含 checkpoint_id、时间戳、文件→SHA 映射）
+snapshot = store.get_latest_snapshot("thread-123")
+print(snapshot.checkpoint_id, snapshot.timestamp, snapshot.file_blobs)
+
+# 按 checkpoint 查询
+store.list_snapshots("thread-123")             # 所有快照（时间序）
+store.get_changed_files("thread-123", "cp_x")  # 某 checkpoint 改了哪些文件
+store.get_file("thread-123", "cp_x", "/path")  # 某文件在某 checkpoint 的内容
+```
+
+**配置模型（`VersionControlConfig`）：**
+
+```python
+from mambo_agents.middleware.version_control import VersionControlConfig
+
+VersionControlConfig(
+    store_dir="./.mambo_versions",              # 版本存储目录
+    auto_snapshot=True,                          # 自动触发备份
+    whitelist_folders=["/workspace/src"],        # 白名单文件夹
+    mutating_tool_names=["write", "edit", "delete"],  # 变更工具名
+)
+```
+
+### 6.9 PatchToolCallsMiddleware & ReorderToolMessagesMiddleware
 
 这两个中间件始终启用（无需配置）：
 
@@ -856,22 +989,6 @@ agent = create_mambo_agent(
 )
 ```
 
-### 8.7 使用 CLI 交互式测试
-
-```bash
-# 基本使用（内存后端）
-python -m mambo_agents.cli.chat
-
-# 指定模型和工作目录
-python -m mambo_agents.cli.chat --model gpt-4o --workspace /tmp/test
-
-# 带通用子代理
-python -m mambo_agents.cli.chat --general-purpose
-
-# 带自定义子代理
-python -m mambo_agents.cli.chat --subagent researcher:研究专家:你是一个研究专家...
-```
-
 ---
 
 ## 9. API 参考
@@ -919,6 +1036,12 @@ from mambo_agents import (
     # 记忆
     MamboMemoryMiddleware,
     MemoryFormatHook,
+
+    # 版本控制
+    VersionControlMiddleware,
+    VersionStore,
+    VersionControlConfig,
+    VersionRollbackConfig,
 )
 ```
 

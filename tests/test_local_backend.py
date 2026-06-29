@@ -257,15 +257,15 @@ class TestLocalBackend:
         with pytest.raises(ValueError, match="mutually exclusive"):
             LocalBackend(
                 root_dir=str(tmp_root),
-                edit_whitelist=frozenset({f"{_W}/src"}),
-                edit_blacklist=frozenset({f"{_W}/build"}),
+                edit_whitelist=frozenset({VirtualPath(f"{_W}/src")}),
+                edit_blacklist=frozenset({VirtualPath(f"{_W}/build")}),
             )
 
     def test_edit_whitelist_blocks_write(self, tmp_root):
         """write to a non-whitelisted path is rejected."""
         backend = LocalBackend(
             root_dir=str(tmp_root),
-            edit_whitelist=frozenset({f"{_W}/src"}),
+            edit_whitelist=frozenset({VirtualPath(f"{_W}/src")}),
         )
         r = backend.write(VirtualPath(f"{_W}/outside.txt"), "hello")
         assert r.error is not None
@@ -275,7 +275,7 @@ class TestLocalBackend:
         """write to a whitelisted path is allowed."""
         backend = LocalBackend(
             root_dir=str(tmp_root),
-            edit_whitelist=frozenset({f"{_W}/src"}),
+            edit_whitelist=frozenset({VirtualPath(f"{_W}/src")}),
         )
         r = backend.write(VirtualPath(f"{_W}/src/hello.txt"), "hello")
         assert r.error is None
@@ -285,7 +285,7 @@ class TestLocalBackend:
         """edit on a blacklisted path is rejected."""
         backend = LocalBackend(
             root_dir=str(tmp_root),
-            edit_blacklist=frozenset({f"{_W}/build"}),
+            edit_blacklist=frozenset({VirtualPath(f"{_W}/build")}),
         )
         r = backend.edit(VirtualPath(f"{_W}/build/output.o"), "a", "b")
         assert r.error is not None
@@ -295,7 +295,7 @@ class TestLocalBackend:
         """edit on a non-blacklisted path works normally."""
         backend = LocalBackend(
             root_dir=str(tmp_root),
-            edit_blacklist=frozenset({f"{_W}/build"}),
+            edit_blacklist=frozenset({VirtualPath(f"{_W}/build")}),
         )
         backend.write(VirtualPath(f"{_W}/src/code.py"), "x = 1")
         r = backend.edit(VirtualPath(f"{_W}/src/code.py"), "x = 1", "x = 2")
@@ -306,7 +306,7 @@ class TestLocalBackend:
         """delete on a non-whitelisted path is rejected."""
         backend = LocalBackend(
             root_dir=str(tmp_root),
-            edit_whitelist=frozenset({f"{_W}/src"}),
+            edit_whitelist=frozenset({VirtualPath(f"{_W}/src")}),
         )
         r = backend.delete(VirtualPath(f"{_W}/outside/secret.txt"))
         assert "not allowed" in r
@@ -315,7 +315,7 @@ class TestLocalBackend:
         """delete on a blacklisted path is rejected."""
         backend = LocalBackend(
             root_dir=str(tmp_root),
-            edit_blacklist=frozenset({f"{_W}/important"}),
+            edit_blacklist=frozenset({VirtualPath(f"{_W}/important")}),
         )
         (tmp_root / "important").mkdir()
         r = backend.delete(VirtualPath(f"{_W}/important"))

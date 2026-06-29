@@ -10,7 +10,7 @@ from typing import Literal
 
 from pydantic import BaseModel, ValidationError
 
-from mambo_agents.backends.schemas import EditResult
+from mambo_agents.backends.schemas import EditResult, VirtualPath
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -159,8 +159,8 @@ def format_tree_entries(
 def check_path_allowed(
     path: str,
     *,
-    whitelist: frozenset[str] | None = None,
-    blacklist: frozenset[str] | None = None,
+    whitelist: frozenset[VirtualPath] | None = None,
+    blacklist: frozenset[VirtualPath] | None = None,
 ) -> bool:
     """Check whether *path* (virtual) is allowed for edit/write/delete.
 
@@ -169,22 +169,25 @@ def check_path_allowed(
     (or equal) any entry.  The two are mutually exclusive and the caller
     must enforce that.
 
+    Prefixes are normalised (trailing slash stripped) so both
+    ``VirtualPath("/src")`` and ``VirtualPath("/src/")`` work identically.
+
     Args:
         path: Virtual absolute path to check (e.g. ``"/src/foo.py"``).
-        whitelist: Allowed path prefixes (e.g. ``{"/src"}``).
-        blacklist: Forbidden path prefixes (e.g. ``{"/build"}``).
+        whitelist: Allowed path prefixes (e.g. ``{VirtualPath("/src")}``).
+        blacklist: Forbidden path prefixes (e.g. ``{VirtualPath("/build")}``).
 
     Returns:
         ``True`` if the path is permitted.
     """
     if whitelist is not None:
         return any(
-            path == prefix or path.startswith(prefix + "/")
+            path == prefix.normalized or path.startswith(prefix.normalized + "/")
             for prefix in whitelist
         )
     if blacklist is not None:
         return not any(
-            path == prefix or path.startswith(prefix + "/")
+            path == prefix.normalized or path.startswith(prefix.normalized + "/")
             for prefix in blacklist
         )
     return True

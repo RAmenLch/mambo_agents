@@ -123,8 +123,8 @@ class SshBackend(BackendProtocol):
         execute_timeout: int = _DEFAULT_EXECUTE_TIMEOUT,
         max_output_bytes: int = _MAX_OUTPUT_BYTES,
         enable_execute: bool = False,
-        edit_whitelist: frozenset[str] | None = None,
-        edit_blacklist: frozenset[str] | None = None,
+        edit_whitelist: frozenset[VirtualPath] | None = None,
+        edit_blacklist: frozenset[VirtualPath] | None = None,
         ignore_dirs: frozenset[str] | None = None,
         max_read_chars: int = 100_000,
         max_grep_matches: int = 1000,
@@ -1136,9 +1136,11 @@ class SshBackend(BackendProtocol):
 
     def _check_edit_allowed(self, path: VirtualPath) -> bool:
         """Check whether *path* is allowed for edit/write/delete."""
-        whitelist = self._edit_whitelist or None
-        blacklist = self._edit_blacklist or None
-        return check_path_allowed(path.value, whitelist=whitelist, blacklist=blacklist)
+        return check_path_allowed(
+            path.value,
+            whitelist=self._edit_whitelist or None,
+            blacklist=self._edit_blacklist or None,
+        )
 
     # ------------------------------------------------------------------
     # Core: glob

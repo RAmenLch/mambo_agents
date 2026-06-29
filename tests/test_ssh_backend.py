@@ -287,7 +287,7 @@ class TestWrite:
 
     def test_write_blocked_by_whitelist(self, ssh_backend):
         """Write outside edit_whitelist should be rejected."""
-        ssh_backend._edit_whitelist = frozenset([f"{_W}/allowed"])
+        ssh_backend._edit_whitelist = frozenset([VirtualPath(f"{_W}/allowed")])
         ssh_backend._sftp.stat.side_effect = FileNotFoundError()
 
         result = ssh_backend.write(VirtualPath(f"{_W}/forbidden/file.txt"), "data")

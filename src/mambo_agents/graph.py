@@ -60,6 +60,11 @@ from mambo_agents.middleware.summarization import (
     SummaryHook,
 )
 from mambo_agents.middleware.planning import MamboPlanMiddleware
+from mambo_agents.middleware.version_control import (
+    VersionControlConfig,
+    VersionControlMiddleware,
+    VersionStore,
+)
 
 
 DEFAULT_SYSTEM_PROMPT = """You are a helpful AI assistant that can work with files.
@@ -93,6 +98,7 @@ def create_mambo_agent(
     tools: Sequence[BaseTool] | None = None,
     interrupt_on: dict[str, bool | InterruptOnConfig] | None = None,
     security_review: SecurityReviewConfig | None = None,
+    version_control: VersionControlConfig | VersionStore | str | bool | None = None,
     checkpointer: BaseCheckpointSaver | None = None,
     store: BaseStore | None = None,
     name: str | None = None,
@@ -321,6 +327,26 @@ def create_mambo_agent(
             MamboMemoryMiddleware(
                 backend=backend,
                 sources=memory_sources,
+            )
+        )
+
+    # ---- Version Control (opt-in) ------------------------------------------
+    if version_control is not None and version_control is not False:
+        vc_store: VersionStore
+        if isinstance(version_control, VersionStore):
+            vc_store = version_control
+        elif isinstance(version_control, VersionControlConfig):
+            vc_store = VersionStore(storage_dir=version_control.store_dir)
+        elif isinstance(version_control, str):
+            vc_store = VersionStore(storage_dir=version_control)
+        else:
+            # bool True or anything else
+            vc_store = VersionStore()
+
+        mw.append(
+            VersionControlMiddleware(
+                store=vc_store,
+                backend=backend,
             )
         )
 

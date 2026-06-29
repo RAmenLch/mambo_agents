@@ -122,8 +122,8 @@ class LocalBackend(BackendProtocol):
         inherit_env: bool = False,
         enable_execute: bool = False,
         max_file_size_mb: int = _DEFAULT_MAX_FILE_SIZE_MB,
-        edit_whitelist: frozenset[str] | None = None,
-        edit_blacklist: frozenset[str] | None = None,
+        edit_whitelist: frozenset[VirtualPath] | None = None,
+        edit_blacklist: frozenset[VirtualPath] | None = None,
         ignore_dirs: frozenset[str] | None = None,
         max_read_chars: int = 100_000,
         max_grep_matches: int = 1000,
@@ -308,9 +308,11 @@ class LocalBackend(BackendProtocol):
         Delegates to :func:`~mambo_agents.backends.utils.check_path_allowed`
         with this backend's whitelist / blacklist.
         """
-        whitelist = self._edit_whitelist or None
-        blacklist = self._edit_blacklist or None
-        return check_path_allowed(path.value, whitelist=whitelist, blacklist=blacklist)
+        return check_path_allowed(
+            path.value,
+            whitelist=self._edit_whitelist or None,
+            blacklist=self._edit_blacklist or None,
+        )
 
     def ls(self, path: VirtualPath) -> LsResult:
         try:

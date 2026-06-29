@@ -386,6 +386,9 @@ unmatched suffixes fall back to the default behaviour (prompting to re-read with
 3. [MamboMemoryMiddleware]          ← memory loading (when memory_sources is not None)
 4. [MamboSummarizationMiddleware]   ← conversation summarization (when summarization is not None)
 5. [user-defined middleware]        ← passed via middleware parameter
+   ├─ VersionControlMiddleware  ← file versioning
+   ├─ MamboPlanMiddleware       ← task planning
+   └─ ...
 6. [SubAgentMiddleware]             ← synchronous sub-agents
 7. [AsyncSubAgentMiddleware]        ← async sub-agents
 8. [AutoSecurityReviewMiddleware | HumanInTheLoopMiddleware]  ← security review
@@ -561,7 +564,137 @@ Tool Call → AI Security Review → Safe: pass through
                                → High Risk: pause → Human Approval
 ```
 
-### 6.7 PatchToolCallsMiddleware & ReorderToolMessagesMiddleware
+### 6.8 VersionControlMiddleware
+
+**Purpose:** Automatically snapshots file changes at checkpoint granularity, with selective rollback support. No tools are exposed to the LLM — version data is purely for caller-side consumption (e.g. a web UI).
+
+**Design principles:**
+- Storage decoupled from agent backend — pure local-file I/O under `./.mambo_versions/`
+- Write-time persistence — each `wrap_tool_call` backup writes its blob and index.json atomically
+- Incremental — only files actually mutated by the LLM are backed up
+- Content-addressed — SHA256 blobs; identical content stored once
+
+**Configuration:**
+
+```python
+from mambo_agents.middleware.version_control import (
+    VersionStore,
+    VersionControlMiddleware,
+)
+
+store = VersionStore(storage_dir="./.mambo_versions")
+
+agent = create_mambo_agent(
+    "gpt-4o",
+    backend=LocalBackend(),
+    middleware=[
+        VersionControlMiddleware(
+            store=store,
+            backend=...,
+            whitelist_folders=["/workspace/src", "/workspace/tests"],
+            mutating_tool_names=["write", "edit", "delete", "patch"],
+        ),
+    ],
+)
+```
+
+**Parameters:**
+
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `store` | `VersionStore` | (required) | Version data storage engine |
+| `backend` | `BackendProtocol` | (required) | Filesystem backend (for reading/writing file content) |
+| `whitelist_folders` | `list[str]` | `[]` | **Whitelist mode** — only backup and rollback files within these folders. Empty list = no files processed |
+| `mutating_tool_names` | `list[str]` | `["write", "edit", "delete"]` | Declares which tools are "write/change" tools to trigger pre-mutation backups |
+
+**Whitelist mode:**
+
+`whitelist_folders` are absolute virtual paths (e.g. `/workspace/src`). Only files located under whitelisted folders are backed up and available for rollback. An empty list means strict whitelist mode — no files will be processed.
+
+```python
+# Only version-control src/ and tests/ directories
+VersionControlMiddleware(
+    store=store,
+    backend=backend,
+    whitelist_folders=["/workspace/src", "/workspace/tests"],
+)
+
+# Empty whitelist = no files processed
+VersionControlMiddleware(store=store, backend=backend)
+```
+
+**Custom mutating tools:**
+
+Different backends may expose different mutating tool names (e.g. `patch`, `rename`). Declare them via `mutating_tool_names`:
+
+```python
+VersionControlMiddleware(
+    store=store,
+    backend=backend,
+    whitelist_folders=["/workspace"],
+    mutating_tool_names=["write", "edit", "delete", "patch", "rename"],
+)
+```
+
+**Time-travel rollback:**
+
+Roll back specific files via `version_rollback` in config:
+
+```python
+config = {
+    "configurable": {
+        "thread_id": "session-1",
+        "checkpoint_id": "cp_target",       # target checkpoint
+        "version_rollback": {
+            "files": ["/workspace/src/main.py"],  # explicit file list
+            # or "all": True to restore all changed files at that checkpoint
+        },
+    }
+}
+agent.astream({"messages": [...]}, config)
+```
+
+Note: rollback respects whitelist — files outside the whitelist will not be restored.
+
+**Caller-side query API (`VersionStore`):**
+
+Web apps and other callers can query version history via `VersionStore`:
+
+```python
+store = VersionStore(storage_dir="./.mambo_versions")
+
+# All unique files changed across the entire session
+all_files = store.get_all_changed_files("thread-123")
+# → frozenset({"/workspace/src/main.py", "/workspace/tests/test.py"})
+
+# Files changed in the latest turn
+latest_files = store.get_latest_changed_files("thread-123")
+# → ["/workspace/src/main.py"]
+
+# Full snapshot for the latest turn (checkpoint_id, timestamp, file→SHA map)
+snapshot = store.get_latest_snapshot("thread-123")
+print(snapshot.checkpoint_id, snapshot.timestamp, snapshot.file_blobs)
+
+# Per-checkpoint queries
+store.list_snapshots("thread-123")             # all snapshots (chronological)
+store.get_changed_files("thread-123", "cp_x")  # files changed at a checkpoint
+store.get_file("thread-123", "cp_x", "/path")  # file content at a checkpoint
+```
+
+**Config model (`VersionControlConfig`):**
+
+```python
+from mambo_agents.middleware.version_control import VersionControlConfig
+
+VersionControlConfig(
+    store_dir="./.mambo_versions",               # version storage root
+    auto_snapshot=True,                           # auto-trigger backups
+    whitelist_folders=["/workspace/src"],         # whitelisted directories
+    mutating_tool_names=["write", "edit", "delete"],  # mutating tool names
+)
+```
+
+### 6.9 PatchToolCallsMiddleware & ReorderToolMessagesMiddleware
 
 These two are always enabled (no configuration needed):
 
@@ -801,22 +934,6 @@ agent = create_mambo_agent(
 )
 ```
 
-### 8.7 Interactive CLI Testing
-
-```bash
-# Basic usage (in-memory backend)
-python -m mambo_agents.cli.chat
-
-# Specify model and working directory
-python -m mambo_agents.cli.chat --model gpt-4o --workspace /tmp/test
-
-# With general-purpose sub-agent
-python -m mambo_agents.cli.chat --general-purpose
-
-# With custom sub-agent
-python -m mambo_agents.cli.chat --subagent researcher:Research specialist:You are a research specialist...
-```
-
 ---
 
 ## 9. API Reference
@@ -864,6 +981,12 @@ from mambo_agents import (
     # Memory
     MamboMemoryMiddleware,
     MemoryFormatHook,
+
+    # Version Control
+    VersionControlMiddleware,
+    VersionStore,
+    VersionControlConfig,
+    VersionRollbackConfig,
 )
 ```
 
