@@ -162,6 +162,59 @@ class TestFormatTreeEntries:
         assert "bigfile.txt" in result
         assert "normal/" in result
 
+    def test_files_nested_under_directories(self):
+        """Files at depth 2 must render under their parent dir at depth 1.
+
+        Regression test for a bug where file depth was miscalculated as
+        ``parent.count("/") + 1`` instead of using the full file path,
+        causing files to render at the same level as their parent directory.
+        """
+        entries = [
+            TreeEntry(name="workspace/", depth=0),
+            TreeEntry(name="0849fe09/", depth=1),
+            TreeEntry(name="Anima_00013_.png (1 MB)", depth=2),
+            TreeEntry(name="Anima_00014_.png (1 MB)", depth=2),
+        ]
+        result = format_tree_entries(entries)
+        lines = result.split("\n")
+
+        dir_line = next(i for i, l in enumerate(lines) if "0849fe09/" in l)
+        file_a_line = next(i for i, l in enumerate(lines) if "Anima_00013_" in l)
+        file_b_line = next(i for i, l in enumerate(lines) if "Anima_00014_" in l)
+
+        # Files must appear after their parent directory
+        assert file_a_line > dir_line
+        assert file_b_line > dir_line
+
+        # Root line has no tree connector (depth 0)
+        assert lines[0] == "workspace/"
+
+        # Depth-2 file connectors must be further right than depth-1 dir connector
+        def _cp(line: str) -> int:
+            """Position of the tree connector (├── or └──) in *line*."""
+            for c in ("├──", "└──"):
+                if c in line:
+                    return line.index(c)
+            return -1
+
+        dir_cp = _cp(lines[dir_line])
+        file_a_cp = _cp(lines[file_a_line])
+        file_b_cp = _cp(lines[file_b_line])
+
+        assert file_a_cp > dir_cp, (
+            f"Depth-2 file should indent more than depth-1 dir; "
+            f"connector pos {file_a_cp} <= {dir_cp}.\n{result}"
+        )
+        assert file_b_cp > dir_cp, (
+            f"Depth-2 file should indent more than depth-1 dir; "
+            f"connector pos {file_b_cp} <= {dir_cp}.\n{result}"
+        )
+        # Siblings share same depth → same connector position
+        assert file_a_cp == file_b_cp, (
+            f"Sibling files should share depth; "
+            f"connector pos {file_a_cp} != {file_b_cp}.\n{result}"
+        )
+
 
 # ============================================================================
 # check_path_allowed

@@ -1460,9 +1460,9 @@ class SshBackend(BackendProtocol):
         # Sort files by depth then name
         for parent, name, size in sorted(
             filtered_files,
-            key=lambda f: (f[0].count("/"), f[0], f[1]),
+            key=lambda f: ((f[0] + "/" + f[1]).count("/") if f[0] != "." else f[1].count("/"), f[0], f[1]),
         ):
-            d = parent.count("/") + 1 if parent != "." else 1
+            d = (parent + "/" + name).count("/") + 1 if parent != "." else 1
             if d > depth:
                 continue
             entries.append(TreeEntry(

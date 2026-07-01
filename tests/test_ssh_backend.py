@@ -450,3 +450,111 @@ class TestRemoteRootValidation:
         """remote_root="~" → expands to /home/test → validated → ok."""
         backend = _make_ssh_backend(remote_root="~")
         assert backend._remote_root == "/home/test"
+
+
+# ============================================================================
+# tree – depth calculation regression
+# ============================================================================
+
+
+def _connector_pos(line: str) -> int:
+    """Return the character position of the tree connector (├── or └──)."""
+    for c in ("├──", "└──"):
+        if c in line:
+            return line.index(c)
+    return -1
+
+
+class TestTreeDepthCalculation:
+    """Regression: files inside subdirectories must be nested at the correct depth.
+
+    The bug: file depth was calculated from ``parent.count("/") + 1``,
+    which gives depth 1 for files directly inside a subdirectory (e.g.
+    ``parent="0849fe09"`` → depth=0+1=1), placing files at the same
+    level as their parent directory instead of one level deeper.
+
+    The fix uses ``(parent + "/" + name).count("/") + 1`` to calculate
+    depth from the file's full relative path.
+
+    We verify nesting by checking that the tree connector (├── / └──)
+    on child lines appears further to the right than the connector on
+    the parent directory line.
+    """
+
+    def test_files_nested_under_subdirectories(self, ssh_backend):
+        """Files in a subdirectory appear indented, not at the same level as the dir."""
+        ssh_backend._has_python3 = False
+
+        # Simulate find output: one dir with two image files inside it
+        fake_out = (
+            "d 0849fe09\n"
+            "f 0849fe09/Anima_00013_.png 1048576\n"
+            "f 0849fe09/Anima_00014_.png 2048\n"
+        )
+        from unittest.mock import MagicMock
+        ssh_backend._exec = MagicMock(return_value=(fake_out, "", 0))
+
+        result = ssh_backend.tree(VirtualPath("/workspace"), depth=3)
+        lines = result.split("\n")
+
+        # Find line indices
+        dir_line = next(i for i, l in enumerate(lines) if "0849fe09/" in l)
+        file_a_line = next(i for i, l in enumerate(lines) if "Anima_00013_" in l)
+        file_b_line = next(i for i, l in enumerate(lines) if "Anima_00014_" in l)
+
+        # Files must appear after their parent directory
+        assert file_a_line > dir_line, f"file_a after its parent dir:\n{result}"
+        assert file_b_line > dir_line, f"file_b after its parent dir:\n{result}"
+
+        # Files must be deeper: their connector positions should be > dir's
+        dir_cp = _connector_pos(lines[dir_line])
+        file_a_cp = _connector_pos(lines[file_a_line])
+        file_b_cp = _connector_pos(lines[file_b_line])
+
+        assert file_a_cp > dir_cp, (
+            f"file_a should be nested deeper (connector pos {file_a_cp} <= dir {dir_cp}).\n{result}"
+        )
+        assert file_b_cp > dir_cp, (
+            f"file_b should be nested deeper (connector pos {file_b_cp} <= dir {dir_cp}).\n{result}"
+        )
+
+        # Sibling files share same depth → same connector position
+        assert file_a_cp == file_b_cp, (
+            f"Sibling files should share depth; "
+            f"connector pos {file_a_cp} != {file_b_cp}.\n{result}"
+        )
+
+    def test_files_at_root_level_appear_flat(self, ssh_backend):
+        """Files directly under workspace/ should appear at depth 1 (same as subdirs)."""
+        ssh_backend._has_python3 = False
+
+        fake_out = (
+            "f root_file.txt 100\n"
+            "d subdir\n"
+            "f subdir/nested.txt 200\n"
+        )
+        from unittest.mock import MagicMock
+        ssh_backend._exec = MagicMock(return_value=(fake_out, "", 0))
+
+        result = ssh_backend.tree(VirtualPath("/workspace"), depth=3)
+        lines = result.split("\n")
+
+        # Find each entry
+        root_file_line = next(i for i, l in enumerate(lines) if "root_file.txt" in l)
+        subdir_line = next(i for i, l in enumerate(lines) if "subdir/" in l)
+        nested_line = next(i for i, l in enumerate(lines) if "nested.txt" in l)
+
+        root_cp = _connector_pos(lines[root_file_line])
+        subdir_cp = _connector_pos(lines[subdir_line])
+        nested_cp = _connector_pos(lines[nested_line])
+
+        # root_file and subdir at same level (both depth 1) → same connector position
+        assert root_cp == subdir_cp, (
+            f"root_file.txt and subdir/ should share depth 1; "
+            f"connector pos {root_cp} vs {subdir_cp}.\n{result}"
+        )
+        # nested.txt one level deeper (depth 2) → connector further right
+        assert nested_cp > subdir_cp, (
+            f"nested.txt should be deeper than subdir/; "
+            f"connector pos {nested_cp} <= {subdir_cp}.\n{result}"
+        )
