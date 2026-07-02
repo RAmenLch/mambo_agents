@@ -249,7 +249,7 @@ _CORE_TOOLS = [
     {
         "name": "glob",
         "description": (
-            "Find files matching a glob pattern. "
+            "Find files and directories matching a glob pattern. "
             "Supports wildcards: *, ** (recursive), ?, [...]. "
         ),
         "method": "glob",

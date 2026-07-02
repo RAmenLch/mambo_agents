@@ -380,7 +380,7 @@ class TestStateBackendLs:
             backend.write(VirtualPath("/workspace/sub/file.txt"), "hello")
             result = backend.ls(VirtualPath("/workspace"))
         dirs = [fi for fi in result.entries if fi.is_dir]
-        assert any(d.path == "/workspace/sub/" for d in dirs)
+        assert any(d.path == "/workspace/sub" for d in dirs)
 
     def test_ls_empty(self):
         backend = StateBackend()

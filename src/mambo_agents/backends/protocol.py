@@ -588,7 +588,7 @@ class BackendProtocol(abc.ABC):
 
     @abc.abstractmethod
     def glob(self, pattern: str, path: VirtualPath) -> GlobResult:
-        """Find files matching a glob pattern under *path*."""
+        """Find files and directories matching a glob pattern under *path*."""
         ...
 
     # ------------------------------------------------------------------
@@ -646,7 +646,7 @@ class BackendProtocol(abc.ABC):
         return await asyncio.to_thread(self.grep, pattern, path, glob, regex, offset, limit)
 
     async def aglob(self, pattern: str, path: VirtualPath) -> GlobResult:
-        """Async: Find files matching a glob pattern under *path*."""
+        """Async: Find files and directories matching a glob pattern under *path*."""
         return await asyncio.to_thread(self.glob, pattern, path)
 
     # ------------------------------------------------------------------

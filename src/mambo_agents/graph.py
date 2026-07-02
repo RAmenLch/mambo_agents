@@ -76,7 +76,7 @@ Use them to help the user accomplish their tasks efficiently.
 - Always use absolute paths starting with '/'.
 - Read files before modifying them.
 - Use `grep` to find specific content across files.
-- Use `glob` to find files by name patterns.
+- Use `glob` to find files and directories by name patterns.
 - When writing new files, ensure the content is complete and correct.
 """
 

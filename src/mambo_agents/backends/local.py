@@ -341,7 +341,7 @@ class LocalBackend(BackendProtocol):
                     rel = str(child.relative_to(self._cwd)).replace("\\", "/")
                     if child.is_dir():
                         infos.append(FileInfo(
-                            path=f"{wr}/{rel}/",
+                            path=f"{wr}/{rel}",
                             is_dir=True,
                             size=0,
                             modified_at=modified_at,
@@ -784,8 +784,7 @@ class LocalBackend(BackendProtocol):
         try:
             for fp in resolved.rglob(pattern):
                 try:
-                    if not fp.is_file():
-                        continue
+                    is_dir = fp.is_dir()
                 except OSError:
                     continue
                 try:
@@ -797,8 +796,8 @@ class LocalBackend(BackendProtocol):
                     continue
                 matches.append(FileInfo(
                     path=virt_path,
-                    is_dir=False,
-                    size=st.st_size,
+                    is_dir=is_dir,
+                    size=st.st_size if not is_dir else 0,
                 ))
         except OSError as e:
             errors.append(f"Glob aborted: {e}")

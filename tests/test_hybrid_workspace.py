@@ -55,7 +55,7 @@ class _FakeBackend(BackendProtocol):
                 continue
             rel = fp[len(prefix):]
             if "/" in rel:
-                dirs.add(prefix + rel.split("/")[0] + "/")
+                dirs.add(prefix + rel.split("/")[0])
             else:
                 infos.append(FileInfo(path=fp, is_dir=False, size=len(content)))
         for d in sorted(dirs):
@@ -148,7 +148,7 @@ class _FakeThreadAwareBackend(ThreadAwareWorkspace):
                 continue
             rel = fp[len(prefix):]
             if "/" in rel:
-                dirs.add(prefix + rel.split("/")[0] + "/")
+                dirs.add(prefix + rel.split("/")[0])
             else:
                 infos.append(FileInfo(path=fp, is_dir=False, size=len(content)))
         for d in sorted(dirs):

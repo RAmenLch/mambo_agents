@@ -423,9 +423,12 @@ class GlobResult(BaseModel):
         if self.matches:
             for fi in self.matches:
                 desc_part = f"  -- {fi.desc.replace(chr(10), ' ')}" if fi.desc else ""
-                lines.append(f"{fi.path}({human_size(fi.size)}){desc_part}")
+                if fi.is_dir:
+                    lines.append(f"{fi.path}/{desc_part}")
+                else:
+                    lines.append(f"{fi.path}({human_size(fi.size)}){desc_part}")
         if not lines:
-            return "No files found."
+            return "No matches found."
         return "\n".join(lines)
 
 

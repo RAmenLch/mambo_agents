@@ -124,7 +124,7 @@ class TestLocalBackend:
         paths = [fi.path for fi in result.entries]
         assert f"{_W}/a.py" in paths
         assert f"{_W}/b.txt" in paths
-        assert any(p == f"{_W}/subdir/" for p in paths)
+        assert any(p == f"{_W}/subdir" for p in paths)
 
     def test_read_not_found(self, tmp_root):
         backend = LocalBackend(root_dir=str(tmp_root))

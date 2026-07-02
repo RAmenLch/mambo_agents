@@ -102,7 +102,7 @@ class TestStateBackend:
             result = backend.ls(VirtualPath("/workspace"))
         assert result.entries is not None
         paths = [fi.path for fi in result.entries]
-        assert any(p.endswith("/") or "/workspace/sub/" in p for p in paths)
+        assert any(p == "/workspace/sub" for p in paths)
 
     def test_grep_finds_pattern(self):
         backend = StateBackend()

@@ -511,8 +511,6 @@ class SshBackend(BackendProtocol):
                 modified_at = datetime.fromtimestamp(attr.st_mtime, tz=timezone.utc).isoformat()
 
             vp = path.join(attr.filename)
-            if is_dir:
-                vp = vp.as_dir()
 
             infos.append(FileInfo(
                 path=vp,
@@ -1147,7 +1145,7 @@ class SshBackend(BackendProtocol):
     # ------------------------------------------------------------------
 
     def glob(self, pattern: str, path: VirtualPath = VirtualPath("/workspace")) -> GlobResult:
-        """Find files matching *pattern* under *path*.
+        """Find files and directories matching *pattern* under *path*.
 
         Uses remote ``python3`` with ``glob.glob(recursive=True)``
         for full wildcard support (``*``, ``**``, ``?``, ``[...]``).
@@ -1203,8 +1201,8 @@ class SshBackend(BackendProtocol):
             f"else:\n"
             f"    res = []\n"
             f"    for f in glob.glob(full, recursive=True):\n"
-            f"        if os.path.isfile(f):\n"
-            f"            res.append({{'p': f, 's': os.path.getsize(f)}})\n"
+            f"        is_dir = os.path.isdir(f)\n"
+            f"        res.append({{'p': f, 'd': is_dir, 's': os.path.getsize(f) if not is_dir else 0}})\n"
             f"    print(json.dumps(res))\n"
         )
 
@@ -1227,7 +1225,7 @@ class SshBackend(BackendProtocol):
             virt = self._physical_to_virtual(item["p"])
             matches.append(FileInfo(
                 path=virt,
-                is_dir=False,
+                is_dir=item.get("d", False),
                 size=item.get("s", 0),
             ))
 
@@ -1288,9 +1286,9 @@ class SshBackend(BackendProtocol):
         maxdepth_flag = f"-maxdepth {maxdepth} " if maxdepth else ""
 
         cmd = (
-            f"find {search_esc} -type f {maxdepth_flag}"
+            f"find {search_esc} {maxdepth_flag}"
             f"-name {name_esc} "
-            f"-printf '%s\\t%p\\n' 2>/dev/null"
+            f"-printf '%Y\\t%s\\t%p\\n' 2>/dev/null"
         )
 
         out, err, exit_code = self._exec(cmd, timeout=60)
@@ -1301,18 +1299,20 @@ class SshBackend(BackendProtocol):
         for line in out.splitlines():
             if not line.strip():
                 continue
-            if "\t" not in line:
+            parts = line.split("\t", 2)
+            if len(parts) < 3:
                 continue
-            size_str, physical_path = line.split("\t", 1)
+            type_char, size_str, physical_path = parts
             try:
                 size = int(size_str)
             except ValueError:
                 size = 0
+            is_dir = (type_char == "d")
             virt = self._physical_to_virtual(physical_path.strip())
             matches.append(FileInfo(
                 path=virt,
-                is_dir=False,
-                size=size,
+                is_dir=is_dir,
+                size=0 if is_dir else size,
             ))
 
         return GlobResult(matches=matches)

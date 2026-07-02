@@ -210,7 +210,7 @@ Every backend must implement 6 core operations:
 | `write(file_path, content, overwrite)` | Create / overwrite a file |
 | `edit(file_path, old_str, new_str, replace_all)` | Replace text in a file |
 | `grep(pattern, path, glob)` | Search text content |
-| `glob(pattern, path)` | Find files by wildcard pattern |
+| `glob(pattern, path)` | Find files and directories by wildcard pattern |
 
 Each backend can also expose extra tools via its `tools` property (e.g. `tree`, `delete`, `execute`).
 
@@ -999,7 +999,7 @@ from mambo_agents import (
 | `WriteResult` | File write result |
 | `EditResult` | File edit result |
 | `GrepResult` | Text search matches |
-| `GlobResult` | File glob matches |
+| `GlobResult` | File and directory glob matches |
 | `FileInfo` | Single file / directory metadata |
 | `GrepMatch` | Single grep match |
 

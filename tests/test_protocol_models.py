@@ -257,7 +257,7 @@ class TestGlobResult:
 
     def test_str_no_matches(self):
         r = GlobResult(matches=[])
-        assert str(r) == "No files found."
+        assert str(r) == "No matches found."
 
     def test_str_error(self):
         r = GlobResult(error="Invalid pattern")

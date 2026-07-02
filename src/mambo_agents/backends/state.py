@@ -337,7 +337,7 @@ class StateBackend(ThreadAwareWorkspace):
                 continue
             relative = fpath[len(normalized):]
             if "/" in relative:
-                subdirs.add(normalized + relative.split("/")[0] + "/")
+                subdirs.add(normalized + relative.split("/")[0])
             else:
                 content = fd.get("content", "")
                 infos.append(
@@ -708,16 +708,38 @@ def _glob_in_memory(
     pattern: str,
     path: str = "/",
 ) -> GlobResult:
+    """Glob against in-memory files and their parent directories.
+
+    The state backend stores only file paths (no directory entries).
+    This function derives virtual directory paths from the stored files
+    so that a glob pattern matching a directory name (e.g. ``*src*``)
+    returns both files and the matching directory entries.
+    """
     path_prefix = path.rstrip("/") if path != "/" else ""
 
     results: list[FileInfo] = []
+    dirs_seen: set[str] = set()
+
     for fpath in sorted(files):
         if path_prefix and fpath != path_prefix and not fpath.startswith(path_prefix + "/"):
             continue
+
+        # Collect ancestor directories from this file path
+        parent = fpath.rpartition("/")[0]
+        while parent and parent != path_prefix and parent not in dirs_seen:
+            dirs_seen.add(parent)
+            parent = parent.rpartition("/")[0]
+
         if not fnmatch.fnmatch(fpath, pattern):
             continue
         content = files[fpath].get("content", "")
         results.append(FileInfo(path=fpath, is_dir=False, size=len(content)))
+
+    # Match directory paths against the pattern
+    for dpath in sorted(dirs_seen):
+        if not fnmatch.fnmatch(dpath, pattern):
+            continue
+        results.append(FileInfo(path=dpath, is_dir=True, size=0))
 
     return GlobResult(matches=results)
 

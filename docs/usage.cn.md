@@ -210,7 +210,7 @@ agent = create_mambo_agent(
 | `write(file_path, content, overwrite)` | 创建/覆盖文件 |
 | `edit(file_path, old_str, new_str, replace_all)` | 替换文件中的文本 |
 | `grep(pattern, path, glob)` | 搜索文本内容 |
-| `glob(pattern, path)` | 按通配符查找文件 |
+| `glob(pattern, path)` | 按通配符查找文件和目录 |
 
 每个后端还可以通过 `tools` 属性暴露额外的工具（如 `tree`、`delete`、`execute`）。
 
@@ -1054,7 +1054,7 @@ from mambo_agents import (
 | `WriteResult` | 文件写入结果 |
 | `EditResult` | 文件编辑结果 |
 | `GrepResult` | 文本搜索匹配 |
-| `GlobResult` | 文件通配符匹配 |
+| `GlobResult` | 文件和目录通配符匹配 |
 | `FileInfo` | 单个文件/目录信息 |
 | `GrepMatch` | 单个 grep 匹配 |
 
