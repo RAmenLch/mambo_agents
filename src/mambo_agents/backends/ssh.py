@@ -569,7 +569,7 @@ class SshBackend(BackendProtocol):
                 mime_type=mime_type,
             )
 
-        # Text file: attempt UTF-8, fallback to base64.
+        # Text file: attempt UTF-8 read.
         # NOTE: Paramiko's SFTPClient.open(…, "r") may return bytes on
         # some server implementations.  Always open in binary mode and
         # decode explicitly to avoid TypeError downstream.
@@ -577,19 +577,8 @@ class SshBackend(BackendProtocol):
             with self._sftp.open(remote, "rb") as f:
                 content = f.read().decode("utf-8")
         except UnicodeDecodeError:
-            # Re-read as binary and encode
-            try:
-                with self._sftp.open(remote, "rb") as f:
-                    raw = f.read()
-            except OSError as e:
-                return ReadResult(error=f"Error reading '{file_path}': {e}")
-            encoded = base64.b64encode(raw).decode("ascii")
             return ReadResult(
-                content=encoded,
-                total_lines=1,
-                encoding="base64",
-                file_type=file_type,
-                mime_type=mime_type,
+                error=f"Cannot read '{file_path}': not a recognized text or multimedia format",
             )
         except OSError as e:
             return ReadResult(error=f"Error reading '{file_path}': {e}")

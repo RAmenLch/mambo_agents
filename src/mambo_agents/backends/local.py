@@ -398,25 +398,14 @@ class LocalBackend(BackendProtocol):
                 mime_type=_get_mime_type(file_path.value),
             )
 
-        # Text file: attempt UTF-8 read, fallback to base64
+        # Text file: attempt UTF-8 read.
         try:
             fd = os.open(resolved, os.O_RDONLY | _O_NOFOLLOW)
             with os.fdopen(fd, "r", encoding="utf-8") as f:
                 content = f.read()
         except UnicodeDecodeError:
-            try:
-                fd = os.open(resolved, os.O_RDONLY | _O_NOFOLLOW)
-                with os.fdopen(fd, "rb") as f:
-                    raw = f.read()
-            except OSError as e:
-                return ReadResult(error=f"Error reading '{file_path}': {e}")
-            encoded = base64.b64encode(raw).decode("ascii")
             return ReadResult(
-                content=encoded,
-                total_lines=1,
-                encoding="base64",
-                file_type=_get_file_type(file_path.value),
-                mime_type=_get_mime_type(file_path.value),
+                error=f"Cannot read '{file_path}': not a recognized text or multimedia format",
             )
         except OSError as e:
             return ReadResult(error=f"Error reading '{file_path}': {e}")

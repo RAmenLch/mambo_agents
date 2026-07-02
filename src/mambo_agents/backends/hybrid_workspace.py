@@ -62,12 +62,12 @@ DEFAULT_MAMBO_PREFIX = "/.mambo/"
 # ============================================================================
 
 
-class CopyResult(BaseModel):
+class CopyResult(Result):
     """Result from ``copy()`` — single-file copy, potentially cross-backend."""
 
     error: str | None = None
-    source: str | None = None
-    destination: str | None = None
+    source: VirtualPath | None = None
+    destination: VirtualPath | None = None
 
     def __str__(self) -> str:
         if self.error is not None:
@@ -875,7 +875,7 @@ class HybridWorkspaceBackend(ThreadAwareWorkspace):
         if ul.error:
             return CopyResult(error=f"Failed to write '{destination}': {ul.error}")
 
-        return CopyResult(source=str(source), destination=str(destination))
+        return CopyResult(source=source, destination=destination)
 
     async def acopy(self, source: VirtualPath, destination: VirtualPath) -> CopyResult:
         """Async: Copy a single file across backends."""
