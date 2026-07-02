@@ -188,7 +188,7 @@ class TestLocalBackend:
 
         r = backend.delete(VirtualPath(f"{_W}/deleteme.txt"))
         assert r is not None
-        assert "Deleted:" in r
+        assert "Deleted:" in str(r)
         assert not (tmp_root / "deleteme.txt").exists()
 
     def test_delete_rejects_directory(self, tmp_root):
@@ -197,14 +197,14 @@ class TestLocalBackend:
         (tmp_root / "fulldir").mkdir()
         (tmp_root / "fulldir" / "file.txt").write_text("hi")
         r = backend.delete(VirtualPath(f"{_W}/fulldir"))
-        assert "is a directory" in r
+        assert "is a directory" in str(r)
         assert (tmp_root / "fulldir").exists()
         assert (tmp_root / "fulldir" / "file.txt").exists()
 
     def test_delete_not_found(self, tmp_root):
         backend = LocalBackend(root_dir=str(tmp_root))
         r = backend.delete(VirtualPath(f"{_W}/nope.txt"))
-        assert "does not exist" in r
+        assert "does not exist" in str(r)
 
     def test_delete_tool_registered(self, tmp_root):
         """delete tool is always available in LocalBackend."""
@@ -309,7 +309,7 @@ class TestLocalBackend:
             edit_whitelist=frozenset({VirtualPath(f"{_W}/src")}),
         )
         r = backend.delete(VirtualPath(f"{_W}/outside/secret.txt"))
-        assert "not allowed" in r
+        assert "not allowed" in str(r)
 
     def test_blacklist_blocks_delete(self, tmp_root):
         """delete on a blacklisted path is rejected."""
@@ -319,7 +319,7 @@ class TestLocalBackend:
         )
         (tmp_root / "important").mkdir()
         r = backend.delete(VirtualPath(f"{_W}/important"))
-        assert "not allowed" in r
+        assert "not allowed" in str(r)
 
     # ------------------------------------------------------------------
     # tree with ignore_dirs

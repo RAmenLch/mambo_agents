@@ -50,7 +50,7 @@ from mambo_agents.backends.utils import (
     format_validation_error,
     format_with_line_numbers,
 )
-from mambo_agents.backends.schemas import human_size,VirtualPath
+from mambo_agents.backends.schemas import human_size,VirtualPath,DeleteResult
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -1536,44 +1536,46 @@ class SshBackend(BackendProtocol):
     # Extra: delete
     # ------------------------------------------------------------------
 
-    def delete(self, path: VirtualPath) -> str:
+    def delete(self, path: VirtualPath) -> DeleteResult:
         """Delete a single **file** on the remote server.
 
         Directories are rejected — the agent must remove files inside
         the directory individually before the directory can be deleted.
         """
         if not self._check_edit_allowed(path):
-            return (
-                f"Error: Path '{path}' is not allowed for delete. "
-                "Check edit_whitelist / edit_blacklist."
+            return DeleteResult(
+                error=f"Path '{path}' is not allowed for delete. "
+                "Check edit_whitelist / edit_blacklist.",
+                path=path,
             )
         try:
             remote = self._resolve(path)
         except WorkspacePathError as e:
-            return str(e)
+            return DeleteResult(error=str(e), path=path)
 
         # Safety: refuse to delete the remote root
         if remote.rstrip("/") == self._remote_root.rstrip("/"):
-            return "Error: cannot delete root working directory."
+            return DeleteResult(error="cannot delete root working directory.", path=path)
 
         # Reject directories
         try:
             st_mode = self._sftp.stat(remote).st_mode
             if self._attr_is_dir_maybe(st_mode):
-                return (
-                    f"Error: '{path}' is a directory. "
-                    f"The delete tool only removes single files. "
+                return DeleteResult(
+                    error=f"'{path}' is a directory. "
+                    f"The delete tool only removes single files. ",
+                    path=path,
                 )
         except FileNotFoundError:
-            return f"Error: path '{path}' does not exist."
+            return DeleteResult(error=f"path '{path}' does not exist.", path=path)
 
         remote_escaped = shlex.quote(remote)
         out, err, exit_code = self._exec(f"rm -f {remote_escaped}")
 
         if exit_code != 0:
-            return f"Error deleting '{path}': {err or out}"
+            return DeleteResult(error=f"deleting '{path}': {err or out}", path=path)
 
-        return f"Deleted: {path}"
+        return DeleteResult(path=path)
 
     # ------------------------------------------------------------------
     # Extra: execute
@@ -1690,7 +1692,7 @@ class SshBackend(BackendProtocol):
         async with self._async_lock:
             return await asyncio.to_thread(self.tree, path, depth)
 
-    async def adelete(self, path: str) -> str:
+    async def adelete(self, path: str) -> DeleteResult:
         async with self._async_lock:
             return await asyncio.to_thread(self.delete, path)
 

@@ -7,7 +7,8 @@ without circular-dependency risk.
 
 from __future__ import annotations
 
-from typing import Literal
+from collections.abc import Callable
+from typing import Literal, Self
 
 from pydantic import BaseModel, ConfigDict, Field, model_serializer, model_validator
 
@@ -292,15 +293,56 @@ class GrepMatch(BaseModel):
 
 
 # ============================================================================
-# Result types
+# Result — base class for all tool result types
+# ============================================================================
+
+ReversePathFn = Callable[[VirtualPath, VirtualPath, VirtualPath], VirtualPath]
+"""Signature of ``_reverse_path(internal_path, target_ws_root, virtual_prefix)``."""
+
+
+class Result(BaseModel):
+    """Base class for all tool results.
+
+    Subclasses that contain translatable path fields override
+    :meth:`apply_reverse_translation` to return a new instance with
+    all ``VirtualPath`` fields reverse-translated.
+
+    The default implementation returns ``self`` unchanged (for results
+    like :class:`ReadResult` that have no path fields).
+    """
+
+    def apply_reverse_translation(
+        self, reverse_fn: ReversePathFn, target_ws_root: VirtualPath, virtual_prefix: VirtualPath,
+    ) -> Self:
+        """Return a new instance with all ``VirtualPath`` fields reverse-translated.
+
+        The default returns *self* unchanged.  Subclasses with path fields
+        override to return a ``model_copy(update={...})``.
+        """
+        return self
+
+
+# ============================================================================
+# Concrete result types
 # ============================================================================
 
 
-class LsResult(BaseModel):
+class LsResult(Result):
     """Result from ``ls()``."""
 
     error: str | None = None
     entries: list[FileInfo] | None = None
+
+    def apply_reverse_translation(
+        self, reverse_fn: ReversePathFn, target_ws_root: VirtualPath, virtual_prefix: VirtualPath,
+    ) -> "LsResult":
+        if self.entries is None:
+            return self
+        entries = [
+            e.model_copy(update={"path": reverse_fn(e.path, target_ws_root, virtual_prefix)})
+            for e in self.entries
+        ]
+        return self.model_copy(update={"entries": entries})
 
     def __str__(self) -> str:
         lines: list[str] = []
@@ -318,7 +360,7 @@ class LsResult(BaseModel):
         return "\n".join(lines)
 
 
-class ReadResult(BaseModel):
+class ReadResult(Result):
     """Result from ``read()``.
 
     For text files, ``content`` carries plain text (no line numbers by
@@ -330,6 +372,9 @@ class ReadResult(BaseModel):
     For non-text (multimodal) files, ``file_type`` is set to the
     appropriate classification (``"image"``, ``"audio"``, ``"video"``,
     or ``"file"``) and ``mime_type`` provides the IANA media type.
+
+    Has no translatable path fields — the default :meth:`Result.apply_reverse_translation`
+    (return *self* unchanged) is sufficient.
     """
 
     error: str | None = None
@@ -352,7 +397,7 @@ class ReadResult(BaseModel):
         return self.content or ""
 
 
-class WriteResult(BaseModel):
+class WriteResult(Result):
     """Result from ``write()`` — create or overwrite a file.
 
     By default ``overwrite=False`` and creating a file that already
@@ -363,18 +408,32 @@ class WriteResult(BaseModel):
     error: str | None = None
     path: VirtualPath | None = None
 
+    def apply_reverse_translation(
+        self, reverse_fn: ReversePathFn, target_ws_root: VirtualPath, virtual_prefix: VirtualPath,
+    ) -> "WriteResult":
+        if self.path is None:
+            return self
+        return self.model_copy(update={"path": reverse_fn(self.path, target_ws_root, virtual_prefix)})
+
     def __str__(self) -> str:
         if self.error is not None:
             return f"Error: {self.error}"
         return f"File written: {self.path}"
 
 
-class EditResult(BaseModel):
+class EditResult(Result):
     """Result from ``edit()`` — replace text in an existing file."""
 
     error: str | None = None
     path: VirtualPath | None = None
     occurrences: int = 0
+
+    def apply_reverse_translation(
+        self, reverse_fn: ReversePathFn, target_ws_root: VirtualPath, virtual_prefix: VirtualPath,
+    ) -> "EditResult":
+        if self.path is None:
+            return self
+        return self.model_copy(update={"path": reverse_fn(self.path, target_ws_root, virtual_prefix)})
 
     def __str__(self) -> str:
         if self.error is not None:
@@ -382,7 +441,7 @@ class EditResult(BaseModel):
         return f"File edited: {self.path} ({self.occurrences} replacement(s))"
 
 
-class GrepResult(BaseModel):
+class GrepResult(Result):
     """Result from ``grep()``."""
 
     error: str | None = None
@@ -391,6 +450,17 @@ class GrepResult(BaseModel):
     """``True`` when the result was truncated by ``max_grep_matches`` or offset/limit."""
     total_matches: int = 0
     """Total number of matches found before offset/limit slicing."""
+
+    def apply_reverse_translation(
+        self, reverse_fn: ReversePathFn, target_ws_root: VirtualPath, virtual_prefix: VirtualPath,
+    ) -> "GrepResult":
+        if self.matches is None:
+            return self
+        matches = [
+            m.model_copy(update={"path": reverse_fn(m.path, target_ws_root, virtual_prefix)})
+            for m in self.matches
+        ]
+        return self.model_copy(update={"matches": matches})
 
     def __str__(self) -> str:
         lines: list[str] = []
@@ -410,11 +480,22 @@ class GrepResult(BaseModel):
         return "\n".join(lines)
 
 
-class GlobResult(BaseModel):
+class GlobResult(Result):
     """Result from ``glob()``."""
 
     error: str | None = None
     matches: list[FileInfo] | None = None
+
+    def apply_reverse_translation(
+        self, reverse_fn: ReversePathFn, target_ws_root: VirtualPath, virtual_prefix: VirtualPath,
+    ) -> "GlobResult":
+        if self.matches is None:
+            return self
+        matches = [
+            e.model_copy(update={"path": reverse_fn(e.path, target_ws_root, virtual_prefix)})
+            for e in self.matches
+        ]
+        return self.model_copy(update={"matches": matches})
 
     def __str__(self) -> str:
         lines: list[str] = []
@@ -432,16 +513,45 @@ class GlobResult(BaseModel):
         return "\n".join(lines)
 
 
-class UploadFileResult(BaseModel):
+class UploadFileResult(Result):
     """Result for a single file in a bulk upload."""
 
     path: VirtualPath
     error: str | None = None
 
+    def apply_reverse_translation(
+        self, reverse_fn: ReversePathFn, target_ws_root: VirtualPath, virtual_prefix: VirtualPath,
+    ) -> "UploadFileResult":
+        return self.model_copy(update={"path": reverse_fn(self.path, target_ws_root, virtual_prefix)})
 
-class DownloadFileResult(BaseModel):
+
+class DownloadFileResult(Result):
     """Result for a single file in a bulk download."""
 
     path: VirtualPath
     content: bytes | None = None
     error: str | None = None
+
+    def apply_reverse_translation(
+        self, reverse_fn: ReversePathFn, target_ws_root: VirtualPath, virtual_prefix: VirtualPath,
+    ) -> "DownloadFileResult":
+        return self.model_copy(update={"path": reverse_fn(self.path, target_ws_root, virtual_prefix)})
+
+
+class DeleteResult(Result):
+    """Result from ``delete()`` — delete a single file."""
+
+    error: str | None = None
+    path: VirtualPath | None = None
+
+    def apply_reverse_translation(
+        self, reverse_fn: ReversePathFn, target_ws_root: VirtualPath, virtual_prefix: VirtualPath,
+    ) -> "DeleteResult":
+        if self.path is None:
+            return self
+        return self.model_copy(update={"path": reverse_fn(self.path, target_ws_root, virtual_prefix)})
+
+    def __str__(self) -> str:
+        if self.error is not None:
+            return f"Error: {self.error}"
+        return f"Deleted: {self.path}"

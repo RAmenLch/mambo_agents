@@ -17,6 +17,7 @@ from langchain_core.tools import StructuredTool
 from pydantic import BaseModel, ConfigDict, Field
 
 from mambo_agents.backends.schemas import (
+    DeleteResult,
     DownloadFileResult,
     EditResult,
     FileInfo,
@@ -26,6 +27,7 @@ from mambo_agents.backends.schemas import (
     GrepResult,
     LsResult,
     ReadResult,
+    Result,
     UploadFileResult,
     VirtualPath,
     WriteResult,

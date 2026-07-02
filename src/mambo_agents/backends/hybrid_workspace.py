@@ -31,6 +31,7 @@ from pydantic import BaseModel, Field, create_model
 
 from mambo_agents.backends.protocol import (
     BackendProtocol,
+    DeleteResult,
     DownloadFileResult,
     EditResult,
     FileInfo,
@@ -39,6 +40,7 @@ from mambo_agents.backends.protocol import (
     LsResult,
     ReadResult,
     ReadSummarizer,
+    Result,
     ThreadAwareWorkspace,
     ToolTimeouts,
     UploadFileResult,
@@ -234,9 +236,12 @@ class HybridWorkspaceBackend(ThreadAwareWorkspace):
             return False
         return "path" in schema.model_fields
 
-    def _translate_path_kwarg(self, kwargs: dict) -> None:
+    def _translate_path_kwarg(self, kwargs: dict) -> tuple[BackendProtocol, VirtualPath] | None:
         """Rewrite ``kwargs["path"]`` via :meth:`_route`
         when the path routes to the real backend.
+
+        Returns ``(target_backend, virtual_prefix)`` for reverse
+        translation of results, or ``None`` when no translation occurred.
 
         Only modifies the dict when all of these hold:
 
@@ -249,23 +254,26 @@ class HybridWorkspaceBackend(ThreadAwareWorkspace):
         :class:`WorkspacePathError` with a descriptive message.
         """
         if "path" not in kwargs:
-            return
+            return None
         raw_path = kwargs["path"]
         if not isinstance(raw_path, (str, VirtualPath)) or not raw_path:
-            return
+            return None
         try:
             if isinstance(raw_path, str):
                 raw_path = VirtualPath(raw_path)
             target, rewritten = self._route(raw_path)
         except (ValueError, TypeError):
-            return
+            return None
         if target is not self._real:
-            return
+            return None
+        vprefix = self._get_virtual_prefix(raw_path)
         kwargs["path"] = rewritten
+        return (target, vprefix)
 
     def _wrap_extra_tool(self, tool: StructuredTool) -> StructuredTool:
         """Wrap a real-backend tool so that its ``path`` argument is
-        translated through :meth:`_route` before delegation.
+        translated through :meth:`_route` before delegation, and
+        ``VirtualPath`` fields in the result are reverse-translated.
 
         Only rewrites when ``_route`` maps to ``self._real`` — paths
         that route to a virtual backend are left unchanged so the real
@@ -278,18 +286,28 @@ class HybridWorkspaceBackend(ThreadAwareWorkspace):
         original_coroutine = tool.coroutine
 
         def wrapped_func(*args, **kwargs):
-            self._translate_path_kwarg(kwargs)
+            route_info = self._translate_path_kwarg(kwargs)
             if original_func is not None:
-                return original_func(*args, **kwargs)
-            return None
+                result = original_func(*args, **kwargs)
+            else:
+                result = None
+            if result is not None and route_info is not None and isinstance(result, Result):
+                target, vprefix = route_info
+                result = result.apply_reverse_translation(self._reverse_path, target.workspace_root, vprefix)
+            return result
 
         async def wrapped_coroutine(*args, **kwargs):
-            self._translate_path_kwarg(kwargs)
+            route_info = self._translate_path_kwarg(kwargs)
             if original_coroutine is not None:
-                return await original_coroutine(*args, **kwargs)
-            if original_func is not None:
-                return await asyncio.to_thread(original_func, *args, **kwargs)
-            return None
+                result = await original_coroutine(*args, **kwargs)
+            elif original_func is not None:
+                result = await asyncio.to_thread(original_func, *args, **kwargs)
+            else:
+                result = None
+            if result is not None and route_info is not None and isinstance(result, Result):
+                target, vprefix = route_info
+                result = result.apply_reverse_translation(self._reverse_path, target.workspace_root, vprefix)
+            return result
 
         return StructuredTool(
             name=tool.name,
@@ -467,28 +485,21 @@ class HybridWorkspaceBackend(ThreadAwareWorkspace):
         except (ValueError, TypeError) as e:
             return LsResult(error=f"路径 '{path}' 无效：{e}。仅可访问：{self._valid_paths_description()}")
         result = target.ls(p)
-
-        entries: list[FileInfo] = []
-        if result.entries:
-            vprefix = self._get_virtual_prefix(path)
-            twsr = target.workspace_root
-            for e in result.entries:
-                entries.append(e.model_copy(update={
-                    "path": self._reverse_path(e.path, twsr, vprefix),
-                }))
+        result = result.apply_reverse_translation(
+            self._reverse_path, target.workspace_root, self._get_virtual_prefix(path),
+        )
 
         # Inject named virtual workspace directories when listing /.mambo root
         if str(path).rstrip("/") == self._prefix.normalized:
+            entries = list(result.entries) if result.entries else []
             for name in self._virtual:
                 entries.append(FileInfo(
                     path=self._prefix.join(name),
                     is_dir=True,
                 ))
+            result = result.model_copy(update={"entries": entries})
 
-        return LsResult(
-            error=result.error,
-            entries=entries if entries else None,
-        )
+        return result
 
     def read(
         self,
@@ -523,7 +534,10 @@ class HybridWorkspaceBackend(ThreadAwareWorkspace):
             target, p = self._route(file_path)
         except (ValueError, TypeError) as e:
             return WriteResult(error=f"路径 '{file_path}' 无效：{e}。仅可访问：{self._valid_paths_description()}")
-        return target.write(p, content, overwrite)
+        result = target.write(p, content, overwrite)
+        return result.apply_reverse_translation(
+            self._reverse_path, target.workspace_root, self._get_virtual_prefix(file_path),
+        )
 
     def edit(
         self,
@@ -537,7 +551,10 @@ class HybridWorkspaceBackend(ThreadAwareWorkspace):
             target, p = self._route(file_path)
         except (ValueError, TypeError) as e:
             return EditResult(error=f"路径 '{file_path}' 无效：{e}。仅可访问：{self._valid_paths_description()}")
-        return target.edit(p, old_str, new_str, replace_all=replace_all)
+        result = target.edit(p, old_str, new_str, replace_all=replace_all)
+        return result.apply_reverse_translation(
+            self._reverse_path, target.workspace_root, self._get_virtual_prefix(file_path),
+        )
 
     def grep(
         self,
@@ -560,21 +577,9 @@ class HybridWorkspaceBackend(ThreadAwareWorkspace):
         except (ValueError, TypeError) as e:
             return GrepResult(error=f"路径 '{path}' 无效：{e}。仅可访问：{self._valid_paths_description()}")
         result = target.grep(pattern, p, glob, regex, offset, limit)
-        if result.matches:
-            vprefix = self._get_virtual_prefix(path)
-            twsr = target.workspace_root
-            result = GrepResult(
-                error=result.error,
-                matches=[
-                    m.model_copy(update={
-                        "path": self._reverse_path(m.path, twsr, vprefix),
-                    })
-                    for m in result.matches
-                ],
-                truncated=result.truncated,
-                total_matches=result.total_matches,
-            )
-        return result
+        return result.apply_reverse_translation(
+            self._reverse_path, target.workspace_root, self._get_virtual_prefix(path),
+        )
 
     def glob(self, pattern: str, path: VirtualPath) -> GlobResult:
         # Fan-out to all virtual backends when searching /.mambo root
@@ -586,19 +591,9 @@ class HybridWorkspaceBackend(ThreadAwareWorkspace):
         except (ValueError, TypeError) as e:
             return GlobResult(error=f"路径 '{path}' 无效：{e}。仅可访问：{self._valid_paths_description()}")
         result = target.glob(pattern, p)
-        if result.matches:
-            vprefix = self._get_virtual_prefix(path)
-            twsr = target.workspace_root
-            result = GlobResult(
-                error=result.error,
-                matches=[
-                    e.model_copy(update={
-                        "path": self._reverse_path(e.path, twsr, vprefix),
-                    })
-                    for e in result.matches
-                ],
-            )
-        return result
+        return result.apply_reverse_translation(
+            self._reverse_path, target.workspace_root, self._get_virtual_prefix(path),
+        )
 
     # ------------------------------------------------------------------
     # Async core file operations — route to target's async method
@@ -614,28 +609,21 @@ class HybridWorkspaceBackend(ThreadAwareWorkspace):
         except (ValueError, TypeError) as e:
             return LsResult(error=f"路径 '{path}' 无效：{e}。仅可访问：{self._valid_paths_description()}")
         result = await target.als(p)
-
-        entries: list[FileInfo] = []
-        if result.entries:
-            vprefix = self._get_virtual_prefix(path)
-            twsr = target.workspace_root
-            for e in result.entries:
-                entries.append(e.model_copy(update={
-                    "path": self._reverse_path(e.path, twsr, vprefix),
-                }))
+        result = result.apply_reverse_translation(
+            self._reverse_path, target.workspace_root, self._get_virtual_prefix(path),
+        )
 
         # Inject named virtual workspace directories when listing /.mambo root
         if str(path).rstrip("/") == self._prefix.normalized:
+            entries = list(result.entries) if result.entries else []
             for name in self._virtual:
                 entries.append(FileInfo(
                     path=self._prefix.join(name),
                     is_dir=True,
                 ))
+            result = result.model_copy(update={"entries": entries})
 
-        return LsResult(
-            error=result.error,
-            entries=entries if entries else None,
-        )
+        return result
 
     async def aread(
         self,
@@ -659,7 +647,10 @@ class HybridWorkspaceBackend(ThreadAwareWorkspace):
             target, p = self._route(file_path)
         except (ValueError, TypeError) as e:
             return WriteResult(error=f"路径 '{file_path}' 无效：{e}。仅可访问：{self._valid_paths_description()}")
-        return await target.awrite(p, content, overwrite)
+        result = await target.awrite(p, content, overwrite)
+        return result.apply_reverse_translation(
+            self._reverse_path, target.workspace_root, self._get_virtual_prefix(file_path),
+        )
 
     async def aedit(
         self,
@@ -673,7 +664,10 @@ class HybridWorkspaceBackend(ThreadAwareWorkspace):
             target, p = self._route(file_path)
         except (ValueError, TypeError) as e:
             return EditResult(error=f"路径 '{file_path}' 无效：{e}。仅可访问：{self._valid_paths_description()}")
-        return await target.aedit(p, old_str, new_str, replace_all=replace_all)
+        result = await target.aedit(p, old_str, new_str, replace_all=replace_all)
+        return result.apply_reverse_translation(
+            self._reverse_path, target.workspace_root, self._get_virtual_prefix(file_path),
+        )
 
     async def agrep(
         self,
@@ -694,21 +688,9 @@ class HybridWorkspaceBackend(ThreadAwareWorkspace):
         except (ValueError, TypeError) as e:
             return GrepResult(error=f"路径 '{path}' 无效：{e}。仅可访问：{self._valid_paths_description()}")
         result = await target.agrep(pattern, p, glob, regex, offset, limit)
-        if result.matches:
-            vprefix = self._get_virtual_prefix(path)
-            twsr = target.workspace_root
-            result = GrepResult(
-                error=result.error,
-                matches=[
-                    m.model_copy(update={
-                        "path": self._reverse_path(m.path, twsr, vprefix),
-                    })
-                    for m in result.matches
-                ],
-                truncated=result.truncated,
-                total_matches=result.total_matches,
-            )
-        return result
+        return result.apply_reverse_translation(
+            self._reverse_path, target.workspace_root, self._get_virtual_prefix(path),
+        )
 
     async def aglob(self, pattern: str, path: VirtualPath) -> GlobResult:
         # Fan-out to all virtual backends when searching /.mambo root
@@ -720,19 +702,9 @@ class HybridWorkspaceBackend(ThreadAwareWorkspace):
         except (ValueError, TypeError) as e:
             return GlobResult(error=f"路径 '{path}' 无效：{e}。仅可访问：{self._valid_paths_description()}")
         result = await target.aglob(pattern, p)
-        if result.matches:
-            vprefix = self._get_virtual_prefix(path)
-            twsr = target.workspace_root
-            result = GlobResult(
-                error=result.error,
-                matches=[
-                    e.model_copy(update={
-                        "path": self._reverse_path(e.path, twsr, vprefix),
-                    })
-                    for e in result.matches
-                ],
-            )
-        return result
+        return result.apply_reverse_translation(
+            self._reverse_path, target.workspace_root, self._get_virtual_prefix(path),
+        )
 
     # ------------------------------------------------------------------
     # Fan-out helpers — search across all virtual backends at /.mambo root

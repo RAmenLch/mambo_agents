@@ -49,7 +49,7 @@ from mambo_agents.backends.utils import (
     format_validation_error,
     format_with_line_numbers,
 )
-from mambo_agents.backends.schemas import VirtualPath,human_size
+from mambo_agents.backends.schemas import VirtualPath,human_size,DeleteResult
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -837,7 +837,7 @@ class LocalBackend(BackendProtocol):
         )
         return format_tree_entries(entries)
 
-    def delete(self, path: VirtualPath) -> str:
+    def delete(self, path: VirtualPath) -> DeleteResult:
         """Delete a single **file**.
 
         Directories are rejected — the agent must remove files inside
@@ -847,37 +847,39 @@ class LocalBackend(BackendProtocol):
             path: Virtual path to delete.
 
         Returns:
-            Success or error message.
+            Success or error result.
         """
         if not self._check_edit_allowed(path):
-            return (
-                f"Error: Path '{path}' is not allowed for delete. "
-                "Check edit_whitelist / edit_blacklist."
+            return DeleteResult(
+                error=f"Path '{path}' is not allowed for delete. "
+                "Check edit_whitelist / edit_blacklist.",
+                path=path,
             )
         try:
             resolved = self._resolve(path)
         except WorkspacePathError as e:
-            return str(e)
+            return DeleteResult(error=str(e), path=path)
 
         # Safety: refuse to delete the root_dir itself
         if resolved == self._cwd:
-            return "Error: cannot delete root working directory."
+            return DeleteResult(error="cannot delete root working directory.", path=path)
 
         if not resolved.exists():
-            return f"Error: path '{path}' does not exist."
+            return DeleteResult(error=f"path '{path}' does not exist.", path=path)
 
         if resolved.is_dir():
-            return (
-                f"Error: '{path}' is a directory. "
-                f"The delete tool only removes single files. "
+            return DeleteResult(
+                error=f"'{path}' is a directory. "
+                f"The delete tool only removes single files. ",
+                path=path,
             )
 
         try:
             resolved.unlink()
         except OSError as e:
-            return f"Error deleting '{path}': {e}"
+            return DeleteResult(error=f"deleting '{path}': {e}", path=path)
 
-        return f"Deleted: {path}"
+        return DeleteResult(path=path)
 
     def execute(
         self,
@@ -959,7 +961,7 @@ class LocalBackend(BackendProtocol):
         """Async: Render a directory tree."""
         return await asyncio.to_thread(self.tree, path, depth)
 
-    async def adelete(self, path: VirtualPath) -> str:
+    async def adelete(self, path: VirtualPath) -> DeleteResult:
         """Async: Delete a file."""
         return await asyncio.to_thread(self.delete, path)
 
