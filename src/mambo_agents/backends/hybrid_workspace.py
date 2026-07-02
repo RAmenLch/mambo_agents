@@ -840,6 +840,80 @@ class HybridWorkspaceBackend(ThreadAwareWorkspace):
     # copy — cross-backend single-file copy
     # ------------------------------------------------------------------
 
+    # ------------------------------------------------------------------
+    # copy helpers — thread_id resolution to avoid Pregel deadlocks
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _resolve_copy_thread_id() -> str | None:
+        """Resolve ``thread_id`` from the current LangGraph config.
+
+        Returns ``None`` when outside graph context — callers fall back
+        to the backend's default path resolution.
+        """
+        try:
+            from langgraph.config import get_config
+            config = get_config()
+            return config.get("configurable", {}).get("thread_id")
+        except (RuntimeError, KeyError):
+            return None
+
+    @staticmethod
+    def _download_for_copy(
+        be: BackendProtocol,
+        paths: list[VirtualPath],
+        thread_id: str | None,
+    ) -> list[DownloadFileResult]:
+        """Return ``be.download_files(paths)``, forwarding *thread_id*
+        when *be* is :class:`ThreadAwareWorkspace` and *thread_id* is set."""
+        if isinstance(be, ThreadAwareWorkspace) and thread_id is not None:
+            return list(be.download_files(paths, thread_id=thread_id))
+        return list(be.download_files(paths))
+
+    @staticmethod
+    def _upload_for_copy(
+        be: BackendProtocol,
+        files: list[tuple[VirtualPath, bytes]],
+        thread_id: str | None,
+    ) -> list[UploadFileResult]:
+        """Return ``be.upload_files(files)``, forwarding *thread_id*
+        when *be* is :class:`ThreadAwareWorkspace` and *thread_id* is set."""
+        if isinstance(be, ThreadAwareWorkspace) and thread_id is not None:
+            return list(be.upload_files(files, thread_id=thread_id))
+        return list(be.upload_files(files))
+
+    @staticmethod
+    async def _adownload_for_copy(
+        be: BackendProtocol,
+        paths: list[VirtualPath],
+        thread_id: str | None,
+    ) -> list[DownloadFileResult]:
+        """Async variant of :meth:`_download_for_copy`.
+
+        Uses ``be.adownload_files`` for non-thread-aware backends
+        (e.g. SshBackend's ``_async_lock`` path), and an explicit
+        ``asyncio.to_thread`` call with *thread_id* forwarding for
+        :class:`ThreadAwareWorkspace` backends.
+        """
+        if isinstance(be, ThreadAwareWorkspace) and thread_id is not None:
+            return list(await asyncio.to_thread(be.download_files, paths, thread_id=thread_id))
+        return list(await be.adownload_files(paths))
+
+    @staticmethod
+    async def _aupload_for_copy(
+        be: BackendProtocol,
+        files: list[tuple[VirtualPath, bytes]],
+        thread_id: str | None,
+    ) -> list[UploadFileResult]:
+        """Async variant of :meth:`_upload_for_copy`."""
+        if isinstance(be, ThreadAwareWorkspace) and thread_id is not None:
+            return list(await asyncio.to_thread(be.upload_files, files, thread_id=thread_id))
+        return list(await be.aupload_files(files))
+
+    # ------------------------------------------------------------------
+    # copy — cross-backend single-file copy
+    # ------------------------------------------------------------------
+
     def copy(self, source: VirtualPath, destination: VirtualPath) -> CopyResult:
         """Copy a single file, potentially across different backends.
 
@@ -847,6 +921,13 @@ class HybridWorkspaceBackend(ThreadAwareWorkspace):
         source backend, then writes to the destination via :meth:`upload_files`
         on the destination backend.  This correctly handles both text and
         binary files without going through the ``write(str)`` path.
+
+        Explicit *thread_id* is resolved and forwarded to
+        :class:`ThreadAwareWorkspace` backends so they use the **graph-out**
+        path.  This is critical: ``copy()`` runs in a daemon thread (via
+        ``_wrap_sync_with_timeout``), and calling the graph-in path
+        (Pregel ``read`` / ``send``) from that thread **deadlocks** because
+        the Pregel loop is already awaiting this tool call.
         """
         try:
             src_be, src_path = self._route(source)
@@ -857,8 +938,10 @@ class HybridWorkspaceBackend(ThreadAwareWorkspace):
         except (ValueError, TypeError) as e:
             return CopyResult(error=f"目标路径 '{destination}' 无效：{e}。仅可访问：{self._valid_paths_description()}")
 
+        tid = self._resolve_copy_thread_id()
+
         # Download source as raw bytes
-        dl_results = list(src_be.download_files([src_path]))
+        dl_results = self._download_for_copy(src_be, [src_path], tid)
         if not dl_results:
             return CopyResult(error=f"No result returned when reading '{source}'")
         dl = dl_results[0]
@@ -868,7 +951,7 @@ class HybridWorkspaceBackend(ThreadAwareWorkspace):
             return CopyResult(error=f"'{source}' is empty or unreadable")
 
         # Upload raw bytes to destination
-        ul_results = list(dst_be.upload_files([(dst_path, dl.content)]))
+        ul_results = self._upload_for_copy(dst_be, [(dst_path, dl.content)], tid)
         if not ul_results:
             return CopyResult(error=f"No result returned when writing '{destination}'")
         ul = ul_results[0]
@@ -878,8 +961,44 @@ class HybridWorkspaceBackend(ThreadAwareWorkspace):
         return CopyResult(source=source, destination=destination)
 
     async def acopy(self, source: VirtualPath, destination: VirtualPath) -> CopyResult:
-        """Async: Copy a single file across backends."""
-        return await asyncio.to_thread(self.copy, source, destination)
+        """Async: Copy a single file across backends.
+
+        Uses async download/upload when the backend provides them
+        (e.g. :class:`SshBackend` acquires ``_async_lock``), and
+        forwards *thread_id* to :class:`ThreadAwareWorkspace` backends
+        to avoid the same Pregel-channel deadlock described in
+        :meth:`copy`.
+        """
+        try:
+            src_be, src_path = self._route(source)
+        except (ValueError, TypeError) as e:
+            return CopyResult(error=f"源路径 '{source}' 无效：{e}。仅可访问：{self._valid_paths_description()}")
+        try:
+            dst_be, dst_path = self._route(destination)
+        except (ValueError, TypeError) as e:
+            return CopyResult(error=f"目标路径 '{destination}' 无效：{e}。仅可访问：{self._valid_paths_description()}")
+
+        tid = self._resolve_copy_thread_id()
+
+        # Download source as raw bytes (async)
+        dl_results = await self._adownload_for_copy(src_be, [src_path], tid)
+        if not dl_results:
+            return CopyResult(error=f"No result returned when reading '{source}'")
+        dl = dl_results[0]
+        if dl.error:
+            return CopyResult(error=f"Failed to read '{source}': {dl.error}")
+        if dl.content is None:
+            return CopyResult(error=f"'{source}' is empty or unreadable")
+
+        # Upload raw bytes to destination (async)
+        ul_results = await self._aupload_for_copy(dst_be, [(dst_path, dl.content)], tid)
+        if not ul_results:
+            return CopyResult(error=f"No result returned when writing '{destination}'")
+        ul = ul_results[0]
+        if ul.error:
+            return CopyResult(error=f"Failed to write '{destination}': {ul.error}")
+
+        return CopyResult(source=source, destination=destination)
 
     # ------------------------------------------------------------------
     # Developer API — upload / download (split by prefix)

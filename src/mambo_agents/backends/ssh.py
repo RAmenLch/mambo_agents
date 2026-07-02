@@ -325,7 +325,12 @@ class SshBackend(BackendProtocol):
 
         # Hard-timeout watchdog: force-close the channel after *t* seconds
         # even if SSH keep-alive traffic prevents socket.timeout from firing.
+        # Uses threading.Event so the main thread can detect when the hard
+        # timer has fired even if recv_exit_status() returns without raising.
+        _timed_out = threading.Event()
+
         def _close_channel() -> None:
+            _timed_out.set()
             try:
                 channel.close()
             except Exception:
@@ -359,6 +364,7 @@ class SshBackend(BackendProtocol):
             try:
                 exit_code = channel.recv_exit_status()
             except socket.timeout:
+                _timed_out.set()
                 channel.close()
                 # Give drain threads a brief window to collect partial data
                 out_thread.join(timeout=3)
@@ -366,10 +372,21 @@ class SshBackend(BackendProtocol):
                 partial_out = b"".join(out_chunks).decode(errors="replace")
                 partial_err = b"".join(err_chunks).decode(errors="replace")
                 hint = f"\n(stderr) {partial_err}" if partial_err.strip() else ""
-                return (partial_out, f"Command timed out after {t}s.{hint}", -1)
+                return (partial_out, f"Timeout: command exceeded {t} seconds.{hint}", -1)
             except Exception as exc:
                 channel.close()
                 return ("", f"Command execution error: {exc}", -1)
+
+            # Check if hard timer fired (channel was force-closed → recv_exit_status()
+            # returns -1 without raising).  Must be checked BEFORE the finally block
+            # cancels the timer.
+            if _timed_out.is_set():
+                out_thread.join(timeout=3)
+                err_thread.join(timeout=3)
+                partial_out = b"".join(out_chunks).decode(errors="replace")
+                partial_err = b"".join(err_chunks).decode(errors="replace")
+                hint = f"\n(stderr) {partial_err}" if partial_err.strip() else ""
+                return (partial_out, f"Timeout: command exceeded {t} seconds.{hint}", -1)
         finally:
             _hard_timer.cancel()
 
@@ -1329,6 +1346,16 @@ class SshBackend(BackendProtocol):
         except WorkspacePathError as e:
             return str(e)
 
+        # Check if path exists and is a directory (T1 & T2 fix)
+        try:
+            st_mode = self._sftp.stat(remote).st_mode
+            if not self._attr_is_dir_maybe(st_mode):
+                return f"'{path}' is a file, not a directory"
+        except FileNotFoundError:
+            return f"Path '{path}' not found"
+        except OSError as e:
+            return f"Cannot access '{path}': {e}"
+
         if self._has_python3:
             out, err, exit_code = self._tree_python(remote, depth)
         else:
@@ -1605,9 +1632,15 @@ class SshBackend(BackendProtocol):
         output_parts: list[str] = []
         if out:
             output_parts.append(out.rstrip())
+
+        # Timeout message: display prominently, not wrapped in [stderr]
+        is_timeout = exit_code == -1 and err.startswith("Timeout:")
         if err:
             for line in err.strip().split("\n"):
-                output_parts.append(f"[stderr] {line}")
+                if is_timeout:
+                    output_parts.append(line)
+                else:
+                    output_parts.append(f"[stderr] {line}")
 
         output = "\n".join(output_parts) if output_parts else "<no output>"
 

@@ -2,7 +2,7 @@
 
 These tests verify the core read/write/edit logic without requiring a
 real SSH server, focusing on edge cases the local-backend tests can't
-cover (e.g. bytes-returning SFTP, base64 fallback for binary files).
+cover (e.g. bytes-returning SFTP, non-UTF-8 decode errors).
 """
 
 from __future__ import annotations
@@ -185,8 +185,8 @@ class TestReadRaw:
         assert result.error is not None
         assert "not found" in result.error.lower()
 
-    def test_read_unicode_decode_error_fallback(self, ssh_backend):
-        """When UTF-8 decode fails, fall back to base64 encoding."""
+    def test_read_unicode_decode_error(self, ssh_backend):
+        """When UTF-8 decode fails on a non-multimedia file, return an error."""
         ssh_backend._sftp.stat.return_value = _sftp_file_stat()
         # Non-UTF-8 bytes that can't be decoded as UTF-8
         raw_bytes = b"\x80\x81\x82\x83"
@@ -194,8 +194,9 @@ class TestReadRaw:
 
         result = ssh_backend.read_raw(VirtualPath(f"{_W}/broken.txt"))
 
-        assert result.encoding == "base64"
-        assert result.content == base64.b64encode(raw_bytes).decode("ascii")
+        assert result.error is not None
+        assert "not a recognized text or multimedia format" in result.error
+        assert result.content is None
 
     def test_read_empty_file(self, ssh_backend):
         """Empty text file should return empty content, not an error."""
