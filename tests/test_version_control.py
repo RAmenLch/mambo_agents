@@ -12,7 +12,7 @@ import pytest
 from langgraph.config import get_config
 from langgraph.prebuilt.tool_node import ToolCallRequest
 
-from mambo_agents.backends.schemas import ReadResult, VirtualPath
+from mambo_agents.backends.schemas import BackendError, ErrorCode, ReadResult, VirtualPath
 from mambo_agents.middleware.version_control import (
     VersionControlConfig,
     VersionControlMiddleware,
@@ -371,7 +371,7 @@ class TestBackup:
         """If read_raw returns an error, no backup."""
         backend = _make_mock_backend()
         backend.read_raw.return_value = ReadResult(
-            error="file not found",
+            error=BackendError(code=ErrorCode.NOT_FOUND, message="file not found"),
             content=None,
         )
 

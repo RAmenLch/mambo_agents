@@ -38,7 +38,6 @@ from mambo_agents.backends.protocol import (
     ToolTimeoutError,
     ToolTimeouts,
     UploadFileResult,
-    WorkspacePathError,
     WriteResult,
     _get_file_type,
     _get_mime_type,
@@ -50,7 +49,7 @@ from mambo_agents.backends.utils import (
     format_validation_error,
     format_with_line_numbers,
 )
-from mambo_agents.backends.schemas import human_size,VirtualPath,DeleteResult
+from mambo_agents.backends.schemas import BackendError, DeleteResult, ErrorCode, VirtualPath, human_size
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -287,9 +286,10 @@ class SshBackend(BackendProtocol):
 
         # Must start with workspace root
         if v != wr and not v.startswith(wr + "/"):
-            raise WorkspacePathError(
-                f"Path '{path}' is outside the workspace. "
-                f"All file paths must be under '{wr}'."
+            raise BackendError(
+                code=ErrorCode.OUTSIDE_WORKSPACE,
+                path=path,
+                message=f"路径超出工作区，所有文件操作必须在 '{wr}/' 下进行",
             )
 
         rel = v[len(wr):].lstrip("/")
@@ -504,17 +504,17 @@ class SshBackend(BackendProtocol):
         """
         try:
             remote = self._resolve(path)
-        except WorkspacePathError as e:
-            return LsResult(error=str(e))
+        except BackendError as e:
+            return LsResult(error=e)
         try:
             st_mode = self._sftp.stat(remote).st_mode
             if not self._attr_is_dir_maybe(st_mode):
-                return LsResult(error=f"'{path}' is a file, not a directory")
+                return LsResult(error=BackendError(code=ErrorCode.NOT_DIR, path=path, message="目标是文件，不是目录"))
             attrs = self._sftp.listdir_attr(remote)
         except FileNotFoundError:
-            return LsResult(error=f"Path '{path}' not found")
+            return LsResult(error=BackendError(code=ErrorCode.NOT_FOUND, path=path, message="路径不存在"))
         except OSError as e:
-            return LsResult(error=f"Cannot access '{path}': {e}")
+            return LsResult(error=BackendError(code=ErrorCode.OS_ERROR, path=path, message=str(e)))
 
         infos: list[FileInfo] = []
         # Sort: directories first, then by name
@@ -557,16 +557,16 @@ class SshBackend(BackendProtocol):
     ) -> ReadResult:
         try:
             remote = self._resolve(file_path)
-        except WorkspacePathError as e:
-            return ReadResult(error=str(e))
+        except BackendError as e:
+            return ReadResult(error=e)
         try:
             is_dir = self._sftp.stat(remote).st_mode
             if self._attr_is_dir_maybe(is_dir):
-                return ReadResult(error=f"'{file_path}' is a directory")
+                return ReadResult(error=BackendError(code=ErrorCode.IS_DIR, path=file_path, message="目标是目录"))
         except FileNotFoundError:
-            return ReadResult(error=f"File '{file_path}' not found")
+            return ReadResult(error=BackendError(code=ErrorCode.NOT_FOUND, path=file_path, message="文件不存在"))
         except OSError as e:
-            return ReadResult(error=f"Error accessing '{file_path}': {e}")
+            return ReadResult(error=BackendError(code=ErrorCode.OS_ERROR, path=file_path, message=str(e)))
 
         file_type = _get_file_type(file_path.value)
         mime_type = _get_mime_type(file_path.value)
@@ -576,7 +576,7 @@ class SshBackend(BackendProtocol):
                 with self._sftp.open(remote, "rb") as f:
                     raw = f.read()
             except OSError as e:
-                return ReadResult(error=f"Error reading '{file_path}': {e}")
+                return ReadResult(error=BackendError(code=ErrorCode.IO_ERROR, path=file_path, message=str(e)))
             encoded = base64.b64encode(raw).decode("ascii")
             return ReadResult(
                 content=encoded,
@@ -595,17 +595,17 @@ class SshBackend(BackendProtocol):
                 content = f.read().decode("utf-8")
         except UnicodeDecodeError:
             return ReadResult(
-                error=f"Cannot read '{file_path}': not a recognized text or multimedia format",
+                error=BackendError(code=ErrorCode.INVALID, path=file_path, message="无法读取，不是可识别的文本或多媒体格式"),
             )
         except OSError as e:
-            return ReadResult(error=f"Error reading '{file_path}': {e}")
+            return ReadResult(error=BackendError(code=ErrorCode.IO_ERROR, path=file_path, message=str(e)))
 
         lines = content.splitlines(keepends=True)
         total = len(lines)
 
         if total > 0 and offset >= total:
             return ReadResult(
-                error=f"Line offset {offset} exceeds file length ({total} lines)",
+                error=BackendError(code=ErrorCode.INVALID, path=file_path, message=f"偏移量 {offset} 超过文件长度({total} 行)"),
             )
 
         sliced = lines[offset : offset + limit] if limit is not None else lines[offset:]
@@ -635,22 +635,19 @@ class SshBackend(BackendProtocol):
     ) -> WriteResult:
         if not self._check_edit_allowed(file_path):
             return WriteResult(
-                error=(
-                    f"Path '{file_path}' is not allowed for write. "
-                    "Check edit_whitelist / edit_blacklist."
-                ),
+                error=BackendError(code=ErrorCode.EDIT_NOT_ALLOWED, path=file_path, message="路径不允许写入"),
             )
         try:
             remote = self._resolve(file_path)
-        except WorkspacePathError as e:
-            return WriteResult(error=str(e))
+        except BackendError as e:
+            return WriteResult(error=e)
 
         # Check if it's a directory
         try:
             st_mode = self._sftp.stat(remote).st_mode
             if self._attr_is_dir_maybe(st_mode):
                 return WriteResult(
-                    error=f"'{file_path}' is a directory, cannot write to it"
+                    error=BackendError(code=ErrorCode.IS_DIR, path=file_path, message="目标是目录，无法写入"),
                 )
         except FileNotFoundError:
             pass  # Doesn't exist yet – fine for write
@@ -664,11 +661,7 @@ class SshBackend(BackendProtocol):
 
         if exists and not overwrite:
             return WriteResult(
-                error=(
-                    f"Cannot write '{file_path}': file already exists. "
-                    "Read the file and use edit() to modify it, "
-                    "or use overwrite=True to replace the file."
-                ),
+                error=BackendError(code=ErrorCode.ALREADY_EXISTS, path=file_path, message="文件已存在，请用 edit() 修改或用 overwrite=True 覆盖"),
             )
 
         # Ensure parent directories exist
@@ -678,7 +671,7 @@ class SshBackend(BackendProtocol):
             with self._sftp.open(remote, "w") as f:
                 f.write(content)
         except OSError as e:
-            return WriteResult(error=f"Error writing '{file_path}': {e}")
+            return WriteResult(error=BackendError(code=ErrorCode.IO_ERROR, path=file_path, message=str(e)))
 
         return WriteResult(path=file_path)
 
@@ -713,31 +706,29 @@ class SshBackend(BackendProtocol):
         replace → upload.
         """
         if not old_str:
-            return EditResult(error="old_str must not be empty")
+            return EditResult(error=BackendError(code=ErrorCode.INVALID, message="old_str 不能为空"))
         if not self._check_edit_allowed(file_path):
             return EditResult(
-                error=(
-                    f"Path '{file_path}' is not allowed for edit. "
-                    "Check edit_whitelist / edit_blacklist."
-                ),
+                error=BackendError(code=ErrorCode.EDIT_NOT_ALLOWED, path=file_path, message="路径不允许编辑"),
             )
         try:
             remote = self._resolve(file_path)
-        except WorkspacePathError as e:
-            return EditResult(error=str(e))
+        except BackendError as e:
+            return EditResult(error=e)
 
         # Check if path exists and is not a directory
         try:
             st_mode = self._sftp.stat(remote).st_mode
             if self._attr_is_dir_maybe(st_mode):
                 return EditResult(
-                    error=f"'{file_path}' is a directory, cannot edit it"
+                    error=BackendError(code=ErrorCode.IS_DIR, path=file_path, message="目标是目录，无法编辑"),
                 )
         except FileNotFoundError:
             return EditResult(
-                error=(
-                    f"Cannot edit '{file_path}': file not found. "
-                    "To create a new file, use write()."
+                error=BackendError(
+                    code=ErrorCode.NOT_FOUND,
+                    path=file_path,
+                    message=f"Cannot edit '{file_path}': file not found. To create a new file, use write().",
                 ),
             )
 
@@ -752,7 +743,7 @@ class SshBackend(BackendProtocol):
 
     def _edit_remote(
         self,
-        file_path: str,
+        file_path: VirtualPath,
         remote: str,
         old_str: str,
         new_str: str,
@@ -788,35 +779,24 @@ class SshBackend(BackendProtocol):
         out, err, exit_code = self._exec(cmd)
 
         if exit_code != 0:
-            return EditResult(error=f"Edit failed (exit {exit_code}): {err or out}")
+            return EditResult(error=BackendError(code=ErrorCode.IO_ERROR, path=file_path, message=f"编辑失败(exit {exit_code}): {err or out}"))
 
         try:
             occurrences = int(out.strip())
         except ValueError:
-            return EditResult(error=f"Edit failed: unexpected output: {out or err}")
+            return EditResult(error=BackendError(code=ErrorCode.INVALID, path=file_path, message=f"编辑返回异常: {out or err}"))
 
         if occurrences == 0:
-            return EditResult(
-                error=(
-                    f"Cannot edit '{file_path}': old_str not found in file. "
-                    "Read the file first to see its exact content."
-                ),
-            )
+            return EditResult(error=BackendError(code=ErrorCode.OLD_STR_NOT_FOUND, path=file_path, message="未找到要替换的文本"))
 
         if occurrences > 1 and not replace_all:
-            return EditResult(
-                error=(
-                    f"Cannot edit '{file_path}': old_str appears {occurrences} times "
-                    f"in the file. Use replace_all=True to replace all occurrences, "
-                    f"or provide a more specific old_str with surrounding context."
-                ),
-            )
+            return EditResult(error=BackendError(code=ErrorCode.MULTI_OCCURRENCES, path=file_path, message=f"匹配到 {occurrences} 处"))
 
         return EditResult(path=file_path, occurrences=occurrences)
 
     def _edit_via_sftp(
         self,
-        file_path: str,
+        file_path: VirtualPath,
         remote: str,
         old_str: str,
         new_str: str,
@@ -828,31 +808,21 @@ class SshBackend(BackendProtocol):
                 content = f.read().decode("utf-8")
         except UnicodeDecodeError:
             return EditResult(
-                error=(
-                    f"Cannot edit '{file_path}': file is not valid UTF-8. "
-                    "Binary file edits require python3 on the remote server."
-                ),
+                error=BackendError(code=ErrorCode.INVALID, path=file_path, message="文件不是有效 UTF-8"),
             )
         except OSError as e:
-            return EditResult(error=f"Error reading '{file_path}' for edit: {e}")
+            return EditResult(error=BackendError(code=ErrorCode.IO_ERROR, path=file_path, message=str(e)))
 
         occurrences = content.count(old_str)
 
         if occurrences == 0:
             return EditResult(
-                error=(
-                    f"Cannot edit '{file_path}': old_str not found in file. "
-                    "Read the file first to see its exact content."
-                ),
+                error=BackendError(code=ErrorCode.OLD_STR_NOT_FOUND, path=file_path, message="未找到要替换的文本"),
             )
 
         if occurrences > 1 and not replace_all:
             return EditResult(
-                error=(
-                    f"Cannot edit '{file_path}': old_str appears {occurrences} times "
-                    f"in the file. Use replace_all=True to replace all occurrences, "
-                    f"or provide a more specific old_str with surrounding context."
-                ),
+                error=BackendError(code=ErrorCode.MULTI_OCCURRENCES, path=file_path, message=f"匹配到 {occurrences} 处"),
             )
 
         new_content = content.replace(old_str, new_str, -1 if replace_all else 1)
@@ -861,7 +831,7 @@ class SshBackend(BackendProtocol):
             with self._sftp.open(remote, "w") as f:
                 f.write(new_content)
         except OSError as e:
-            return EditResult(error=f"Error writing '{file_path}' for edit: {e}")
+            return EditResult(error=BackendError(code=ErrorCode.IO_ERROR, path=file_path, message=str(e)))
 
         return EditResult(path=file_path, occurrences=occurrences)
 
@@ -896,17 +866,17 @@ class SshBackend(BackendProtocol):
     def _grep_raw(
         self,
         pattern: str,
-        path: str = "/workspace",
+        path: VirtualPath = VirtualPath("/workspace"),
         glob: str | None = None,
         regex: bool = False,
     ) -> GrepResult:
         """Collect raw grep matches without offset/limit truncation."""
         if not pattern:
-            return GrepResult(error="pattern must not be empty")
+            return GrepResult(error=BackendError(code=ErrorCode.INVALID, message="搜索模式不能为空"))
         try:
             remote = self._resolve(path)
-        except WorkspacePathError as e:
-            return GrepResult(error=str(e))
+        except BackendError as e:
+            return GrepResult(error=e)
         remote_escaped = shlex.quote(remote)
         pattern_escaped = shlex.quote(pattern)
 
@@ -1053,12 +1023,12 @@ class SshBackend(BackendProtocol):
         out, err, exit_code = self._exec(cmd, timeout=60)
 
         if exit_code != 0:
-            return GrepResult(error=f"grep error (exit {exit_code}): {err or out}")
+            return GrepResult(error=BackendError(code=ErrorCode.IO_ERROR, message=f"grep 错误(exit {exit_code}): {err or out}"))
 
         try:
             data = _json.loads(out.strip())
         except _json.JSONDecodeError:
-            return GrepResult(error=f"grep: unexpected output: {out[:200]}")
+            return GrepResult(error=BackendError(code=ErrorCode.INVALID, message=f"grep 返回异常: {out[:200]}"))
 
         matches: list[GrepMatch] = []
         for item in data:
@@ -1098,7 +1068,7 @@ class SshBackend(BackendProtocol):
         # grep exit codes: 0 = matches, 1 = no matches, >1 = errors in some files
         if not out.strip():
             if exit_code > 1 and err.strip():
-                return GrepResult(error=f"grep error: {err.strip()}")
+                return GrepResult(error=BackendError(code=ErrorCode.IO_ERROR, message=f"grep 错误: {err.strip()}"))
             return GrepResult(matches=[])
 
         matches: list[GrepMatch] = []
@@ -1159,16 +1129,16 @@ class SshBackend(BackendProtocol):
         """
         try:
             remote = self._resolve(path)
-        except WorkspacePathError as e:
-            return GlobResult(error=str(e))
+        except BackendError as e:
+            return GlobResult(error=e)
 
         # Check that path is a directory
         try:
             st_mode = self._sftp.stat(remote).st_mode
             if not self._attr_is_dir_maybe(st_mode):
-                return GlobResult(error=f"'{path}' is a file, not a directory")
+                return GlobResult(error=BackendError(code=ErrorCode.NOT_DIR, path=path, message="目标是文件，不是目录"))
         except FileNotFoundError:
-            return GlobResult(error=f"Path '{path}' not found")
+            return GlobResult(error=BackendError(code=ErrorCode.NOT_FOUND, path=path, message="路径不存在"))
 
         if self._has_python3:
             return self._glob_python(pattern, remote)
@@ -1216,15 +1186,15 @@ class SshBackend(BackendProtocol):
         out, err, exit_code = self._exec(cmd, timeout=60)
 
         if exit_code != 0:
-            return GlobResult(error=f"glob error (exit {exit_code}): {err or out}")
+            return GlobResult(error=BackendError(code=ErrorCode.IO_ERROR, message=f"glob 错误(exit {exit_code}): {err or out}"))
 
         try:
             data = _json.loads(out.strip())
         except _json.JSONDecodeError:
-            return GlobResult(error=f"glob: unexpected output: {out[:200]}")
+            return GlobResult(error=BackendError(code=ErrorCode.INVALID, message=f"glob 返回异常: {out[:200]}"))
 
         if isinstance(data, dict) and "error" in data:
-            return GlobResult(error=data["error"])
+            return GlobResult(error=BackendError(code=ErrorCode.IO_ERROR, message=str(data["error"])))
 
         matches: list[FileInfo] = []
         for item in data:
@@ -1299,7 +1269,7 @@ class SshBackend(BackendProtocol):
 
         out, err, exit_code = self._exec(cmd, timeout=60)
         if exit_code > 1:
-            return GlobResult(error=f"glob error: {err}")
+            return GlobResult(error=BackendError(code=ErrorCode.IO_ERROR, message=f"glob 错误: {err}"))
 
         matches: list[FileInfo] = []
         for line in out.splitlines():
@@ -1343,7 +1313,7 @@ class SshBackend(BackendProtocol):
         """
         try:
             remote = self._resolve(path)
-        except WorkspacePathError as e:
+        except BackendError as e:
             return str(e)
 
         # Check if path exists and is a directory (T1 & T2 fix)
@@ -1560,36 +1530,34 @@ class SshBackend(BackendProtocol):
         """
         if not self._check_edit_allowed(path):
             return DeleteResult(
-                error=f"Path '{path}' is not allowed for delete. "
-                "Check edit_whitelist / edit_blacklist.",
+                error=BackendError(code=ErrorCode.EDIT_NOT_ALLOWED, path=path, message="路径不允许删除"),
                 path=path,
             )
         try:
             remote = self._resolve(path)
-        except WorkspacePathError as e:
-            return DeleteResult(error=str(e), path=path)
+        except BackendError as e:
+            return DeleteResult(error=e, path=path)
 
         # Safety: refuse to delete the remote root
         if remote.rstrip("/") == self._remote_root.rstrip("/"):
-            return DeleteResult(error="cannot delete root working directory.", path=path)
+            return DeleteResult(error=BackendError(code=ErrorCode.INVALID, path=path, message="不能删除根工作目录"), path=path)
 
         # Reject directories
         try:
             st_mode = self._sftp.stat(remote).st_mode
             if self._attr_is_dir_maybe(st_mode):
                 return DeleteResult(
-                    error=f"'{path}' is a directory. "
-                    f"The delete tool only removes single files. ",
+                    error=BackendError(code=ErrorCode.IS_DIR, path=path, message="目标是目录，delete 工具只能删除单个文件"),
                     path=path,
                 )
         except FileNotFoundError:
-            return DeleteResult(error=f"path '{path}' does not exist.", path=path)
+            return DeleteResult(error=BackendError(code=ErrorCode.NOT_FOUND, path=path, message="路径不存在"), path=path)
 
         remote_escaped = shlex.quote(remote)
         out, err, exit_code = self._exec(f"rm -f {remote_escaped}")
 
         if exit_code != 0:
-            return DeleteResult(error=f"deleting '{path}': {err or out}", path=path)
+            return DeleteResult(error=BackendError(code=ErrorCode.IO_ERROR, path=path, message=err or out), path=path)
 
         return DeleteResult(path=path)
 
@@ -1659,13 +1627,13 @@ class SshBackend(BackendProtocol):
     # paramiko Transport deadlocks when ToolNode runs tools in parallel.
     # ------------------------------------------------------------------
 
-    async def als(self, path: str) -> LsResult:
+    async def als(self, path: VirtualPath) -> LsResult:
         async with self._async_lock:
             return await asyncio.to_thread(self.ls, path)
 
     async def aread(
         self,
-        file_path: str,
+        file_path: VirtualPath,
         offset: int = 0,
         limit: int = 2000,
         include_line_numbers: bool = False,
@@ -1676,14 +1644,14 @@ class SshBackend(BackendProtocol):
             )
 
     async def awrite(
-        self, file_path: str, content: str, overwrite: bool = False,
+        self, file_path: VirtualPath, content: str, overwrite: bool = False,
     ) -> WriteResult:
         async with self._async_lock:
             return await asyncio.to_thread(self.write, file_path, content, overwrite)
 
     async def aedit(
         self,
-        file_path: str,
+        file_path: VirtualPath,
         old_str: str,
         new_str: str,
         *,
@@ -1697,7 +1665,7 @@ class SshBackend(BackendProtocol):
     async def agrep(
         self,
         pattern: str,
-        path: str = "/workspace",
+        path: VirtualPath = VirtualPath("/workspace"),
         glob: str | None = None,
         regex: bool = False,
         offset: int = 0,
@@ -1706,15 +1674,15 @@ class SshBackend(BackendProtocol):
         async with self._async_lock:
             return await asyncio.to_thread(self.grep, pattern, path, glob, regex, offset, limit)
 
-    async def aglob(self, pattern: str, path: str = "/workspace") -> GlobResult:
+    async def aglob(self, pattern: str, path: VirtualPath = VirtualPath("/workspace")) -> GlobResult:
         async with self._async_lock:
             return await asyncio.to_thread(self.glob, pattern, path)
 
-    async def atree(self, path: str = "/", depth: int = 3) -> str:
+    async def atree(self, path: VirtualPath = VirtualPath("/workspace"), depth: int = 3) -> str:
         async with self._async_lock:
             return await asyncio.to_thread(self.tree, path, depth)
 
-    async def adelete(self, path: str) -> DeleteResult:
+    async def adelete(self, path: VirtualPath) -> DeleteResult:
         async with self._async_lock:
             return await asyncio.to_thread(self.delete, path)
 
@@ -1763,11 +1731,11 @@ class SshBackend(BackendProtocol):
                     f.write(raw_content)
                 results.append(UploadFileResult(path=path))
             except OSError as e:
-                results.append(UploadFileResult(path=path, error=str(e)))
+                results.append(UploadFileResult(path=path, error=BackendError(code=ErrorCode.IO_ERROR, path=path, message=str(e))))
             except Exception as e:
                 results.append(
                     UploadFileResult(
-                        path=path, error=f"{type(e).__name__}: {e}"
+                        path=path, error=BackendError(code=ErrorCode.INVALID, path=path, message=f"{type(e).__name__}: {e}")
                     )
                 )
         return results
@@ -1786,7 +1754,7 @@ class SshBackend(BackendProtocol):
                 except FileNotFoundError:
                     results.append(
                         DownloadFileResult(
-                            path=path, content=None, error="file_not_found"
+                            path=path, content=None, error=BackendError(code=ErrorCode.NOT_FOUND, path=path, message="文件不存在")
                         )
                     )
                     continue
@@ -1794,7 +1762,7 @@ class SshBackend(BackendProtocol):
                 if self._attr_is_dir_maybe(attr.st_mode):
                     results.append(
                         DownloadFileResult(
-                            path=path, content=None, error="is_directory"
+                            path=path, content=None, error=BackendError(code=ErrorCode.IS_DIR, path=path, message="目标是目录")
                         )
                     )
                     continue
@@ -1806,14 +1774,14 @@ class SshBackend(BackendProtocol):
                 )
             except OSError as e:
                 results.append(
-                    DownloadFileResult(path=path.value, content=None, error=str(e))
+                    DownloadFileResult(path=path, content=None, error=BackendError(code=ErrorCode.IO_ERROR, path=path, message=str(e)))
                 )
             except Exception as e:
                 results.append(
                     DownloadFileResult(
                         path=path,
                         content=None,
-                        error=f"{type(e).__name__}: {e}",
+                        error=BackendError(code=ErrorCode.INVALID, path=path, message=f"{type(e).__name__}: {e}"),
                     )
                 )
         return results

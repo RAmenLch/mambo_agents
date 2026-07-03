@@ -52,7 +52,7 @@ class TestStateBackend:
             backend.write(VirtualPath("/workspace/a.txt"), "original")
             r = backend.write(VirtualPath("/workspace/a.txt"), "modified")
         assert r.error is not None
-        assert "already exists" in (r.error or "")
+        assert "已存在" in str(r.error)
 
     def test_edit_replaces_text(self):
         """Edit replaces the matched old_str with new_str."""
@@ -72,7 +72,7 @@ class TestStateBackend:
             backend.write(VirtualPath("/workspace/code.py"), "hello world")
             r = backend.edit(VirtualPath("/workspace/code.py"), "not there", "replacement")
         assert r.error is not None
-        assert "old_str not found" in (r.error or "")
+        assert "未找到" in str(r.error)
 
     def test_edit_file_not_found(self):
         """Edit fails if file doesn't exist."""
@@ -80,7 +80,7 @@ class TestStateBackend:
         with _simulate_graph(backend):
             r = backend.edit(VirtualPath("/workspace/no_file.py"), "something", "x")
         assert r.error is not None
-        assert "file not found" in (r.error or "")
+        assert "不存在" in str(r.error)
 
     def test_ls_shows_files(self):
         backend = StateBackend()
@@ -143,7 +143,7 @@ class TestStateBackend:
         with _simulate_graph(backend):
             result = backend.read(VirtualPath("/workspace/nonexistent.txt"))
         assert result.error is not None
-        assert "not found" in result.error
+        assert "不存在" in str(result.error)
 
 
 # ---------------------------------------------------------------------------

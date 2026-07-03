@@ -33,10 +33,8 @@ from mambo_agents.backends.protocol import (
     LsResult,
     ReadResult,
     ReadSummarizer,
-    ToolTimeoutError,
     ToolTimeouts,
     UploadFileResult,
-    WorkspacePathError,
     WriteResult,
     _get_file_type,
     _get_mime_type,
@@ -49,7 +47,7 @@ from mambo_agents.backends.utils import (
     format_validation_error,
     format_with_line_numbers,
 )
-from mambo_agents.backends.schemas import VirtualPath,human_size,DeleteResult
+from mambo_agents.backends.schemas import BackendError, DeleteResult, ErrorCode, VirtualPath, human_size
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -270,7 +268,7 @@ class LocalBackend(BackendProtocol):
 
         Validates that *path* is under :attr:`workspace_root` and strips
         the prefix before resolving against ``_cwd``.  Raises
-        :class:`WorkspacePathError` for paths outside the workspace.
+        :class:`~mambo_agents.backends.schemas.BackendError` for paths outside the workspace.
 
         VirtualPath already validates on construction (no ``..``, no
         ``//``, absolute, non-empty), so no additional traversal checks
@@ -281,9 +279,10 @@ class LocalBackend(BackendProtocol):
 
         # Must start with workspace root
         if v != wr and not v.startswith(wr + "/"):
-            raise WorkspacePathError(
-                f"Path '{path}' is outside the workspace. "
-                f"All file paths must be under '{wr}'."
+            raise BackendError(
+                code=ErrorCode.OUTSIDE_WORKSPACE,
+                path=path,
+                message=f"路径超出工作区，所有文件操作必须在 '{wr}/' 下进行",
             )
 
         rel = v[len(wr):].lstrip("/")
@@ -296,8 +295,10 @@ class LocalBackend(BackendProtocol):
         try:
             resolved.relative_to(self._cwd)
         except ValueError:
-            raise WorkspacePathError(
-                f"Path '{path}' resolves outside the working directory via symlink."
+            raise BackendError(
+                code=ErrorCode.SYMLINK_ESCAPE,
+                path=path,
+                message="路径通过符号链接解析到工作区外部",
             ) from None
 
         return resolved
@@ -317,15 +318,15 @@ class LocalBackend(BackendProtocol):
     def ls(self, path: VirtualPath) -> LsResult:
         try:
             resolved = self._resolve(path)
-        except WorkspacePathError as e:
-            return LsResult(error=str(e))
+        except BackendError as e:
+            return LsResult(error=e)
         try:
             if not resolved.exists():
-                return LsResult(error=f"Path '{path}' not found")
+                return LsResult(error=BackendError(code=ErrorCode.NOT_FOUND, path=path, message="路径不存在"))
             if not resolved.is_dir():
-                return LsResult(error=f"'{path}' is a file, not a directory")
+                return LsResult(error=BackendError(code=ErrorCode.NOT_DIR, path=path, message="目标是文件，不是目录"))
         except OSError as e:
-            return LsResult(error=f"Cannot access '{path}': {e}")
+            return LsResult(error=BackendError(code=ErrorCode.OS_ERROR, path=path, message=str(e)))
 
         wr = self.workspace_root.value
         infos: list[FileInfo] = []
@@ -358,7 +359,7 @@ class LocalBackend(BackendProtocol):
         except OSError as e:
             errors.append(f"Listing aborted: {e}")
 
-        error_msg = "\n".join(errors) if errors else None
+        error_msg = BackendError(code=ErrorCode.IO_ERROR, message="\n".join(errors)) if errors else None
         return LsResult(error=error_msg, entries=infos)
 
     def read_raw(
@@ -370,15 +371,15 @@ class LocalBackend(BackendProtocol):
     ) -> ReadResult:
         try:
             resolved = self._resolve(file_path)
-        except WorkspacePathError as e:
-            return ReadResult(error=str(e))
+        except BackendError as e:
+            return ReadResult(error=e)
         try:
             if not resolved.exists():
-                return ReadResult(error=f"File '{file_path}' not found")
+                return ReadResult(error=BackendError(code=ErrorCode.NOT_FOUND, path=file_path, message="文件不存在"))
             if resolved.is_dir():
-                return ReadResult(error=f"'{file_path}' is a directory")
+                return ReadResult(error=BackendError(code=ErrorCode.IS_DIR, path=file_path, message="目标是目录"))
         except OSError as e:
-            return ReadResult(error=f"Error accessing '{file_path}': {e}")
+            return ReadResult(error=BackendError(code=ErrorCode.OS_ERROR, path=file_path, message=str(e)))
 
         _O_NOFOLLOW = getattr(os, "O_NOFOLLOW", 0)
 
@@ -388,7 +389,7 @@ class LocalBackend(BackendProtocol):
                 with os.fdopen(fd, "rb") as f:
                     raw = f.read()
             except OSError as e:
-                return ReadResult(error=f"Error reading '{file_path}': {e}")
+                return ReadResult(error=BackendError(code=ErrorCode.IO_ERROR, path=file_path, message=str(e)))
             encoded = base64.b64encode(raw).decode("ascii")
             return ReadResult(
                 content=encoded,
@@ -405,17 +406,17 @@ class LocalBackend(BackendProtocol):
                 content = f.read()
         except UnicodeDecodeError:
             return ReadResult(
-                error=f"Cannot read '{file_path}': not a recognized text or multimedia format",
+                error=BackendError(code=ErrorCode.INVALID, path=file_path, message="无法读取，不是可识别的文本或多媒体格式"),
             )
         except OSError as e:
-            return ReadResult(error=f"Error reading '{file_path}': {e}")
+            return ReadResult(error=BackendError(code=ErrorCode.IO_ERROR, path=file_path, message=str(e)))
 
         lines = content.splitlines(keepends=True)
         total = len(lines)
 
         if total > 0 and offset >= total:
             return ReadResult(
-                error=f"Line offset {offset} exceeds file length ({total} lines)",
+                error=BackendError(code=ErrorCode.INVALID, path=file_path, message=f"偏移量 {offset} 超过文件长度 ({total} 行)"),
             )
 
         sliced = lines[offset : offset + limit] if limit is not None else lines[offset:]
@@ -436,29 +437,22 @@ class LocalBackend(BackendProtocol):
     ) -> WriteResult:
         if not self._check_edit_allowed(file_path):
             return WriteResult(
-                error=(
-                    f"Path '{file_path}' is not allowed for write. "
-                    "Check edit_whitelist / edit_blacklist."
-                ),
+                error=BackendError(code=ErrorCode.EDIT_NOT_ALLOWED, path=file_path, message="路径不允许写入"),
             )
         try:
             resolved = self._resolve(file_path)
-        except WorkspacePathError as e:
-            return WriteResult(error=str(e))
+        except BackendError as e:
+            return WriteResult(error=e)
         try:
             if resolved.is_dir():
                 return WriteResult(
-                    error=f"'{file_path}' is a directory, cannot write to it"
+                    error=BackendError(code=ErrorCode.IS_DIR, path=file_path, message="目标是目录，无法写入"),
                 )
         except OSError as e:
-            return WriteResult(error=f"Error accessing '{file_path}': {e}")
+            return WriteResult(error=BackendError(code=ErrorCode.OS_ERROR, path=file_path, message=str(e)))
         if resolved.exists() and not overwrite:
             return WriteResult(
-                error=(
-                    f"Cannot write '{file_path}': file already exists. "
-                    "Read the file and use edit() to modify it, "
-                    "or use overwrite=True to replace the file."
-                ),
+                error=BackendError(code=ErrorCode.ALREADY_EXISTS, path=file_path, message="文件已存在，请用 edit() 修改或用 overwrite=True 覆盖"),
             )
 
         try:
@@ -469,9 +463,9 @@ class LocalBackend(BackendProtocol):
             with os.fdopen(fd, "w", encoding="utf-8", newline="") as f:
                 f.write(content)
         except OSError as e:
-            return WriteResult(error=f"Error writing '{file_path}': {e}")
+            return WriteResult(error=BackendError(code=ErrorCode.IO_ERROR, path=file_path, message=str(e)))
 
-        return WriteResult(path=file_path.value)
+        return WriteResult(path=file_path)
 
     def edit(
         self,
@@ -482,32 +476,26 @@ class LocalBackend(BackendProtocol):
         replace_all: bool = False,
     ) -> EditResult:
         if not old_str:
-            return EditResult(error="old_str must not be empty")
+            return EditResult(error=BackendError(code=ErrorCode.INVALID, message="old_str 不能为空"))
         if not self._check_edit_allowed(file_path):
             return EditResult(
-                error=(
-                    f"Path '{file_path}' is not allowed for edit. "
-                    "Check edit_whitelist / edit_blacklist."
-                ),
+                error=BackendError(code=ErrorCode.EDIT_NOT_ALLOWED, path=file_path, message="路径不允许编辑"),
             )
         try:
             resolved = self._resolve(file_path)
-        except WorkspacePathError as e:
-            return EditResult(error=str(e))
+        except BackendError as e:
+            return EditResult(error=e)
         try:
             if not resolved.exists():
                 return EditResult(
-                    error=(
-                        f"Cannot edit '{file_path}': file not found. "
-                        "To create a new file, use write()."
-                    ),
+                    error=BackendError(code=ErrorCode.NOT_FOUND, path=file_path, message="文件不存在，请用 write() 创建新文件"),
                 )
             if resolved.is_dir():
                 return EditResult(
-                    error=f"'{file_path}' is a directory, cannot edit it"
+                    error=BackendError(code=ErrorCode.IS_DIR, path=file_path, message="目标是目录，无法编辑"),
                 )
         except OSError as e:
-            return EditResult(error=f"Error accessing '{file_path}': {e}")
+            return EditResult(error=BackendError(code=ErrorCode.OS_ERROR, path=file_path, message=str(e)))
 
         _O_NOFOLLOW = getattr(os, "O_NOFOLLOW", 0)
         try:
@@ -515,7 +503,7 @@ class LocalBackend(BackendProtocol):
             with os.fdopen(fd, "r", encoding="utf-8") as f:
                 content = f.read()
         except OSError as e:
-            return EditResult(error=f"Error reading '{file_path}': {e}")
+            return EditResult(error=BackendError(code=ErrorCode.IO_ERROR, path=file_path, message=str(e)))
 
         # Normalize line endings in old_str / new_str so that LLM-provided
         # CRLF strings match files that were read as LF by Python text mode.
@@ -527,24 +515,17 @@ class LocalBackend(BackendProtocol):
         if occurrences == 0:
             # Detect trailing-newline mismatch
             mismatch = detect_trailing_newline_mismatch(
-                file_path, old_str, content,
+                old_str, content,
             )
             if mismatch is not None:
                 return mismatch
             return EditResult(
-                error=(
-                    f"Cannot edit '{file_path}': old_str not found in file. "
-                    "Read the file first to see its exact content."
-                ),
+                error=BackendError(code=ErrorCode.OLD_STR_NOT_FOUND, path=file_path, message="未找到要替换的文本，请先读文件确认内容"),
             )
 
         if occurrences > 1 and not replace_all:
             return EditResult(
-                error=(
-                    f"Cannot edit '{file_path}': old_str appears {occurrences} times "
-                    f"in the file. Use replace_all=True to replace all occurrences, "
-                    f"or provide a more specific old_str with surrounding context."
-                ),
+                error=BackendError(code=ErrorCode.MULTI_OCCURRENCES, path=file_path, message=f"匹配到 {occurrences} 处，请用 replace_all=True 替换全部或提供更精确的上下文"),
             )
 
         try:
@@ -553,9 +534,9 @@ class LocalBackend(BackendProtocol):
             with os.fdopen(fd, "w", encoding="utf-8", newline="") as f:
                 f.write(content.replace(old_str, new_str))
         except OSError as e:
-            return EditResult(error=f"Error writing '{file_path}': {e}")
+            return EditResult(error=BackendError(code=ErrorCode.IO_ERROR, path=file_path, message=str(e)))
 
-        return EditResult(path=file_path.value, occurrences=occurrences)
+        return EditResult(path=file_path, occurrences=occurrences)
 
     # ------------------------------------------------------------------
     # grep — ripgrep-first with Python fallback and file-size guard
@@ -571,16 +552,16 @@ class LocalBackend(BackendProtocol):
         limit: int | None = None,
     ) -> GrepResult:
         if not pattern:
-            return GrepResult(error="pattern must not be empty")
+            return GrepResult(error=BackendError(code=ErrorCode.INVALID, message="搜索模式不能为空"))
         try:
             resolved = self._resolve(path)
-        except WorkspacePathError as e:
-            return GrepResult(error=str(e))
+        except BackendError as e:
+            return GrepResult(error=e)
         try:
             if not resolved.exists():
-                return GrepResult(error=f"Path '{path}' not found")
+                return GrepResult(error=BackendError(code=ErrorCode.NOT_FOUND, path=path, message="路径不存在"))
         except OSError as e:
-            return GrepResult(error=f"Error accessing '{path}': {e}")
+            return GrepResult(error=BackendError(code=ErrorCode.OS_ERROR, path=path, message=str(e)))
 
         is_dir = resolved.is_dir()
         wr = self.workspace_root.value
@@ -616,7 +597,7 @@ class LocalBackend(BackendProtocol):
             else:
                 compiled = re.compile(re.escape(pattern))
         except re.error as e:
-            return GrepResult(error=f"Invalid regex pattern: {e}")
+            return GrepResult(error=BackendError(code=ErrorCode.INVALID, message=f"无效正则: {e}"))
 
         if not is_dir:
             # Single-file search
@@ -634,7 +615,7 @@ class LocalBackend(BackendProtocol):
             return self._apply_grep_limit(matches, offset, limit)
 
         search_dir = resolved
-        error_msg: str | None = None
+        error_msg: BackendError | None = None
         try:
             for fp in search_dir.rglob("*"):
                 if len(matches) >= self._max_grep_matches:
@@ -673,16 +654,17 @@ class LocalBackend(BackendProtocol):
         except OSError as e:
             result = self._apply_grep_limit(matches, offset, limit)
             return GrepResult(
-                error=f"Error during grep: {e}",
+                error=BackendError(code=ErrorCode.OS_ERROR, path=path, message=str(e)),
                 matches=result.matches,
                 truncated=result.truncated,
                 total_matches=result.total_matches,
             )
 
         if skipped:
-            error_msg = (
-                f"Skipped {skipped} file(s) exceeding "
-                f"{self._max_file_size_bytes // (1024 * 1024)} MB size limit"
+            error_msg = BackendError(
+                code=ErrorCode.FILE_TOO_LARGE,
+                path=path,
+                message=f"跳过 {skipped} 个大文件 (>{self._max_file_size_bytes // (1024 * 1024)} MB)",
             )
 
         result = self._apply_grep_limit(matches, offset, limit)
@@ -756,16 +738,16 @@ class LocalBackend(BackendProtocol):
     def glob(self, pattern: str, path: VirtualPath = VirtualPath("/workspace")) -> GlobResult:
         try:
             resolved = self._resolve(path)
-        except WorkspacePathError as e:
-            return GlobResult(error=str(e))
+        except BackendError as e:
+            return GlobResult(error=e)
 
         try:
             if not resolved.exists():
-                return GlobResult(error=f"Path '{path}' not found")
+                return GlobResult(error=BackendError(code=ErrorCode.NOT_FOUND, path=path, message="路径不存在"))
             if not resolved.is_dir():
-                return GlobResult(error=f"'{path}' is a file, not a directory")
+                return GlobResult(error=BackendError(code=ErrorCode.NOT_DIR, path=path, message="目标是文件，不是目录"))
         except OSError as e:
-            return GlobResult(error=f"Error accessing '{path}': {e}")
+            return GlobResult(error=BackendError(code=ErrorCode.OS_ERROR, path=path, message=str(e)))
 
         wr = self.workspace_root.value
         matches: list[FileInfo] = []
@@ -781,7 +763,7 @@ class LocalBackend(BackendProtocol):
                     virt_path = f"{wr}/{rel}"
                     st = fp.stat()
                 except OSError as e:
-                    errors.append(f"Cannot stat '{fp}': {e}")
+                    errors.append(f"无法获取文件信息 '{fp}': {e}")
                     continue
                 matches.append(FileInfo(
                     path=virt_path,
@@ -789,9 +771,9 @@ class LocalBackend(BackendProtocol):
                     size=st.st_size if not is_dir else 0,
                 ))
         except OSError as e:
-            errors.append(f"Glob aborted: {e}")
+            errors.append(f"Glob 搜索中断: {e}")
 
-        error_msg = "\n".join(errors) if errors else None
+        error_msg = BackendError(code=ErrorCode.IO_ERROR, message="\n".join(errors)) if errors else None
         return GlobResult(error=error_msg, matches=matches)
 
     # ------------------------------------------------------------------
@@ -810,7 +792,7 @@ class LocalBackend(BackendProtocol):
         """
         try:
             resolved = self._resolve(path)
-        except WorkspacePathError as e:
+        except BackendError as e:
             return str(e)
         if not resolved.exists():
             return f"Path '{path}' not found."
@@ -840,33 +822,31 @@ class LocalBackend(BackendProtocol):
         """
         if not self._check_edit_allowed(path):
             return DeleteResult(
-                error=f"Path '{path}' is not allowed for delete. "
-                "Check edit_whitelist / edit_blacklist.",
+                error=BackendError(code=ErrorCode.EDIT_NOT_ALLOWED, path=path, message="路径不允许删除"),
                 path=path,
             )
         try:
             resolved = self._resolve(path)
-        except WorkspacePathError as e:
-            return DeleteResult(error=str(e), path=path)
+        except BackendError as e:
+            return DeleteResult(error=e, path=path)
 
         # Safety: refuse to delete the root_dir itself
         if resolved == self._cwd:
-            return DeleteResult(error="cannot delete root working directory.", path=path)
+            return DeleteResult(error=BackendError(code=ErrorCode.INVALID, path=path, message="不能删除根工作目录"), path=path)
 
         if not resolved.exists():
-            return DeleteResult(error=f"path '{path}' does not exist.", path=path)
+            return DeleteResult(error=BackendError(code=ErrorCode.NOT_FOUND, path=path, message="路径不存在"), path=path)
 
         if resolved.is_dir():
             return DeleteResult(
-                error=f"'{path}' is a directory. "
-                f"The delete tool only removes single files. ",
+                error=BackendError(code=ErrorCode.IS_DIR, path=path, message="目标是目录，delete 工具只能删除单个文件"),
                 path=path,
             )
 
         try:
             resolved.unlink()
         except OSError as e:
-            return DeleteResult(error=f"deleting '{path}': {e}", path=path)
+            return DeleteResult(error=BackendError(code=ErrorCode.IO_ERROR, path=path, message=str(e)), path=path)
 
         return DeleteResult(path=path)
 
@@ -986,13 +966,13 @@ class LocalBackend(BackendProtocol):
                 resolved = self._resolve(path)
                 resolved.parent.mkdir(parents=True, exist_ok=True)
                 resolved.write_bytes(raw_content)
-                results.append(UploadFileResult(path=path.value))
+                results.append(UploadFileResult(path=path))
             except OSError as e:
-                results.append(UploadFileResult(path=path.value, error=str(e)))
+                results.append(UploadFileResult(path=path, error=BackendError(code=ErrorCode.IO_ERROR, path=path, message=str(e))))
             except Exception as e:
                 results.append(
                     UploadFileResult(
-                        path=path.value, error=f"{type(e).__name__}: {e}"
+                        path=path, error=BackendError(code=ErrorCode.INVALID, path=path, message=f"{type(e).__name__}: {e}")
                     )
                 )
         return results
@@ -1017,32 +997,32 @@ class LocalBackend(BackendProtocol):
                 resolved = self._resolve(path)
                 if not resolved.exists():
                     results.append(
-                        DownloadFileResult(
-                            path=path.value, content=None, error="file_not_found"
-                        )
+                    DownloadFileResult(
+                        path=path, content=None, error=BackendError(code=ErrorCode.NOT_FOUND, path=path, message="文件不存在")
+                    )
                     )
                     continue
                 if resolved.is_dir():
                     results.append(
                         DownloadFileResult(
-                            path=path.value, content=None, error="is_directory"
+                            path=path, content=None, error=BackendError(code=ErrorCode.IS_DIR, path=path, message="目标是目录")
                         )
                     )
                     continue
                 raw = resolved.read_bytes()
                 results.append(
-                    DownloadFileResult(path=path.value, content=raw)
+                    DownloadFileResult(path=path, content=raw)
                 )
             except OSError as e:
                 results.append(
-                    DownloadFileResult(path=path.value, content=None, error=str(e))
+                    DownloadFileResult(path=path, content=None, error=BackendError(code=ErrorCode.IO_ERROR, path=path, message=str(e)))
                 )
             except Exception as e:
                 results.append(
                     DownloadFileResult(
                         path=path,
                         content=None,
-                        error=f"{type(e).__name__}: {e}",
+                        error=BackendError(code=ErrorCode.INVALID, path=path, message=f"{type(e).__name__}: {e}"),
                     )
                 )
         return results

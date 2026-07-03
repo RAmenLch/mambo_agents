@@ -9,7 +9,7 @@ from langchain.tools import ToolRuntime
 from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
 from langgraph.prebuilt.tool_node import ToolNode
 
-from mambo_agents.backends.schemas import VirtualPath
+from mambo_agents.backends.schemas import BackendError, ErrorCode, VirtualPath
 from mambo_agents.backends.protocol import (
     ReadResult,
     _EXTENSION_TO_FILE_TYPE,
@@ -147,8 +147,8 @@ class TestReadResultMultimodal:
         assert r.is_multimodal is False
 
     def test_str_with_error(self):
-        r = ReadResult(error="File not found")
-        assert str(r) == "Error: File not found"
+        r = ReadResult(error=BackendError(code=ErrorCode.NOT_FOUND, message="File not found"))
+        assert "File not found" in str(r)
 
     def test_str_with_content(self):
         r = ReadResult(content="hello", encoding="utf-8")

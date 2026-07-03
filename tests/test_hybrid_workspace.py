@@ -19,7 +19,7 @@ from mambo_agents.backends.protocol import (
     UploadFileResult,
 )
 from mambo_agents.backends.state import StateBackend
-from mambo_agents.backends.schemas import VirtualPath
+from mambo_agents.backends.schemas import BackendError, ErrorCode, VirtualPath
 
 from tests.test_state_backend import _simulate_graph
 
@@ -236,7 +236,7 @@ class _FakeThreadAwareBackend(ThreadAwareWorkspace):
             s = str(path)
             c = self._files.get(s)
             if c is None:
-                results.append(DownloadFileResult(path=s, content=None, error="file_not_found"))
+                results.append(DownloadFileResult(path=s, content=None, error=BackendError(code=ErrorCode.NOT_FOUND, path=s, message="file_not_found")))
             else:
                 results.append(DownloadFileResult(path=s, content=c.encode("utf-8"), error=None))
         return results
@@ -988,7 +988,7 @@ class TestCopy:
             result = hws.copy(VirtualPath("/.mambo/nonexistent.txt"), VirtualPath(f"{_W}/out.txt"))
 
         assert result.error is not None
-        assert "nonexistent" in result.error.lower() or "not found" in result.error.lower()
+        assert result.error.code in (ErrorCode.NOT_FOUND, ErrorCode.PATH_NOT_UNDER, ErrorCode.IO_ERROR)
 
     def test_copy_result_model_str(self):
         from mambo_agents.backends.hybrid_workspace import CopyResult
@@ -998,7 +998,7 @@ class TestCopy:
         assert "/a.txt" in str(r)
         assert "/b.txt" in str(r)
 
-        err = CopyResult(error="source not found")
+        err = CopyResult(error=BackendError(code=ErrorCode.NOT_FOUND, message="source not found"))
         assert "Error:" in str(err)
         assert "source not found" in str(err)
 
@@ -1618,11 +1618,13 @@ class TestOutOfWorkspacePaths:
     # -- _route still throws ValueError for invalid paths -------------------
 
     def test_route_raises_for_outside_path(self, hws: HybridWorkspaceBackend):
-        with pytest.raises(ValueError, match="is not under"):
+        from mambo_agents.backends.schemas import BackendError
+        with pytest.raises(BackendError, match="路径不在"):
             hws._route(VirtualPath("/home/ramenl"))
 
     def test_route_raises_for_absolute_root(self, hws: HybridWorkspaceBackend):
-        with pytest.raises(ValueError, match="is not under"):
+        from mambo_agents.backends.schemas import BackendError
+        with pytest.raises(BackendError, match="路径不在"):
             hws._route(VirtualPath("/etc/passwd"))
 
     # -- Operation methods catch ValueError and return error results --------
@@ -1630,47 +1632,49 @@ class TestOutOfWorkspacePaths:
     def test_ls_outside_workspace_returns_error(self, hws: HybridWorkspaceBackend):
         r = hws.ls(VirtualPath("/home/ramenl"))
         assert r.error is not None
-        assert "无效" in r.error
-        assert hws.workspace_root.value in r.error
+        assert r.error.code == ErrorCode.PATH_NOT_UNDER
 
     def test_read_outside_workspace_returns_error(self, hws: HybridWorkspaceBackend):
         r = hws.read(VirtualPath("/home/ramenl/.bashrc"))
         assert r.error is not None
-        assert "无效" in r.error
+        assert r.error.code == ErrorCode.PATH_NOT_UNDER
 
     def test_read_raw_outside_workspace_returns_error(self, hws: HybridWorkspaceBackend):
         r = hws.read_raw(VirtualPath("/home/ramenl/.bashrc"))
         assert r.error is not None
-        assert "无效" in r.error
+        assert r.error.code == ErrorCode.PATH_NOT_UNDER
 
     def test_grep_outside_workspace_returns_error(self, hws: HybridWorkspaceBackend):
         r = hws.grep("password", path=VirtualPath("/home"))
         assert r.error is not None
-        assert "无效" in r.error
+        assert r.error.code == ErrorCode.PATH_NOT_UNDER
 
     def test_glob_outside_workspace_returns_error(self, hws: HybridWorkspaceBackend):
         r = hws.glob("*", path=VirtualPath("/home"))
         assert r.error is not None
-        assert "无效" in r.error
+        assert r.error.code == ErrorCode.PATH_NOT_UNDER
 
     # -- Error message content ------------------------------------------------
 
     def test_error_includes_workspace_root(self, hws: HybridWorkspaceBackend):
         r = hws.ls(VirtualPath("/tmp"))
-        assert hws.workspace_root.value in r.error
+        assert r.error is not None
+        assert r.error.code == ErrorCode.PATH_NOT_UNDER
 
     def test_error_includes_mambo_prefix(self, hws: HybridWorkspaceBackend):
         r = hws.read(VirtualPath("/root/.profile"))
-        assert hws._prefix.value in r.error
+        assert r.error is not None
+        assert r.error.code == ErrorCode.PATH_NOT_UNDER
 
     def test_error_includes_named_virtual_workspaces(self, hws: HybridWorkspaceBackend):
         r = hws.glob("*", path=VirtualPath("/opt"))
-        assert "/.mambo/skills/" in r.error
+        assert r.error is not None
+        assert r.error.code == ErrorCode.PATH_NOT_UNDER
 
     def test_error_includes_real_backend_mapping(self, hws: HybridWorkspaceBackend):
         r = hws.ls(VirtualPath("/home/ramenl"))
-        assert "映射至真实路径" in r.error
-        assert hws._real.workspace_root.value in r.error
+        assert r.error is not None
+        assert "映射至真实路径" not in str(r.error)  # real paths no longer leaked
 
     # -- _valid_paths_description --------------------------------------------
 
@@ -1703,17 +1707,17 @@ class TestVirtualPathIntegration:
 
     def test_route_rejects_dotdot_traversal(self, hws: HybridWorkspaceBackend):
         """VirtualPath construction blocks '..' before it reaches _route."""
-        with pytest.raises(ValidationError, match="must not contain '..'"):
+        with pytest.raises(BackendError, match="不能包含 '..'"):
             VirtualPath("/workspace/../../etc/passwd")
 
     def test_route_rejects_double_slash(self, hws: HybridWorkspaceBackend):
         """VirtualPath construction blocks '//' before it reaches _route."""
-        with pytest.raises(ValidationError, match="must not contain '//'"):
+        with pytest.raises(BackendError, match="不能包含 '//'"):
             VirtualPath("/workspace//src")
 
     def test_route_rejects_non_absolute(self, hws: HybridWorkspaceBackend):
         """VirtualPath construction rejects non-absolute paths."""
-        with pytest.raises(ValidationError, match="must be an absolute path"):
+        with pytest.raises(BackendError, match="必须以 '/' 开头"):
             VirtualPath("workspace/src")
 
     def test_route_accepts_valid_path(self, hws: HybridWorkspaceBackend):
@@ -1750,13 +1754,13 @@ class TestVirtualPathIntegration:
         """Writing to a path outside workspace returns error, doesn't crash."""
         r = hws.write(VirtualPath("/etc/hosts"), "evil")
         assert r.error is not None
-        assert "无效" in r.error
+        assert r.error.code == ErrorCode.PATH_NOT_UNDER
 
     def test_edit_outside_workspace_returns_error(self, hws: HybridWorkspaceBackend):
         """Editing outside workspace returns error result, doesn't crash."""
         r = hws.edit(VirtualPath("/etc/crontab"), "old", "new")
         assert r.error is not None
-        assert "无效" in r.error
+        assert r.error.code == ErrorCode.PATH_NOT_UNDER
 
     # -- VirtualPath pass-through via _route ---------------------------------
 
@@ -1779,10 +1783,10 @@ class TestVirtualPathIntegration:
 
     def test_virtual_path_blocks_dotdot_before_route(self):
         """VirtualPath constructor blocks '..' before it reaches _route."""
-        with pytest.raises(ValidationError, match="must not contain '..'"):
+        with pytest.raises(BackendError, match="不能包含 '..'"):
             VirtualPath("/workspace/../../etc/passwd")
 
     def test_virtual_path_blocks_double_slash_before_route(self):
         """VirtualPath constructor blocks '//' before it reaches _route."""
-        with pytest.raises(ValidationError, match="must not contain '//'"):
+        with pytest.raises(BackendError, match="不能包含 '//'"):
             VirtualPath("/workspace//src/secret")

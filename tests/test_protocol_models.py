@@ -17,6 +17,7 @@ from mambo_agents.backends.protocol import (
     UploadFileResult,
     WriteResult,
 )
+from mambo_agents.backends.schemas import BackendError, ErrorCode
 
 
 # ============================================================================
@@ -86,18 +87,18 @@ class TestLsResult:
         assert str(r) == "(empty directory)"
 
     def test_str_with_error(self):
-        r = LsResult(error="Permission denied", entries=[])
+        r = LsResult(error=BackendError(code=ErrorCode.INVALID, message="Permission denied"), entries=[])
         s = str(r)
-        assert "Warning: Permission denied" in s
+        assert "Permission denied" in s
 
     def test_str_with_error_and_entries(self):
         """Error + entries → both shown."""
         r = LsResult(
-            error="Partial listing",
+            error=BackendError(code=ErrorCode.INVALID, message="Partial listing"),
             entries=[FileInfo(path="/ok.txt")],
         )
         s = str(r)
-        assert "Warning: Partial listing" in s
+        assert "Partial listing" in s
         assert "/ok.txt" in s
 
     def test_str_file_with_desc(self):
@@ -141,8 +142,8 @@ class TestReadResult:
         assert str(r) == "some text"
 
     def test_str_with_error(self):
-        r = ReadResult(error="File not found")
-        assert str(r) == "Error: File not found"
+        r = ReadResult(error=BackendError(code=ErrorCode.NOT_FOUND, message="File not found"))
+        assert "File not found" in str(r)
 
     def test_is_multimodal_true(self):
         r = ReadResult(
@@ -169,8 +170,8 @@ class TestWriteResult:
         assert str(r) == "File written: /new.txt"
 
     def test_str_error(self):
-        r = WriteResult(error="File already exists", path="/new.txt")
-        assert str(r) == "Error: File already exists"
+        r = WriteResult(error=BackendError(code=ErrorCode.ALREADY_EXISTS, path="/new.txt", message="File already exists"), path="/new.txt")
+        assert "File already exists" in str(r)
 
 
 # ============================================================================
@@ -184,8 +185,8 @@ class TestEditResult:
         assert str(r) == "File edited: /f.py (3 replacement(s))"
 
     def test_str_error(self):
-        r = EditResult(error="old_str not found", path="/f.py")
-        assert str(r) == "Error: old_str not found"
+        r = EditResult(error=BackendError(code=ErrorCode.OLD_STR_NOT_FOUND, path="/f.py", message="old_str not found"), path="/f.py")
+        assert "old_str not found" in str(r)
 
     def test_default_occurrences(self):
         r = EditResult(path="/f.py")
@@ -209,9 +210,9 @@ class TestGrepResult:
         assert str(r) == "No matches found."
 
     def test_str_error(self):
-        r = GrepResult(error="Search failed")
+        r = GrepResult(error=BackendError(code=ErrorCode.INVALID, message="Search failed"))
         s = str(r)
-        assert "Warning: Search failed" in s
+        assert "Search failed" in s
 
 
 # ============================================================================
@@ -260,9 +261,9 @@ class TestGlobResult:
         assert str(r) == "No matches found."
 
     def test_str_error(self):
-        r = GlobResult(error="Invalid pattern")
+        r = GlobResult(error=BackendError(code=ErrorCode.INVALID, message="Invalid pattern"))
         s = str(r)
-        assert "Warning: Invalid pattern" in s
+        assert "Invalid pattern" in s
 
 
 # ============================================================================
@@ -277,8 +278,8 @@ class TestUploadFileResult:
         assert r.error is None
 
     def test_error(self):
-        r = UploadFileResult(path="/bad.txt", error="Disk full")
-        assert r.error == "Disk full"
+        r = UploadFileResult(path="/bad.txt", error=BackendError(code=ErrorCode.IO_ERROR, path="/bad.txt", message="Disk full"))
+        assert "Disk full" in str(r.error)
 
 
 class TestDownloadFileResult:
@@ -289,9 +290,9 @@ class TestDownloadFileResult:
         assert r.error is None
 
     def test_error(self):
-        r = DownloadFileResult(path="/missing.txt", error="file_not_found")
+        r = DownloadFileResult(path="/missing.txt", error=BackendError(code=ErrorCode.NOT_FOUND, path="/missing.txt", message="file_not_found"))
         assert r.content is None
-        assert r.error == "file_not_found"
+        assert r.error.code == ErrorCode.NOT_FOUND
 
 
 # ============================================================================

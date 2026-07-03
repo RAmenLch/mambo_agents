@@ -520,7 +520,7 @@ class TestGrepPathHandling:
         """Search outside /workspace should be rejected."""
         result = backend.grep("hello", path="/etc")
         assert result.error is not None, "Should reject path outside workspace"
-        assert "outside the workspace" in (result.error or "").lower()
+        assert "超出工作区" in str(result.error).lower()
         print(f"\n  ✅ outside_workspace: correctly rejected")
 
 
@@ -564,5 +564,5 @@ def test_cleanup(backend: SshBackend):
     # Verify deletion
     result = backend.read(_FILE_A)
     assert result.error is not None
-    assert "not found" in (result.error or "").lower()
+    assert "不存在" in str(result.error).lower()
     print("\n  ✅ test files cleaned up")

@@ -16,6 +16,7 @@ from datetime import datetime
 import pytest
 
 from mambo_agents.backends.ssh import SshBackend
+from mambo_agents.backends.schemas import ErrorCode
 
 # ---------------------------------------------------------------------------
 # Config – host/port are hardcoded; password comes from env
@@ -153,7 +154,7 @@ def test_edit_multiple_without_replace_all(backend: SshBackend):
         f"Edit with 2 occurrences and replace_all=False should FAIL. "
         f"Got: {result}"
     )
-    assert "2 times" in result.error or "appears" in result.error, (
+    assert "处" in str(result.error) or result.error.code == ErrorCode.MULTI_OCCURRENCES, (
         f"Error should mention multiple occurrences. Got: {result.error}"
     )
 
@@ -207,7 +208,7 @@ def test_edit_not_found(backend: SshBackend):
     )
 
     assert result.error is not None
-    assert "not found" in result.error.lower()
+    assert "未找到" in str(result.error)
     print(f"\n  ✅ not found: {result.error}")
 
 
@@ -248,5 +249,5 @@ def test_cleanup(backend: SshBackend):
     # Verify deletion
     result = backend.read(_TEST_FILE)
     assert result.error is not None
-    assert "not found" in (result.error or "").lower()
+    assert "不存在" in str(result.error).lower()
     print("\n  ✅ test file cleaned up")

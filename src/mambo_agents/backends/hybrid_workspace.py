@@ -46,7 +46,7 @@ from mambo_agents.backends.protocol import (
     UploadFileResult,
     WriteResult,
 )
-from mambo_agents.backends.schemas import check_no_path_traversal, GrepMatch,VirtualPath
+from mambo_agents.backends.schemas import BackendError, ErrorCode, check_no_path_traversal, GrepMatch, VirtualPath
 from mambo_agents.backends.state import StateBackend
 
 # ---------------------------------------------------------------------------
@@ -65,7 +65,6 @@ DEFAULT_MAMBO_PREFIX = "/.mambo/"
 class CopyResult(Result):
     """Result from ``copy()`` — single-file copy, potentially cross-backend."""
 
-    error: str | None = None
     source: VirtualPath | None = None
     destination: VirtualPath | None = None
 
@@ -262,7 +261,7 @@ class HybridWorkspaceBackend(ThreadAwareWorkspace):
             if isinstance(raw_path, str):
                 raw_path = VirtualPath(raw_path)
             target, rewritten = self._route(raw_path)
-        except (ValueError, TypeError):
+        except BackendError:
             return None
         if target is not self._real:
             return None
@@ -482,8 +481,8 @@ class HybridWorkspaceBackend(ThreadAwareWorkspace):
     def ls(self, path: VirtualPath) -> LsResult:
         try:
             target, p = self._route(path)
-        except (ValueError, TypeError) as e:
-            return LsResult(error=f"路径 '{path}' 无效：{e}。仅可访问：{self._valid_paths_description()}")
+        except BackendError as e:
+            return LsResult(error=e)
         result = target.ls(p)
         result = result.apply_reverse_translation(
             self._reverse_path, target.workspace_root, self._get_virtual_prefix(path),
@@ -510,9 +509,12 @@ class HybridWorkspaceBackend(ThreadAwareWorkspace):
     ) -> ReadResult:
         try:
             target, p = self._route(file_path)
-        except (ValueError, TypeError) as e:
-            return ReadResult(error=f"路径 '{file_path}' 无效：{e}。仅可访问：{self._valid_paths_description()}")
-        return target.read(p, offset, limit, include_line_numbers)
+        except BackendError as e:
+            return ReadResult(error=e)
+        result = target.read(p, offset, limit, include_line_numbers)
+        return result.apply_reverse_translation(
+            self._reverse_path, target.workspace_root, self._get_virtual_prefix(file_path),
+        )
 
     def read_raw(
         self,
@@ -523,17 +525,20 @@ class HybridWorkspaceBackend(ThreadAwareWorkspace):
     ) -> ReadResult:
         try:
             target, p = self._route(file_path)
-        except (ValueError, TypeError) as e:
-            return ReadResult(error=f"路径 '{file_path}' 无效：{e}。仅可访问：{self._valid_paths_description()}")
-        return target.read_raw(p, offset, limit, include_line_numbers)
+        except BackendError as e:
+            return ReadResult(error=e)
+        result = target.read_raw(p, offset, limit, include_line_numbers)
+        return result.apply_reverse_translation(
+            self._reverse_path, target.workspace_root, self._get_virtual_prefix(file_path),
+        )
 
     def write(
         self, file_path: VirtualPath, content: str, overwrite: bool = False,
     ) -> WriteResult:
         try:
             target, p = self._route(file_path)
-        except (ValueError, TypeError) as e:
-            return WriteResult(error=f"路径 '{file_path}' 无效：{e}。仅可访问：{self._valid_paths_description()}")
+        except BackendError as e:
+            return WriteResult(error=e)
         result = target.write(p, content, overwrite)
         return result.apply_reverse_translation(
             self._reverse_path, target.workspace_root, self._get_virtual_prefix(file_path),
@@ -549,8 +554,8 @@ class HybridWorkspaceBackend(ThreadAwareWorkspace):
     ) -> EditResult:
         try:
             target, p = self._route(file_path)
-        except (ValueError, TypeError) as e:
-            return EditResult(error=f"路径 '{file_path}' 无效：{e}。仅可访问：{self._valid_paths_description()}")
+        except BackendError as e:
+            return EditResult(error=e)
         result = target.edit(p, old_str, new_str, replace_all=replace_all)
         return result.apply_reverse_translation(
             self._reverse_path, target.workspace_root, self._get_virtual_prefix(file_path),
@@ -574,8 +579,8 @@ class HybridWorkspaceBackend(ThreadAwareWorkspace):
 
         try:
             target, p = self._route(path)
-        except (ValueError, TypeError) as e:
-            return GrepResult(error=f"路径 '{path}' 无效：{e}。仅可访问：{self._valid_paths_description()}")
+        except BackendError as e:
+            return GrepResult(error=e)
         result = target.grep(pattern, p, glob, regex, offset, limit)
         return result.apply_reverse_translation(
             self._reverse_path, target.workspace_root, self._get_virtual_prefix(path),
@@ -588,8 +593,8 @@ class HybridWorkspaceBackend(ThreadAwareWorkspace):
 
         try:
             target, p = self._route(path)
-        except (ValueError, TypeError) as e:
-            return GlobResult(error=f"路径 '{path}' 无效：{e}。仅可访问：{self._valid_paths_description()}")
+        except BackendError as e:
+            return GlobResult(error=e)
         result = target.glob(pattern, p)
         return result.apply_reverse_translation(
             self._reverse_path, target.workspace_root, self._get_virtual_prefix(path),
@@ -606,8 +611,8 @@ class HybridWorkspaceBackend(ThreadAwareWorkspace):
     async def als(self, path: VirtualPath) -> LsResult:
         try:
             target, p = self._route(path)
-        except (ValueError, TypeError) as e:
-            return LsResult(error=f"路径 '{path}' 无效：{e}。仅可访问：{self._valid_paths_description()}")
+        except BackendError as e:
+            return LsResult(error=e)
         result = await target.als(p)
         result = result.apply_reverse_translation(
             self._reverse_path, target.workspace_root, self._get_virtual_prefix(path),
@@ -634,10 +639,13 @@ class HybridWorkspaceBackend(ThreadAwareWorkspace):
     ) -> ReadResult:
         try:
             target, p = self._route(file_path)
-        except (ValueError, TypeError) as e:
-            return ReadResult(error=f"路径 '{file_path}' 无效：{e}。仅可访问：{self._valid_paths_description()}")
-        return await target.aread(
+        except BackendError as e:
+            return ReadResult(error=e)
+        result = await target.aread(
             p, offset, limit, include_line_numbers,
+        )
+        return result.apply_reverse_translation(
+            self._reverse_path, target.workspace_root, self._get_virtual_prefix(file_path),
         )
 
     async def awrite(
@@ -645,8 +653,8 @@ class HybridWorkspaceBackend(ThreadAwareWorkspace):
     ) -> WriteResult:
         try:
             target, p = self._route(file_path)
-        except (ValueError, TypeError) as e:
-            return WriteResult(error=f"路径 '{file_path}' 无效：{e}。仅可访问：{self._valid_paths_description()}")
+        except BackendError as e:
+            return WriteResult(error=e)
         result = await target.awrite(p, content, overwrite)
         return result.apply_reverse_translation(
             self._reverse_path, target.workspace_root, self._get_virtual_prefix(file_path),
@@ -662,8 +670,8 @@ class HybridWorkspaceBackend(ThreadAwareWorkspace):
     ) -> EditResult:
         try:
             target, p = self._route(file_path)
-        except (ValueError, TypeError) as e:
-            return EditResult(error=f"路径 '{file_path}' 无效：{e}。仅可访问：{self._valid_paths_description()}")
+        except BackendError as e:
+            return EditResult(error=e)
         result = await target.aedit(p, old_str, new_str, replace_all=replace_all)
         return result.apply_reverse_translation(
             self._reverse_path, target.workspace_root, self._get_virtual_prefix(file_path),
@@ -685,8 +693,8 @@ class HybridWorkspaceBackend(ThreadAwareWorkspace):
 
         try:
             target, p = self._route(path)
-        except (ValueError, TypeError) as e:
-            return GrepResult(error=f"路径 '{path}' 无效：{e}。仅可访问：{self._valid_paths_description()}")
+        except BackendError as e:
+            return GrepResult(error=e)
         result = await target.agrep(pattern, p, glob, regex, offset, limit)
         return result.apply_reverse_translation(
             self._reverse_path, target.workspace_root, self._get_virtual_prefix(path),
@@ -699,8 +707,8 @@ class HybridWorkspaceBackend(ThreadAwareWorkspace):
 
         try:
             target, p = self._route(path)
-        except (ValueError, TypeError) as e:
-            return GlobResult(error=f"路径 '{path}' 无效：{e}。仅可访问：{self._valid_paths_description()}")
+        except BackendError as e:
+            return GlobResult(error=e)
         result = await target.aglob(pattern, p)
         return result.apply_reverse_translation(
             self._reverse_path, target.workspace_root, self._get_virtual_prefix(path),
@@ -918,9 +926,8 @@ class HybridWorkspaceBackend(ThreadAwareWorkspace):
         """Copy a single file, potentially across different backends.
 
         Reads the source file as raw bytes via :meth:`download_files` on the
-        source backend, then writes to the destination via :meth:`upload_files`
-        on the destination backend.  This correctly handles both text and
-        binary files without going through the ``write(str)`` path.
+        source backend, then writes to the destination **always overwriting**
+        (copy semantics — the destination is replaced if it already exists).
 
         Explicit *thread_id* is resolved and forwarded to
         :class:`ThreadAwareWorkspace` backends so they use the **graph-out**
@@ -931,32 +938,32 @@ class HybridWorkspaceBackend(ThreadAwareWorkspace):
         """
         try:
             src_be, src_path = self._route(source)
-        except (ValueError, TypeError) as e:
-            return CopyResult(error=f"源路径 '{source}' 无效：{e}。仅可访问：{self._valid_paths_description()}")
+        except BackendError as e:
+            return CopyResult(error=e)
         try:
             dst_be, dst_path = self._route(destination)
-        except (ValueError, TypeError) as e:
-            return CopyResult(error=f"目标路径 '{destination}' 无效：{e}。仅可访问：{self._valid_paths_description()}")
+        except BackendError as e:
+            return CopyResult(error=e)
 
         tid = self._resolve_copy_thread_id()
 
         # Download source as raw bytes
         dl_results = self._download_for_copy(src_be, [src_path], tid)
         if not dl_results:
-            return CopyResult(error=f"No result returned when reading '{source}'")
+            return CopyResult(error=BackendError(code=ErrorCode.INVALID, path=source, message=f"No result returned when reading '{source}'"))
         dl = dl_results[0]
         if dl.error:
-            return CopyResult(error=f"Failed to read '{source}': {dl.error}")
+            return CopyResult(error=BackendError(code=ErrorCode.IO_ERROR, path=source, message=f"Failed to read '{source}': {dl.error}"))
         if dl.content is None:
-            return CopyResult(error=f"'{source}' is empty or unreadable")
+            return CopyResult(error=BackendError(code=ErrorCode.INVALID, path=source, message=f"'{source}' is empty or unreadable"))
 
-        # Upload raw bytes to destination
+        # Upload to destination (all backends' upload_files overwrite by default)
         ul_results = self._upload_for_copy(dst_be, [(dst_path, dl.content)], tid)
         if not ul_results:
-            return CopyResult(error=f"No result returned when writing '{destination}'")
+            return CopyResult(error=BackendError(code=ErrorCode.INVALID, path=destination, message=f"No result returned when writing '{destination}'"))
         ul = ul_results[0]
         if ul.error:
-            return CopyResult(error=f"Failed to write '{destination}': {ul.error}")
+            return CopyResult(error=BackendError(code=ErrorCode.IO_ERROR, path=destination, message=f"Failed to write '{destination}': {ul.error}"))
 
         return CopyResult(source=source, destination=destination)
 
@@ -967,36 +974,36 @@ class HybridWorkspaceBackend(ThreadAwareWorkspace):
         (e.g. :class:`SshBackend` acquires ``_async_lock``), and
         forwards *thread_id* to :class:`ThreadAwareWorkspace` backends
         to avoid the same Pregel-channel deadlock described in
-        :meth:`copy`.
+        :meth:`copy`.  Always overwrites the destination.
         """
         try:
             src_be, src_path = self._route(source)
-        except (ValueError, TypeError) as e:
-            return CopyResult(error=f"源路径 '{source}' 无效：{e}。仅可访问：{self._valid_paths_description()}")
+        except BackendError as e:
+            return CopyResult(error=e)
         try:
             dst_be, dst_path = self._route(destination)
-        except (ValueError, TypeError) as e:
-            return CopyResult(error=f"目标路径 '{destination}' 无效：{e}。仅可访问：{self._valid_paths_description()}")
+        except BackendError as e:
+            return CopyResult(error=e)
 
         tid = self._resolve_copy_thread_id()
 
         # Download source as raw bytes (async)
         dl_results = await self._adownload_for_copy(src_be, [src_path], tid)
         if not dl_results:
-            return CopyResult(error=f"No result returned when reading '{source}'")
+            return CopyResult(error=BackendError(code=ErrorCode.INVALID, path=source, message=f"No result returned when reading '{source}'"))
         dl = dl_results[0]
         if dl.error:
-            return CopyResult(error=f"Failed to read '{source}': {dl.error}")
+            return CopyResult(error=BackendError(code=ErrorCode.IO_ERROR, path=source, message=f"Failed to read '{source}': {dl.error}"))
         if dl.content is None:
-            return CopyResult(error=f"'{source}' is empty or unreadable")
+            return CopyResult(error=BackendError(code=ErrorCode.INVALID, path=source, message=f"'{source}' is empty or unreadable"))
 
-        # Upload raw bytes to destination (async)
+        # Upload to destination (all backends' upload_files overwrite by default)
         ul_results = await self._aupload_for_copy(dst_be, [(dst_path, dl.content)], tid)
         if not ul_results:
-            return CopyResult(error=f"No result returned when writing '{destination}'")
+            return CopyResult(error=BackendError(code=ErrorCode.INVALID, path=destination, message=f"No result returned when writing '{destination}'"))
         ul = ul_results[0]
         if ul.error:
-            return CopyResult(error=f"Failed to write '{destination}': {ul.error}")
+            return CopyResult(error=BackendError(code=ErrorCode.IO_ERROR, path=destination, message=f"Failed to write '{destination}': {ul.error}"))
 
         return CopyResult(source=source, destination=destination)
 
@@ -1014,16 +1021,16 @@ class HybridWorkspaceBackend(ThreadAwareWorkspace):
         # Group files by target backend
         groups: dict[int, list[tuple[VirtualPath, bytes]]] = {}  # backend_id → files
         targets: list[BackendProtocol] = []
-        index_map: list[tuple[int, int]] = []  # (target_idx, file_idx_in_group)
-        routing_errors: dict[int, str] = {}  # file_orig_index → error message
+        index_map: list[tuple[int, int, int]] = []  # (orig_idx, target_idx, file_idx_in_group)
+        routing_errors: dict[int, BackendError] = {}  # file_orig_index → error
+        _reverse_info: dict[tuple[int, int], tuple[VirtualPath, VirtualPath]] = {}
+        # (target_idx, file_idx) → (target_ws_root, virtual_prefix)
 
         for orig_idx, (orig_path, data) in enumerate(files):
             try:
                 target, stripped = self._route(orig_path)
-            except (ValueError, TypeError) as e:
-                routing_errors[orig_idx] = (
-                    f"路径 '{orig_path}' 无效：{e}。仅可访问：{self._valid_paths_description()}"
-                )
+            except BackendError as e:
+                routing_errors[orig_idx] = e
                 continue
             # Find or register target
             idx = None
@@ -1036,18 +1043,26 @@ class HybridWorkspaceBackend(ThreadAwareWorkspace):
                 targets.append(target)
                 groups[idx] = []
             groups[idx].append((stripped, data))
-            index_map.append((orig_idx, idx, len(groups[idx]) - 1))
+            fi = len(groups[idx]) - 1
+            _reverse_info[(idx, fi)] = (target.workspace_root, self._get_virtual_prefix(orig_path))
+            index_map.append((orig_idx, idx, fi))
 
         # Execute uploads per target
         results_per_target: dict[int, list[UploadFileResult]] = {}
         for idx, group_files in groups.items():
             be = targets[idx]
             if isinstance(be, ThreadAwareWorkspace):
-                results_per_target[idx] = list(
+                raw_results = list(
                     be.upload_files(group_files, thread_id=thread_id)
                 )
             else:
-                results_per_target[idx] = list(be.upload_files(group_files))
+                raw_results = list(be.upload_files(group_files))
+            # Reverse-translate each result's path
+            translated: list[UploadFileResult] = []
+            for fi, result in enumerate(raw_results):
+                twsr, vprefix = _reverse_info[(idx, fi)]
+                translated.append(result.apply_reverse_translation(self._reverse_path, twsr, vprefix))
+            results_per_target[idx] = translated
 
         # Reassemble in original order
         results: list[UploadFileResult] = []
@@ -1074,15 +1089,15 @@ class HybridWorkspaceBackend(ThreadAwareWorkspace):
         groups: dict[int, list[VirtualPath]] = {}
         targets: list[BackendProtocol] = []
         index_map: list[tuple[int, int, int]] = []
-        routing_errors: dict[int, str] = {}
+        routing_errors: dict[int, BackendError] = {}
+        _reverse_info: dict[tuple[int, int], tuple[VirtualPath, VirtualPath]] = {}
+        # (target_idx, file_idx) → (target_ws_root, virtual_prefix)
 
         for orig_idx, orig_path in enumerate(paths):
             try:
                 target, stripped = self._route(orig_path)
-            except (ValueError, TypeError) as e:
-                routing_errors[orig_idx] = (
-                    f"路径 '{orig_path}' 无效：{e}。仅可访问：{self._valid_paths_description()}"
-                )
+            except BackendError as e:
+                routing_errors[orig_idx] = e
                 continue
             idx = None
             for i, t in enumerate(targets):
@@ -1094,17 +1109,25 @@ class HybridWorkspaceBackend(ThreadAwareWorkspace):
                 targets.append(target)
                 groups[idx] = []
             groups[idx].append(stripped)
-            index_map.append((orig_idx, idx, len(groups[idx]) - 1))
+            fi = len(groups[idx]) - 1
+            _reverse_info[(idx, fi)] = (target.workspace_root, self._get_virtual_prefix(orig_path))
+            index_map.append((orig_idx, idx, fi))
 
         results_per_target: dict[int, list[DownloadFileResult]] = {}
         for idx, group_paths in groups.items():
             be = targets[idx]
             if isinstance(be, ThreadAwareWorkspace):
-                results_per_target[idx] = list(
+                raw_results = list(
                     be.download_files(group_paths, thread_id=thread_id)
                 )
             else:
-                results_per_target[idx] = list(be.download_files(group_paths))
+                raw_results = list(be.download_files(group_paths))
+            # Reverse-translate each result's path
+            translated: list[DownloadFileResult] = []
+            for fi, result in enumerate(raw_results):
+                twsr, vprefix = _reverse_info[(idx, fi)]
+                translated.append(result.apply_reverse_translation(self._reverse_path, twsr, vprefix))
+            results_per_target[idx] = translated
 
         results: list[DownloadFileResult] = []
         for orig_idx in range(len(paths)):
@@ -1136,15 +1159,15 @@ class HybridWorkspaceBackend(ThreadAwareWorkspace):
         groups: dict[int, list[tuple[VirtualPath, bytes]]] = {}
         targets: list[BackendProtocol] = []
         index_map: list[tuple[int, int, int]] = []
-        routing_errors: dict[int, str] = {}
+        routing_errors: dict[int, BackendError] = {}
+        _reverse_info: dict[tuple[int, int], tuple[VirtualPath, VirtualPath]] = {}
+        # (target_idx, file_idx) → (target_ws_root, virtual_prefix)
 
         for orig_idx, (orig_path, data) in enumerate(files):
             try:
                 target, stripped = self._route(orig_path)
-            except (ValueError, TypeError) as e:
-                routing_errors[orig_idx] = (
-                    f"路径 '{orig_path}' 无效：{e}。仅可访问：{self._valid_paths_description()}"
-                )
+            except BackendError as e:
+                routing_errors[orig_idx] = e
                 continue
             idx = None
             for i, t in enumerate(targets):
@@ -1156,15 +1179,23 @@ class HybridWorkspaceBackend(ThreadAwareWorkspace):
                 targets.append(target)
                 groups[idx] = []
             groups[idx].append((stripped, data))
-            index_map.append((orig_idx, idx, len(groups[idx]) - 1))
+            fi = len(groups[idx]) - 1
+            _reverse_info[(idx, fi)] = (target.workspace_root, self._get_virtual_prefix(orig_path))
+            index_map.append((orig_idx, idx, fi))
 
         # Execute uploads per target via each backend's async method
         results_per_target: dict[int, list[UploadFileResult]] = {}
         for idx, group_files in groups.items():
             be = targets[idx]
-            results_per_target[idx] = list(
+            raw_results = list(
                 await be.aupload_files(group_files)
             )
+            # Reverse-translate each result's path
+            translated: list[UploadFileResult] = []
+            for fi, result in enumerate(raw_results):
+                twsr, vprefix = _reverse_info[(idx, fi)]
+                translated.append(result.apply_reverse_translation(self._reverse_path, twsr, vprefix))
+            results_per_target[idx] = translated
 
         # Reassemble in original order
         results: list[UploadFileResult] = []
@@ -1191,15 +1222,15 @@ class HybridWorkspaceBackend(ThreadAwareWorkspace):
         groups: dict[int, list[VirtualPath]] = {}
         targets: list[BackendProtocol] = []
         index_map: list[tuple[int, int, int]] = []
-        routing_errors: dict[int, str] = {}
+        routing_errors: dict[int, BackendError] = {}
+        _reverse_info: dict[tuple[int, int], tuple[VirtualPath, VirtualPath]] = {}
+        # (target_idx, file_idx) → (target_ws_root, virtual_prefix)
 
         for orig_idx, orig_path in enumerate(paths):
             try:
                 target, stripped = self._route(orig_path)
-            except (ValueError, TypeError) as e:
-                routing_errors[orig_idx] = (
-                    f"路径 '{orig_path}' 无效：{e}。仅可访问：{self._valid_paths_description()}"
-                )
+            except BackendError as e:
+                routing_errors[orig_idx] = e
                 continue
             idx = None
             for i, t in enumerate(targets):
@@ -1211,15 +1242,23 @@ class HybridWorkspaceBackend(ThreadAwareWorkspace):
                 targets.append(target)
                 groups[idx] = []
             groups[idx].append(stripped)
-            index_map.append((orig_idx, idx, len(groups[idx]) - 1))
+            fi = len(groups[idx]) - 1
+            _reverse_info[(idx, fi)] = (target.workspace_root, self._get_virtual_prefix(orig_path))
+            index_map.append((orig_idx, idx, fi))
 
         # Execute downloads per target via each backend's async method
         results_per_target: dict[int, list[DownloadFileResult]] = {}
         for idx, group_paths in groups.items():
             be = targets[idx]
-            results_per_target[idx] = list(
+            raw_results = list(
                 await be.adownload_files(group_paths)
             )
+            # Reverse-translate each result's path
+            translated: list[DownloadFileResult] = []
+            for fi, result in enumerate(raw_results):
+                twsr, vprefix = _reverse_info[(idx, fi)]
+                translated.append(result.apply_reverse_translation(self._reverse_path, twsr, vprefix))
+            results_per_target[idx] = translated
 
         # Reassemble in original order
         results: list[DownloadFileResult] = []

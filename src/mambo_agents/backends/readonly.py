@@ -23,7 +23,7 @@ from mambo_agents.backends.protocol import (
     ReadResult,
     WriteResult,
 )
-from mambo_agents.backends.schemas import VirtualPath
+from mambo_agents.backends.schemas import BackendError, ErrorCode, VirtualPath
 
 
 class ReadOnlyBackend(BackendProtocol):
@@ -68,8 +68,10 @@ class ReadOnlyBackend(BackendProtocol):
     def ls(self, path: VirtualPath) -> LsResult:
         try:
             return self._backend.ls(path)
+        except BackendError as exc:
+            return LsResult(error=exc)
         except Exception as exc:
-            return LsResult(error=f"{type(exc).__name__}: {exc}")
+            return LsResult(error=BackendError(code=ErrorCode.INVALID, message=f"{type(exc).__name__}: {exc}"))
 
     def read_raw(
         self,
@@ -80,8 +82,10 @@ class ReadOnlyBackend(BackendProtocol):
     ) -> ReadResult:
         try:
             return self._backend.read_raw(file_path, offset, limit, include_line_numbers)
+        except BackendError as exc:
+            return ReadResult(error=exc)
         except Exception as exc:
-            return ReadResult(error=f"{type(exc).__name__}: {exc}")
+            return ReadResult(error=BackendError(code=ErrorCode.INVALID, message=f"{type(exc).__name__}: {exc}"))
 
     def grep(
         self,
@@ -94,14 +98,18 @@ class ReadOnlyBackend(BackendProtocol):
     ) -> GrepResult:
         try:
             return self._backend.grep(pattern, path, glob, regex, offset, limit)
+        except BackendError as exc:
+            return GrepResult(error=exc)
         except Exception as exc:
-            return GrepResult(error=f"{type(exc).__name__}: {exc}")
+            return GrepResult(error=BackendError(code=ErrorCode.INVALID, message=f"{type(exc).__name__}: {exc}"))
 
     def glob(self, pattern: str, path: VirtualPath) -> GlobResult:
         try:
             return self._backend.glob(pattern, path)
+        except BackendError as exc:
+            return GlobResult(error=exc)
         except Exception as exc:
-            return GlobResult(error=f"{type(exc).__name__}: {exc}")
+            return GlobResult(error=BackendError(code=ErrorCode.INVALID, message=f"{type(exc).__name__}: {exc}"))
 
     # ------------------------------------------------------------------
     # Rejected write ops
@@ -111,7 +119,7 @@ class ReadOnlyBackend(BackendProtocol):
         self, file_path: VirtualPath, content: str, overwrite: bool = False,
     ) -> WriteResult:
         return WriteResult(
-            error="Write denied: backend is read-only.",
+            error=BackendError(code=ErrorCode.EDIT_NOT_ALLOWED, path=file_path, message="写入被拒绝：后端是只读的"),
             path=file_path.value,
         )
 
@@ -124,7 +132,7 @@ class ReadOnlyBackend(BackendProtocol):
         replace_all: bool = False,
     ) -> EditResult:
         return EditResult(
-            error="Edit denied: backend is read-only.",
+            error=BackendError(code=ErrorCode.EDIT_NOT_ALLOWED, path=file_path, message="编辑被拒绝：后端是只读的"),
             path=file_path.value,
             occurrences=0,
         )

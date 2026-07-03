@@ -5,7 +5,7 @@ from __future__ import annotations
 import pytest
 from pydantic import BaseModel, ValidationError
 
-from mambo_agents.backends.schemas import VirtualPath, check_no_path_traversal
+from mambo_agents.backends.schemas import BackendError, VirtualPath, check_no_path_traversal
 
 
 # ============================================================================
@@ -45,23 +45,23 @@ class TestVirtualPathConstruction:
 
 class TestVirtualPathRejection:
     def test_empty_string(self):
-        with pytest.raises(ValidationError, match="must not be empty"):
+        with pytest.raises(BackendError, match="不能为空"):
             VirtualPath("")
 
     def test_whitespace_only(self):
-        with pytest.raises(ValidationError, match="must not be empty"):
+        with pytest.raises(BackendError, match="不能为空"):
             VirtualPath("   ")
 
     def test_root_path_rejected(self):
-        with pytest.raises(ValidationError, match="root directory"):
+        with pytest.raises(BackendError, match="不能是根目录"):
             VirtualPath("/")
 
     def test_non_absolute(self):
-        with pytest.raises(ValidationError, match="must be an absolute path"):
+        with pytest.raises(BackendError, match="必须以 '/' 开头"):
             VirtualPath("workspace/src")
 
     def test_relative_with_dot(self):
-        with pytest.raises(ValidationError, match="must be an absolute path"):
+        with pytest.raises(BackendError, match="必须以 '/' 开头"):
             VirtualPath("./workspace")
 
     @pytest.mark.parametrize(
@@ -76,7 +76,7 @@ class TestVirtualPathRejection:
         ],
     )
     def test_path_traversal_via_dotdot(self, attack_path):
-        with pytest.raises(ValidationError, match="must not contain '..'"):
+        with pytest.raises(BackendError, match="不能包含 '..'"):
             VirtualPath(attack_path)
 
     @pytest.mark.parametrize(
@@ -88,11 +88,11 @@ class TestVirtualPathRejection:
         ],
     )
     def test_double_slash_rejected(self, double_slash_path):
-        with pytest.raises(ValidationError, match="must not contain '//'"):
+        with pytest.raises(BackendError, match="不能包含 '//'"):
             VirtualPath(double_slash_path)
 
     def test_non_string_type(self):
-        with pytest.raises((ValidationError, TypeError), match="Expected str or VirtualPath"):
+        with pytest.raises((BackendError, TypeError), match="Expected str or VirtualPath"):
             VirtualPath(123)  # type: ignore[arg-type]
 
 
@@ -143,7 +143,7 @@ class TestRelativeTo:
 
     def test_not_under_raises(self):
         vp = VirtualPath("/etc/passwd")
-        with pytest.raises(ValueError, match="is not under"):
+        with pytest.raises(BackendError, match="路径不在"):
             vp.relative_to("/workspace")
 
 
@@ -168,7 +168,7 @@ class TestJoin:
         result = vp.join("src")
         assert isinstance(result, VirtualPath)
         # join validates the result, so invalid parts raise
-        with pytest.raises(ValidationError):
+        with pytest.raises(BackendError):
             vp.join("../escape")  # produces /workspace/../escape → rejected
 
 
@@ -244,12 +244,12 @@ class TestPydanticCoercion:
 
     def test_str_with_traversal_rejected(self):
         """Pydantic model should reject traversal paths during validation."""
-        with pytest.raises(ValidationError) as exc_info:
+        with pytest.raises(BackendError) as exc_info:
             self.MySchema(
                 file_path="/workspace/../../etc/passwd",
                 path="/workspace",
             )
-        assert "must not contain '..'" in str(exc_info.value)
+        assert "不能包含 '..'" in str(exc_info.value)
 
     def test_virtual_path_passed_directly(self):
         """Existing VirtualPath should be accepted and value-preserved."""
@@ -287,13 +287,13 @@ class TestCheckNoPathTraversal:
         check_no_path_traversal("/workspace/src/main.py")  # should not raise
 
     def test_dotdot_raises(self):
-        with pytest.raises(ValueError, match="must not contain '..'"):
+        with pytest.raises(BackendError, match="不能包含 '..'"):
             check_no_path_traversal("/workspace/../../etc/passwd")
 
     def test_double_slash_raises(self):
-        with pytest.raises(ValueError, match="must not contain '//'"):
+        with pytest.raises(BackendError, match="不能包含 '//'"):
             check_no_path_traversal("/workspace//src")
 
     def test_custom_name(self):
-        with pytest.raises(ValueError, match="file_path must not contain"):
+        with pytest.raises(BackendError, match="不能包含 '..'"):
             check_no_path_traversal("/../etc/passwd", name="file_path")

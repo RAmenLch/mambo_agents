@@ -8,6 +8,7 @@ without circular-dependency risk.
 from __future__ import annotations
 
 from collections.abc import Callable
+from enum import Enum
 from typing import Literal, Self
 
 from pydantic import BaseModel, ConfigDict, Field, model_serializer, model_validator
@@ -33,7 +34,7 @@ def human_size(size: int) -> str:
 
 
 def check_no_path_traversal(path: str, *, name: str = "path") -> None:
-    """Raise :class:`ValueError` if *path* contains ``".."`` or ``"//"``.
+    """Raise :class:`BackendError` if *path* contains ``".."`` or ``"//"``.
 
     This check MUST run on the **raw, un-normalized** path string —
     **before** passing it through :class:`~pathlib.PurePosixPath` or any
@@ -46,38 +47,48 @@ def check_no_path_traversal(path: str, *, name: str = "path") -> None:
         name: Human-readable name for the parameter (used in error messages).
 
     Raises:
-        ValueError: If *path* contains ``".."`` path traversal or ``"//"``
-            double slashes.
+        BackendError: If *path* contains ``".."`` path traversal or ``"//"``
+            double slashes.  The raw *path* is **not** embedded in the
+            message — only the AI-facing ``path`` field when the input is
+            a valid absolute path.
     """
     # Split on "/" separates the raw segments without collapsing ".."
     if ".." in path.split("/"):
-        raise ValueError(
-            f"{name} must not contain '..' path traversal, got {path!r}"
+        raise BackendError(
+            code=ErrorCode.PATH_TRAVERSAL,
+            message=f"{name} 不能包含 '..' 路径穿越",
         )
     if "//" in path:
-        raise ValueError(f"{name} must not contain '//', got {path!r}")
+        raise BackendError(
+            code=ErrorCode.PATH_DOUBLE_SLASH,
+            message=f"{name} 不能包含 '//'",
+        )
 
 
 def _normalize_path_str(value: str) -> str:
     """Validate + normalize a path string for :class:`VirtualPath` construction.
 
-    Raises ValueError if the path is empty, non-absolute, contains ``..``
-    traversal, ``//``, or is the root directory ``"/"`` (trailing slash
-    is preserved — ``"/workspace/"`` is valid, ``"/"`` is not).
+    Raises :class:`BackendError` if the path is empty, non-absolute,
+    contains ``..`` traversal, ``//``, or is the root directory ``"/"``
+    (trailing slash is preserved — ``"/workspace/"`` is valid,
+    ``"/"`` is not).
+
     Returns the validated path string as-is.
     """
     check_no_path_traversal(value, name="path")
     s = value.strip()
     if not s:
-        raise ValueError("path must not be empty")
+        raise BackendError(code=ErrorCode.PATH_EMPTY, message="路径不能为空")
     if not s.startswith("/"):
-        raise ValueError(
-            f"path must be an absolute path starting with '/', got {s!r}"
+        raise BackendError(
+            code=ErrorCode.PATH_NOT_ABSOLUTE,
+            message="路径必须以 '/' 开头",
         )
     # Reject root — but "/workspace/" with trailing slash is fine
     if s.rstrip("/") == "":
-        raise ValueError(
-            "path must not be the root directory '/'; use a subdirectory like '/workspace'"
+        raise BackendError(
+            code=ErrorCode.PATH_IS_ROOT,
+            message="路径不能是根目录 '/'；请使用子目录如 '/workspace'",
         )
     return s
 
@@ -201,7 +212,7 @@ class VirtualPath(BaseModel):
     def relative_to(self, prefix: str) -> str:
         """Return the relative path fragment without leading ``'/'``.
 
-        Raises :class:`ValueError` when this path is not under *prefix*.
+        Raises :class:`BackendError` when this path is not under *prefix*.
 
         The *prefix* is normalized (trailing slash stripped) so both
         ``"/.mambo"`` and ``"/.mambo/"`` work identically.
@@ -211,7 +222,11 @@ class VirtualPath(BaseModel):
             return ""
         if self.value.startswith(prefix + "/"):
             return self.value[len(prefix) + 1:]
-        raise ValueError(f"{self.value!r} is not under {prefix!r}")
+        raise BackendError(
+            code=ErrorCode.PATH_NOT_UNDER,
+            path=self,
+            message=f"路径不在 '{prefix}/' 下",
+        )
 
     def endswith(self, suffix: str) -> bool:
         """Return ``True`` if this path's value ends with *suffix*."""
@@ -259,6 +274,67 @@ FileType = Literal["text", "image", "audio", "video", "file"]
 
 
 # ============================================================================
+# ErrorCode — machine-readable error classification
+# ============================================================================
+
+
+class ErrorCode(str, Enum):
+    """Structured error codes for :class:`BackendError`.
+
+    Replaces ad-hoc string matching (``"file_not_found"``, ``"not found"``
+    substring checks, etc.) with typed, machine-readable codes.
+    """
+
+    # -- 路径验证 ----------------------------------------------------------
+    PATH_TRAVERSAL = "PATH_TRAVERSAL"
+    """Path contains ``".."`` traversal segments."""
+    PATH_DOUBLE_SLASH = "PATH_DOUBLE_SLASH"
+    """Path contains ``"//"``."""
+    PATH_NOT_ABSOLUTE = "PATH_NOT_ABSOLUTE"
+    """Path does not start with ``"/"``."""
+    PATH_IS_ROOT = "PATH_IS_ROOT"
+    """Path is ``"/"`` (the root, which is forbidden)."""
+    PATH_EMPTY = "PATH_EMPTY"
+    """Path is empty or whitespace-only."""
+    PATH_NOT_UNDER = "PATH_NOT_UNDER"
+    """Path is not under the required prefix."""
+
+    # -- 工作区边界 --------------------------------------------------------
+    OUTSIDE_WORKSPACE = "OUTSIDE_WORKSPACE"
+    """Path is outside the configured workspace root."""
+    SYMLINK_ESCAPE = "SYMLINK_ESCAPE"
+    """Symlink resolves outside the working directory."""
+
+    # -- 文件操作 ----------------------------------------------------------
+    NOT_FOUND = "NOT_FOUND"
+    """File or directory does not exist."""
+    IS_DIR = "IS_DIR"
+    """Target is a directory when a file was expected."""
+    NOT_DIR = "NOT_DIR"
+    """Target is a file when a directory was expected."""
+    ALREADY_EXISTS = "ALREADY_EXISTS"
+    """File already exists and overwrite was not requested."""
+    FILE_TOO_LARGE = "FILE_TOO_LARGE"
+    """File exceeds the configured size limit."""
+
+    # -- 编辑 --------------------------------------------------------------
+    EDIT_NOT_ALLOWED = "EDIT_NOT_ALLOWED"
+    """Path is blocked by edit whitelist / blacklist."""
+    OLD_STR_NOT_FOUND = "OLD_STR_NOT_FOUND"
+    """The ``old_str`` was not found in the file."""
+    MULTI_OCCURRENCES = "MULTI_OCCURRENCES"
+    """``old_str`` appears more than once and ``replace_all`` was not set."""
+
+    # -- IO / 系统 ---------------------------------------------------------
+    IO_ERROR = "IO_ERROR"
+    """Generic filesystem I/O error."""
+    OS_ERROR = "OS_ERROR"
+    """Operating-system-level error (permissions, disk full, etc.)."""
+    INVALID = "INVALID"
+    """Catch-all for errors that don't fit a specific code."""
+
+
+# ============================================================================
 # Value objects
 # ============================================================================
 
@@ -293,6 +369,69 @@ class GrepMatch(BaseModel):
 
 
 # ============================================================================
+# BackendError — unified structured error (Model + Exception)
+# ============================================================================
+
+
+class BackendError(Exception):
+    """Unified structured error — raiseable AND storable as ``Result.error``.
+
+    Inherits :class:`Exception` so it can be raised / caught, and stores
+    typed attributes (``code``, ``path``, ``message``) so the hybrid
+    router can reverse-translate the path via :meth:`apply_reverse_translation`.
+
+    Replaces three string-based error mechanisms:
+
+    - ``ValueError`` from :func:`check_no_path_traversal` / etc.
+    - ``WorkspacePathError`` from backend ``_resolve()``
+    - ``str | None`` in ``Result.error``
+
+    Attributes:
+        code: Machine-readable :class:`ErrorCode`.
+        path: The offending :class:`VirtualPath`, or ``None``.
+        message: Human-readable description — does **not** embed raw paths.
+    """
+
+    def __init__(
+        self,
+        code: ErrorCode,
+        *,
+        path: VirtualPath | None = None,
+        message: str,
+    ) -> None:
+        self.code: ErrorCode = code
+        self.path: VirtualPath | None = path
+        self.message: str = message
+        super().__init__(message)
+
+    def __str__(self) -> str:
+        return f"[{self.code.value}] {self.message}"
+
+    def __eq__(self, other: object) -> bool:
+        if isinstance(other, BackendError):
+            return self.code == other.code and self.path == other.path and self.message == other.message
+        return NotImplemented
+
+    def __hash__(self) -> int:
+        return hash((self.code, self.path, self.message))
+
+    def apply_reverse_translation(
+        self,
+        reverse_fn: "ReversePathFn",
+        target_ws_root: VirtualPath,
+        virtual_prefix: VirtualPath,
+    ) -> "BackendError":
+        """Reverse-translate the *path* field through the hybrid boundary."""
+        if self.path is None:
+            return self
+        return BackendError(
+            code=self.code,
+            path=reverse_fn(self.path, target_ws_root, virtual_prefix),
+            message=self.message,
+        )
+
+
+# ============================================================================
 # Result — base class for all tool result types
 # ============================================================================
 
@@ -303,23 +442,42 @@ ReversePathFn = Callable[[VirtualPath, VirtualPath, VirtualPath], VirtualPath]
 class Result(BaseModel):
     """Base class for all tool results.
 
-    Subclasses that contain translatable path fields override
+    Subclasses that contain translatable ``VirtualPath`` fields override
     :meth:`apply_reverse_translation` to return a new instance with
-    all ``VirtualPath`` fields reverse-translated.
+    all path fields reverse-translated.
 
-    The default implementation returns ``self`` unchanged (for results
-    like :class:`ReadResult` that have no path fields).
+    The default implementation handles the ``error`` field (a
+    :class:`BackendError` whose ``path`` is also reverse-translated)
+    and returns *self* unchanged otherwise.
+    """
+
+    model_config = ConfigDict(arbitrary_types_allowed=True)
+
+    error: BackendError | None = None
+    """Structured error, or ``None`` on success.
+
+    :class:`BackendError` carries a machine-readable :class:`ErrorCode`,
+    the offending :class:`VirtualPath` (if applicable), and a human-readable
+    ``message`` that never embeds raw filesystem paths.
     """
 
     def apply_reverse_translation(
         self, reverse_fn: ReversePathFn, target_ws_root: VirtualPath, virtual_prefix: VirtualPath,
     ) -> Self:
-        """Return a new instance with all ``VirtualPath`` fields reverse-translated.
+        """Return a new instance with ``VirtualPath`` fields reverse-translated.
 
-        The default returns *self* unchanged.  Subclasses with path fields
-        override to return a ``model_copy(update={...})``.
+        The default implementation reverse-translates the ``error`` field
+        (if set) and returns *self* unchanged when there is no error.
+        Subclasses with additional path fields override, call ``super()``
+        first, then apply their own translations.
         """
-        return self
+        if self.error is None:
+            return self
+        return self.model_copy(update={
+            "error": self.error.apply_reverse_translation(
+                reverse_fn, target_ws_root, virtual_prefix,
+            ),
+        })
 
 
 # ============================================================================
@@ -330,19 +488,19 @@ class Result(BaseModel):
 class LsResult(Result):
     """Result from ``ls()``."""
 
-    error: str | None = None
     entries: list[FileInfo] | None = None
 
     def apply_reverse_translation(
         self, reverse_fn: ReversePathFn, target_ws_root: VirtualPath, virtual_prefix: VirtualPath,
     ) -> "LsResult":
+        result = super().apply_reverse_translation(reverse_fn, target_ws_root, virtual_prefix)
         if self.entries is None:
-            return self
+            return result
         entries = [
             e.model_copy(update={"path": reverse_fn(e.path, target_ws_root, virtual_prefix)})
             for e in self.entries
         ]
-        return self.model_copy(update={"entries": entries})
+        return result.model_copy(update={"entries": entries})
 
     def __str__(self) -> str:
         lines: list[str] = []
@@ -372,12 +530,8 @@ class ReadResult(Result):
     For non-text (multimodal) files, ``file_type`` is set to the
     appropriate classification (``"image"``, ``"audio"``, ``"video"``,
     or ``"file"``) and ``mime_type`` provides the IANA media type.
-
-    Has no translatable path fields — the default :meth:`Result.apply_reverse_translation`
-    (return *self* unchanged) is sufficient.
     """
 
-    error: str | None = None
     content: str | None = None
     total_lines: int = 0
     encoding: str | None = None
@@ -405,15 +559,15 @@ class WriteResult(Result):
     contents entirely.
     """
 
-    error: str | None = None
     path: VirtualPath | None = None
 
     def apply_reverse_translation(
         self, reverse_fn: ReversePathFn, target_ws_root: VirtualPath, virtual_prefix: VirtualPath,
     ) -> "WriteResult":
+        result = super().apply_reverse_translation(reverse_fn, target_ws_root, virtual_prefix)
         if self.path is None:
-            return self
-        return self.model_copy(update={"path": reverse_fn(self.path, target_ws_root, virtual_prefix)})
+            return result
+        return result.model_copy(update={"path": reverse_fn(self.path, target_ws_root, virtual_prefix)})
 
     def __str__(self) -> str:
         if self.error is not None:
@@ -424,16 +578,16 @@ class WriteResult(Result):
 class EditResult(Result):
     """Result from ``edit()`` — replace text in an existing file."""
 
-    error: str | None = None
     path: VirtualPath | None = None
     occurrences: int = 0
 
     def apply_reverse_translation(
         self, reverse_fn: ReversePathFn, target_ws_root: VirtualPath, virtual_prefix: VirtualPath,
     ) -> "EditResult":
+        result = super().apply_reverse_translation(reverse_fn, target_ws_root, virtual_prefix)
         if self.path is None:
-            return self
-        return self.model_copy(update={"path": reverse_fn(self.path, target_ws_root, virtual_prefix)})
+            return result
+        return result.model_copy(update={"path": reverse_fn(self.path, target_ws_root, virtual_prefix)})
 
     def __str__(self) -> str:
         if self.error is not None:
@@ -444,7 +598,6 @@ class EditResult(Result):
 class GrepResult(Result):
     """Result from ``grep()``."""
 
-    error: str | None = None
     matches: list[GrepMatch] | None = None
     truncated: bool = False
     """``True`` when the result was truncated by ``max_grep_matches`` or offset/limit."""
@@ -454,13 +607,14 @@ class GrepResult(Result):
     def apply_reverse_translation(
         self, reverse_fn: ReversePathFn, target_ws_root: VirtualPath, virtual_prefix: VirtualPath,
     ) -> "GrepResult":
+        result = super().apply_reverse_translation(reverse_fn, target_ws_root, virtual_prefix)
         if self.matches is None:
-            return self
+            return result
         matches = [
             m.model_copy(update={"path": reverse_fn(m.path, target_ws_root, virtual_prefix)})
             for m in self.matches
         ]
-        return self.model_copy(update={"matches": matches})
+        return result.model_copy(update={"matches": matches})
 
     def __str__(self) -> str:
         lines: list[str] = []
@@ -483,19 +637,19 @@ class GrepResult(Result):
 class GlobResult(Result):
     """Result from ``glob()``."""
 
-    error: str | None = None
     matches: list[FileInfo] | None = None
 
     def apply_reverse_translation(
         self, reverse_fn: ReversePathFn, target_ws_root: VirtualPath, virtual_prefix: VirtualPath,
     ) -> "GlobResult":
+        result = super().apply_reverse_translation(reverse_fn, target_ws_root, virtual_prefix)
         if self.matches is None:
-            return self
+            return result
         matches = [
             e.model_copy(update={"path": reverse_fn(e.path, target_ws_root, virtual_prefix)})
             for e in self.matches
         ]
-        return self.model_copy(update={"matches": matches})
+        return result.model_copy(update={"matches": matches})
 
     def __str__(self) -> str:
         lines: list[str] = []
@@ -517,12 +671,12 @@ class UploadFileResult(Result):
     """Result for a single file in a bulk upload."""
 
     path: VirtualPath
-    error: str | None = None
 
     def apply_reverse_translation(
         self, reverse_fn: ReversePathFn, target_ws_root: VirtualPath, virtual_prefix: VirtualPath,
     ) -> "UploadFileResult":
-        return self.model_copy(update={"path": reverse_fn(self.path, target_ws_root, virtual_prefix)})
+        result = super().apply_reverse_translation(reverse_fn, target_ws_root, virtual_prefix)
+        return result.model_copy(update={"path": reverse_fn(self.path, target_ws_root, virtual_prefix)})
 
 
 class DownloadFileResult(Result):
@@ -530,26 +684,26 @@ class DownloadFileResult(Result):
 
     path: VirtualPath
     content: bytes | None = None
-    error: str | None = None
 
     def apply_reverse_translation(
         self, reverse_fn: ReversePathFn, target_ws_root: VirtualPath, virtual_prefix: VirtualPath,
     ) -> "DownloadFileResult":
-        return self.model_copy(update={"path": reverse_fn(self.path, target_ws_root, virtual_prefix)})
+        result = super().apply_reverse_translation(reverse_fn, target_ws_root, virtual_prefix)
+        return result.model_copy(update={"path": reverse_fn(self.path, target_ws_root, virtual_prefix)})
 
 
 class DeleteResult(Result):
     """Result from ``delete()`` — delete a single file."""
 
-    error: str | None = None
     path: VirtualPath | None = None
 
     def apply_reverse_translation(
         self, reverse_fn: ReversePathFn, target_ws_root: VirtualPath, virtual_prefix: VirtualPath,
     ) -> "DeleteResult":
+        result = super().apply_reverse_translation(reverse_fn, target_ws_root, virtual_prefix)
         if self.path is None:
-            return self
-        return self.model_copy(update={"path": reverse_fn(self.path, target_ws_root, virtual_prefix)})
+            return result
+        return result.model_copy(update={"path": reverse_fn(self.path, target_ws_root, virtual_prefix)})
 
     def __str__(self) -> str:
         if self.error is not None:

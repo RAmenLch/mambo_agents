@@ -95,7 +95,7 @@ from langchain.agents.middleware.types import (
 )
 from langchain_core.messages import SystemMessage
 from langgraph.prebuilt import ToolRuntime
-from mambo_agents.backends.schemas import VirtualPath
+from mambo_agents.backends.schemas import ErrorCode, VirtualPath
 
 logger = logging.getLogger(__name__)
 
@@ -112,7 +112,7 @@ MAX_SKILL_NAME_LENGTH = 64
 MAX_SKILL_DESCRIPTION_LENGTH = 1024
 MAX_SKILL_COMPATIBILITY_LENGTH = 500
 
-FILE_NOT_FOUND = "file_not_found"
+FILE_NOT_FOUND = ErrorCode.NOT_FOUND
 
 # ---------------------------------------------------------------------------
 # Type aliases
@@ -450,7 +450,7 @@ def _skill_metadata_from_response(
 ) -> SkillMetadata | None:
     """Decode a SKILL.md download response into SkillMetadata (or None)."""
     if response.error:
-        if response.error != FILE_NOT_FOUND:
+        if response.error.code != FILE_NOT_FOUND:
             logger.warning(
                 "Cannot load SKILL.md at %s: %s; skipping",
                 skill_md_path, response.error,

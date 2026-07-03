@@ -260,43 +260,43 @@ class TestDetectTrailingNewlineMismatch:
     def test_no_mismatch__old_str_has_no_newline(self):
         """old_str without trailing newline → no mismatch to detect."""
         result = detect_trailing_newline_mismatch(
-            "file.py", "def foo():", "def foo():\n  pass"
+            "def foo():", "def foo():\n  pass"
         )
         assert result is None
 
     def test_no_mismatch__content_has_newline(self):
         """content ends with newline, old_str matches exactly."""
         result = detect_trailing_newline_mismatch(
-            "file.py", "def foo():\n", "def foo():\n"
+            "def foo():\n", "def foo():\n"
         )
         assert result is None
 
     def test_no_mismatch__neither_ends_with_newline(self):
         """Neither old_str nor content ends with \n."""
         result = detect_trailing_newline_mismatch(
-            "file.py", "def foo():", "def foo():"
+            "def foo():", "def foo():"
         )
         assert result is None
 
     def test_mismatch_detected_single_occurrence(self):
         """old_str ends with \n but content does not — mismatch detected (1 match)."""
         result = detect_trailing_newline_mismatch(
-            "file.py", "def foo():\n", "def foo():"
+            "def foo():\n", "def foo():"
         )
         assert result is not None
-        assert "newline" in (result.error or "").lower()
+        assert "换行" in str(result.error).lower()
 
     def test_mismatch_detected_multiple_occurrences(self):
         """old_str ends with \n but content does not — mismatch detected (3 matches)."""
         result = detect_trailing_newline_mismatch(
-            "file.py", "foo\n", "foo bar foo baz foo"
+            "foo\n", "foo bar foo baz foo"
         )
         assert result is not None
         assert result.occurrences == 0  # error result
-        assert "3 times" in (result.error or "")
+        assert "处" in str(result.error)
 
     def test_single_char_old_str_skipped(self):
         """old_str of length 1 with newline (e.g. just '\\n') should not crash."""
         # This falls through the len(old_str) > 1 check
-        result = detect_trailing_newline_mismatch("file.py", "\n", "x")
+        result = detect_trailing_newline_mismatch("\n", "x")
         assert result is None

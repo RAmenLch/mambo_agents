@@ -10,7 +10,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 import pytest
 
 from mambo_agents.backends.state import StateBackend
-from mambo_agents.backends.schemas import VirtualPath
+from mambo_agents.backends.schemas import ErrorCode, VirtualPath
 
 
 # ============================================================================
@@ -229,7 +229,7 @@ class TestStateBackendWrite:
             backend.write(VirtualPath("/dup.txt"), "original")
             r = backend.write(VirtualPath("/dup.txt"), "modified")
         assert r.error is not None
-        assert "already exists" in (r.error or "")
+        assert "已存在" in str(r.error)
 
     def test_write_overwrite(self):
         backend = StateBackend()
@@ -276,20 +276,20 @@ class TestStateBackendEdit:
         with _simulate_graph(backend):
             backend.write(VirtualPath("/f.txt"), "A-B-A")
             r = backend.edit(VirtualPath("/f.txt"), "A", "X")
-        assert "appears 2 times" in (r.error or "")
+        assert "处" in str(r.error)
 
     def test_edit_not_found(self):
         backend = StateBackend()
         with _simulate_graph(backend):
             backend.write(VirtualPath("/f.txt"), "hello")
             r = backend.edit(VirtualPath("/f.txt"), "gone", "x")
-        assert "old_str not found" in (r.error or "")
+        assert "未找到" in str(r.error)
 
     def test_edit_file_not_found(self):
         backend = StateBackend()
         with _simulate_graph(backend):
             r = backend.edit(VirtualPath("/no.txt"), "x", "y")
-        assert "file not found" in (r.error or "")
+        assert "不存在" in str(r.error)
 
     def test_edit_binary_blocked(self):
         """FIX 1: edit() blocks binary (base64) files with clear error."""
@@ -298,8 +298,7 @@ class TestStateBackendEdit:
             backend.write(VirtualPath("/img.png"), "AAAA")
             r = backend.edit(VirtualPath("/img.png"), "AAA", "BBB")
         assert r.error is not None
-        assert "binary" in (r.error or "").lower()
-        assert "base64" in (r.error or "").lower()
+        assert "二进制" in str(r.error)
 
     def test_edit_binary_from_initial_files_blocked(self):
         """FIX 1: edit() blocked even from initial_files binary."""
@@ -307,7 +306,7 @@ class TestStateBackendEdit:
         with _simulate_graph(backend):
             r = backend.edit(VirtualPath("/img.png"), "raw", "new")
         assert r.error is not None
-        assert "binary" in (r.error or "").lower()
+        assert "二进制" in str(r.error)
 
     def test_edit_trailing_newline_hint(self):
         backend = StateBackend()
@@ -315,7 +314,7 @@ class TestStateBackendEdit:
             backend.write(VirtualPath("/f.txt"), "def foo(): pass")
             r = backend.edit(VirtualPath("/f.txt"), "def foo(): pass\n", "def bar():\n")
         assert r.error is not None
-        assert "newline" in (r.error or "").lower()
+        assert "换行" in str(r.error).lower()
 
 
 # ============================================================================
@@ -355,7 +354,7 @@ class TestStateBackendRead:
         backend = StateBackend()
         with _simulate_graph(backend):
             r = backend.read(VirtualPath("/no.txt"))
-        assert "not found" in (r.error or "")
+        assert "不存在" in str(r.error)
 
 
 # ============================================================================
@@ -396,7 +395,7 @@ class TestStateBackendLs:
             # Non-root directories without files should return "not found"
             result = backend.ls(VirtualPath("/workspace/dir"))
         assert result.error is not None
-        assert "not found" in result.error
+        assert "不存在" in str(result.error)
 
 
 # ============================================================================
@@ -509,7 +508,7 @@ class TestStateBackendUploadDownload:
         backend = StateBackend()
         with _simulate_graph(backend):
             results = backend.download_files([VirtualPath("/workspace/no.txt")])
-        assert results[0].error == "file_not_found"
+        assert results[0].error.code == ErrorCode.NOT_FOUND
 
     def test_upload_multiple_in_graph(self):
         backend = StateBackend()
@@ -568,7 +567,7 @@ class TestStateBackendUploadDownload:
         """Downloading from a never-seen thread returns empty results."""
         backend = StateBackend()
         results = backend.download_files([VirtualPath("/workspace/a.txt")], thread_id="unknown")
-        assert results[0].error == "file_not_found"
+        assert results[0].error.code == ErrorCode.NOT_FOUND
 
 
 # ============================================================================

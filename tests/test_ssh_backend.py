@@ -13,8 +13,8 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-from mambo_agents.backends.protocol import ReadResult, WriteResult, WorkspacePathError
-from mambo_agents.backends.schemas import VirtualPath
+from mambo_agents.backends.protocol import ReadResult, WriteResult
+from mambo_agents.backends.schemas import BackendError, VirtualPath
 from mambo_agents.backends.ssh import SshBackend
 
 
@@ -172,7 +172,7 @@ class TestReadRaw:
 
         assert result.content is None
         assert result.error is not None
-        assert "directory" in result.error
+        assert "目录" in str(result.error)
 
     def test_read_file_not_found(self, ssh_backend):
         """Non-existent file should return an error."""
@@ -183,7 +183,7 @@ class TestReadRaw:
 
         assert result.content is None
         assert result.error is not None
-        assert "not found" in result.error.lower()
+        assert "不存在" in str(result.error)
 
     def test_read_unicode_decode_error(self, ssh_backend):
         """When UTF-8 decode fails on a non-multimedia file, return an error."""
@@ -195,7 +195,7 @@ class TestReadRaw:
         result = ssh_backend.read_raw(VirtualPath(f"{_W}/broken.txt"))
 
         assert result.error is not None
-        assert "not a recognized text or multimedia format" in result.error
+        assert "无法读取" in str(result.error)
         assert result.content is None
 
     def test_read_empty_file(self, ssh_backend):
@@ -213,7 +213,7 @@ class TestReadRaw:
         """Paths outside /workspace are rejected even before SFTP access."""
         result = ssh_backend.read_raw(VirtualPath("/etc/passwd"))
         assert result.error is not None
-        assert "outside the workspace" in (result.error or "")
+        assert "超出工作区" in str(result.error)
 
 
 # ============================================================================
@@ -294,13 +294,13 @@ class TestWrite:
         result = ssh_backend.write(VirtualPath(f"{_W}/forbidden/file.txt"), "data")
 
         assert result.error is not None
-        assert "not allowed" in result.error.lower()
+        assert "不允许" in str(result.error)
 
     def test_write_outside_workspace_rejected(self, ssh_backend):
         """Write to path outside /workspace is rejected."""
         result = ssh_backend.write(VirtualPath("/etc/hosts"), "evil")
         assert result.error is not None
-        assert "outside the workspace" in (result.error or "")
+        assert "超出工作区" in str(result.error)
 
 
 # ============================================================================

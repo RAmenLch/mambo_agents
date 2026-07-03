@@ -10,7 +10,7 @@ from typing import Literal
 
 from pydantic import BaseModel, ValidationError
 
-from mambo_agents.backends.schemas import EditResult, VirtualPath
+from mambo_agents.backends.schemas import BackendError, EditResult, ErrorCode, VirtualPath
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -194,7 +194,6 @@ def check_path_allowed(
 
 
 def detect_trailing_newline_mismatch(
-    file_path: str,
     old_str: str,
     existing_content: str,
 ) -> EditResult | None:
@@ -218,19 +217,14 @@ def detect_trailing_newline_mismatch(
     stripped_count = existing_content.count(stripped)
     if stripped_count == 1:
         return EditResult(
-            error=(
-                "old_str ends with a newline, but the file does not "
-                "end with a newline. Retry with the trailing newline "
-                "removed from old_str (and from new_str if it also "
-                "ends with a newline)."
+            error=BackendError(
+                code=ErrorCode.OLD_STR_NOT_FOUND,
+                message="old_str 以换行符结尾，但文件不以换行符结尾。请去掉 old_str 末尾的换行符后重试",
             ),
         )
     return EditResult(
-        error=(
-            f"old_str ends with a newline, but the file does not "
-            f"end with a newline. With the trailing newline removed, "
-            f"old_str would appear {stripped_count} times. "
-            f"Retry with the trailing newline removed and add "
-            f"surrounding context so the match is unique."
+        error=BackendError(
+            code=ErrorCode.MULTI_OCCURRENCES,
+            message=f"old_str 以换行符结尾，去掉后匹配到 {stripped_count} 处。请去掉末尾换行符并增加上下文使匹配唯一",
         ),
     )

@@ -174,21 +174,6 @@ class ToolTimeoutError(Exception):
 
 
 # ============================================================================
-# Workspace path error
-# ============================================================================
-
-
-class WorkspacePathError(ValueError):
-    """Raised when a virtual path falls outside the workspace root.
-
-    Each backend defines a ``workspace_root`` (default ``"/workspace"``)
-    that serves as the only valid anchor for file operations.  Any path
-    outside this prefix is rejected so the AI never perceives the virtual
-    filesystem as a real system root.
-    """
-
-
-# ============================================================================
 # Protocol
 # ============================================================================
 
@@ -224,7 +209,7 @@ class BackendProtocol(abc.ABC):
 
     All file operations must target paths under this prefix (e.g.
     ``"/workspace/src/main.py"``).  Paths outside are rejected with
-    :class:`WorkspacePathError` so the AI never treats the virtual
+    :class:`~mambo_agents.backends.schemas.BackendError` so the AI never treats the virtual
     filesystem as a real system root.
     """
 
@@ -670,10 +655,10 @@ class BackendProtocol(abc.ABC):
         for path, raw_content in files:
             try:
                 text = raw_content.decode("utf-8")
-                w = self.write(path, text)
+                w = self.write(path, text, overwrite=True)
             except UnicodeDecodeError:
                 encoded = base64.b64encode(raw_content).decode("ascii")
-                w = self.write(path, encoded)
+                w = self.write(path, encoded, overwrite=True)
             results.append(
                 UploadFileResult(path=path, error=w.error)
             )

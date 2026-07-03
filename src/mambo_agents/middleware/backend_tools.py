@@ -29,7 +29,7 @@ from langgraph.typing import ContextT
 from pydantic import BaseModel, Field
 
 from mambo_agents.backends.protocol import BackendProtocol, ReadResult, ToolTimeoutError
-from mambo_agents.backends.schemas import VirtualPath
+from mambo_agents.backends.schemas import BackendError, VirtualPath
 from mambo_agents.backends.state_schema import FilesystemState
 from mambo_agents.backends.utils import format_validation_error
 
@@ -327,6 +327,8 @@ def _build_sync_read_tool(backend: BackendProtocol) -> StructuredTool:
             )
         except ToolTimeoutError as e:
             return str(e)
+        except BackendError as e:
+            return str(e)
         if result.is_multimodal and result.content is not None:
             tool_call_id = (runtime.tool_call_id or "") if runtime is not None else ""
             return ToolMessage(
@@ -371,6 +373,8 @@ def _build_sync_read_tool(backend: BackendProtocol) -> StructuredTool:
                 file_path, offset, limit, include_line_numbers,
             )
         except ToolTimeoutError as e:
+            return str(e)
+        except BackendError as e:
             return str(e)
         if result.is_multimodal and result.content is not None:
             tool_call_id = (runtime.tool_call_id or "") if runtime is not None else ""
@@ -435,6 +439,8 @@ def build_core_tools(backend: BackendProtocol) -> list[StructuredTool]:
                 return str(wrapped_sync(**kwargs))
             except ToolTimeoutError as e:
                 return str(e)
+            except BackendError as e:
+                return str(e)
         return tool_func
 
     def _make_coro(method_name: str):
@@ -447,6 +453,8 @@ def build_core_tools(backend: BackendProtocol) -> list[StructuredTool]:
             try:
                 return str(await wrapped(**kwargs))
             except ToolTimeoutError as e:
+                return str(e)
+            except BackendError as e:
                 return str(e)
         return tool_coro
 
@@ -592,16 +600,47 @@ class BackendToolsMiddleware(AgentMiddleware[FilesystemState, ContextT, Response
         request: ToolCallRequest,
         handler: Callable[[ToolCallRequest], ToolMessage],
     ) -> ToolMessage:
-        result = handler(request)
-        return self._maybe_evict(result, request)
+        try:
+            result = handler(request)
+            return self._maybe_evict(result, request)
+        except BackendError as e:
+            return self._build_error_tool_message(request, e)
 
     async def awrap_tool_call(
         self,
         request: ToolCallRequest,
         handler: Callable[[ToolCallRequest], Awaitable[ToolMessage]],
     ) -> ToolMessage:
-        result = await handler(request)
-        return await self._amaybe_evict(result, request)
+        try:
+            result = await handler(request)
+            return await self._amaybe_evict(result, request)
+        except BackendError as e:
+            return self._build_error_tool_message(request, e)
+
+    # ------------------------------------------------------------------
+    # Error handling — catch BackendError and turn it into a ToolMessage
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _build_error_tool_message(
+        request: ToolCallRequest,
+        error: BackendError,
+    ) -> ToolMessage:
+        """Convert a :class:`BackendError` into a ``ToolMessage`` with ``status="error"``.
+
+        This prevents :class:`BackendError` raised during Pydantic validation
+        (e.g. path traversal in :class:`VirtualPath`) or backend operations
+        from crashing the entire graph run — the LLM sees the error message and
+        can retry with corrected arguments.
+        """
+        tool_call_id = request.tool_call.get("id", "")
+        tool_name = request.tool_call.get("name", "")
+        return ToolMessage(
+            content=str(error),
+            name=tool_name,
+            tool_call_id=tool_call_id,
+            status="error",
+        )
 
     # ------------------------------------------------------------------
     # Eviction logic

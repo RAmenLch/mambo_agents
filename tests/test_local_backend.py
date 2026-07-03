@@ -11,8 +11,7 @@ from langgraph.checkpoint.memory import MemorySaver
 
 from mambo_agents import create_mambo_agent
 from mambo_agents.backends.local import LocalBackend
-from mambo_agents.backends.schemas import VirtualPath
-from mambo_agents.backends.protocol import WorkspacePathError
+from mambo_agents.backends.schemas import BackendError, VirtualPath
 from mambo_agents.backends.state import StateBackend
 
 
@@ -85,7 +84,7 @@ class TestLocalBackend:
         backend.write(VirtualPath(f"{_W}/a.txt"), "original")
         r = backend.write(VirtualPath(f"{_W}/a.txt"), "modified")
         assert r.error is not None
-        assert "already exists" in (r.error or "")
+        assert "已存在" in str(r.error)
 
     def test_edit_replaces_text(self, tmp_root):
         backend = LocalBackend(root_dir=str(tmp_root))
@@ -105,13 +104,13 @@ class TestLocalBackend:
         backend.write(VirtualPath(f"{_W}/code.py"), "hello")
         r = backend.edit(VirtualPath(f"{_W}/code.py"), "not there", "x")
         assert r.error is not None
-        assert "old_str not found" in (r.error or "")
+        assert "未找到" in str(r.error)
 
     def test_edit_file_not_found(self, tmp_root):
         backend = LocalBackend(root_dir=str(tmp_root))
         r = backend.edit(VirtualPath(f"{_W}/ghost.py"), "something", "x")
         assert r.error is not None
-        assert "file not found" in (r.error or "")
+        assert "不存在" in str(r.error)
 
     def test_ls(self, tmp_root):
         backend = LocalBackend(root_dir=str(tmp_root))
@@ -130,7 +129,7 @@ class TestLocalBackend:
         backend = LocalBackend(root_dir=str(tmp_root))
         r = backend.read(VirtualPath(f"{_W}/nope.txt"))
         assert r.error is not None
-        assert "not found" in r.error
+        assert "不存在" in str(r.error)
 
     def test_grep(self, tmp_root):
         backend = LocalBackend(root_dir=str(tmp_root))
@@ -168,14 +167,14 @@ class TestLocalBackend:
         backend = LocalBackend(root_dir=str(tmp_root))
         r = backend.ls(VirtualPath("/etc"))
         assert r.error is not None
-        assert "outside the workspace" in (r.error or "")
+        assert "超出工作区" in str(r.error)
 
     def test_path_outside_workspace_write_rejected(self, tmp_root):
         """write to /etc/passwd-like path is rejected."""
         backend = LocalBackend(root_dir=str(tmp_root))
         r = backend.write(VirtualPath("/etc/passwd"), "evil")
         assert r.error is not None
-        assert "outside the workspace" in (r.error or "")
+        assert "超出工作区" in str(r.error)
 
     # ------------------------------------------------------------------
     # Delete tool
@@ -197,14 +196,14 @@ class TestLocalBackend:
         (tmp_root / "fulldir").mkdir()
         (tmp_root / "fulldir" / "file.txt").write_text("hi")
         r = backend.delete(VirtualPath(f"{_W}/fulldir"))
-        assert "is a directory" in str(r)
+        assert "目标" in str(r)
         assert (tmp_root / "fulldir").exists()
         assert (tmp_root / "fulldir" / "file.txt").exists()
 
     def test_delete_not_found(self, tmp_root):
         backend = LocalBackend(root_dir=str(tmp_root))
         r = backend.delete(VirtualPath(f"{_W}/nope.txt"))
-        assert "does not exist" in str(r)
+        assert "不存在" in str(r)
 
     def test_delete_tool_registered(self, tmp_root):
         """delete tool is always available in LocalBackend."""
@@ -269,7 +268,7 @@ class TestLocalBackend:
         )
         r = backend.write(VirtualPath(f"{_W}/outside.txt"), "hello")
         assert r.error is not None
-        assert "not allowed" in (r.error or "")
+        assert "不允许" in str(r.error)
 
     def test_edit_whitelist_allows_write(self, tmp_root):
         """write to a whitelisted path is allowed."""
@@ -289,7 +288,7 @@ class TestLocalBackend:
         )
         r = backend.edit(VirtualPath(f"{_W}/build/output.o"), "a", "b")
         assert r.error is not None
-        assert "not allowed" in (r.error or "")
+        assert "不允许" in str(r.error)
 
     def test_edit_blacklist_allows_other_paths(self, tmp_root):
         """edit on a non-blacklisted path works normally."""
@@ -309,7 +308,7 @@ class TestLocalBackend:
             edit_whitelist=frozenset({VirtualPath(f"{_W}/src")}),
         )
         r = backend.delete(VirtualPath(f"{_W}/outside/secret.txt"))
-        assert "not allowed" in str(r)
+        assert "不允许" in str(r)
 
     def test_blacklist_blocks_delete(self, tmp_root):
         """delete on a blacklisted path is rejected."""
@@ -319,7 +318,7 @@ class TestLocalBackend:
         )
         (tmp_root / "important").mkdir()
         r = backend.delete(VirtualPath(f"{_W}/important"))
-        assert "not allowed" in str(r)
+        assert "不允许" in str(r)
 
     # ------------------------------------------------------------------
     # tree with ignore_dirs

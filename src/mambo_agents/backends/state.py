@@ -42,7 +42,7 @@ from mambo_agents.backends.utils import (
     detect_trailing_newline_mismatch,
     format_with_line_numbers,
 )
-from mambo_agents.backends.schemas import VirtualPath,human_size
+from mambo_agents.backends.schemas import BackendError, ErrorCode, VirtualPath, human_size
 
 # ---------------------------------------------------------------------------
 # StateBackend
@@ -94,9 +94,9 @@ class StateBackend(ThreadAwareWorkspace):
             for raw_path, content_ in initial_files.items():
                 vp = VirtualPath(raw_path)  # validate absolute, no "..", no "//"
                 if vp.value.endswith("/"):
-                    raise ValueError(
-                        f"initial_files path must not end with '/': {raw_path!r} "
-                        f"(directories are not supported)"
+                    raise BackendError(
+                        code=ErrorCode.INVALID,
+                        message=f"initial_files 路径不能以 '/' 结尾: {raw_path!r}",
                     )
                 encoding = "base64" if _get_file_type(vp.normalized) != "text" else "utf-8"
                 self._initial_files[vp.normalized] = FileData(
@@ -328,7 +328,7 @@ class StateBackend(ThreadAwareWorkspace):
         files = self._read_files()
         # Check if path itself is a file, not a directory
         if path.normalized in files:
-            return LsResult(error=f"'{path}' is a file, not a directory")
+            return LsResult(error=BackendError(code=ErrorCode.NOT_DIR, path=path, message="目标是文件，不是目录"))
 
         infos: list[FileInfo] = []
         subdirs: set[str] = set()
@@ -348,7 +348,7 @@ class StateBackend(ThreadAwareWorkspace):
             # workspace_root always exists even when empty
             if path.normalized == self.workspace_root.normalized:
                 return LsResult(entries=[])
-            return LsResult(error=f"Path '{path}' not found")
+            return LsResult(error=BackendError(code=ErrorCode.NOT_FOUND, path=path, message="路径不存在"))
 
         for sd in sorted(subdirs):
             infos.append(FileInfo(path=sd, is_dir=True, size=0))
@@ -364,11 +364,11 @@ class StateBackend(ThreadAwareWorkspace):
         include_line_numbers: bool = False,
     ) -> ReadResult:
         if file_path.value.endswith("/"):
-            return ReadResult(error=f"Cannot read '{file_path}': looks like a directory")
+            return ReadResult(error=BackendError(code=ErrorCode.IS_DIR, path=file_path, message="目标是目录"))
         files = self._read_files()
         fd = files.get(file_path.normalized)
         if fd is None:
-            return ReadResult(error=f"File '{file_path}' not found")
+            return ReadResult(error=BackendError(code=ErrorCode.NOT_FOUND, path=file_path, message="文件不存在"))
 
         content = fd.get("content", "")
         encoding = fd.get("encoding", "utf-8")
@@ -406,22 +406,18 @@ class StateBackend(ThreadAwareWorkspace):
         self, file_path: VirtualPath, content: str, overwrite: bool = False,
     ) -> WriteResult:
         if file_path.value.endswith("/"):
-            return WriteResult(error=f"'{file_path}' looks like a directory — use ls() to list it")
+            return WriteResult(error=BackendError(code=ErrorCode.IS_DIR, path=file_path, message="目标是目录"))
         files = self._read_files()
         # Check if file_path is a "directory" (contains child files)
         prefix = file_path.normalized + "/"
         for fpath in files:
             if fpath.startswith(prefix):
                 return WriteResult(
-                    error=f"'{file_path}' is a directory, cannot write to it"
+                    error=BackendError(code=ErrorCode.IS_DIR, path=file_path, message="目标是目录，无法写入"),
                 )
         if file_path.normalized in files and not overwrite:
             return WriteResult(
-                error=(
-                    f"Cannot write '{file_path}': file already exists. "
-                    "Read the file and use edit() to modify it, "
-                    "or use overwrite=True to replace the file."
-                ),
+                error=BackendError(code=ErrorCode.ALREADY_EXISTS, path=file_path, message="文件已存在，请用 edit() 修改或用 overwrite=True 覆盖"),
             )
         encoding = "base64" if _get_file_type(file_path.normalized) != "text" else "utf-8"
         fd: FileData = {"content": content, "encoding": encoding}
@@ -437,31 +433,25 @@ class StateBackend(ThreadAwareWorkspace):
         replace_all: bool = False,
     ) -> EditResult:
         if file_path.value.endswith("/"):
-            return EditResult(error=f"'{file_path}' looks like a directory — use ls() to list it")
+            return EditResult(error=BackendError(code=ErrorCode.IS_DIR, path=file_path, message="目标是目录"))
         if not old_str:
-            return EditResult(error="old_str must not be empty")
+            return EditResult(error=BackendError(code=ErrorCode.INVALID, message="old_str 不能为空"))
         files = self._read_files()
         # Check if file_path is a "directory" (contains child files)
         prefix = file_path.normalized + "/"
         for fpath in files:
             if fpath.startswith(prefix):
                 return EditResult(
-                    error=f"'{file_path}' is a directory, cannot edit it"
+                    error=BackendError(code=ErrorCode.IS_DIR, path=file_path, message="目标是目录，无法编辑"),
                 )
         existing_fd = files.get(file_path.normalized)
         if existing_fd is None:
             return EditResult(
-                error=(
-                    f"Cannot edit '{file_path}': file not found. "
-                    "To create a new file, use write()."
-                ),
+                error=BackendError(code=ErrorCode.NOT_FOUND, path=file_path, message="文件不存在，请用 write() 创建新文件"),
             )
         if existing_fd.get("encoding") == "base64":
             return EditResult(
-                error=(
-                    f"Cannot edit '{file_path}': file is binary "
-                    f"(base64 encoded). Use write() to replace the file."
-                ),
+                error=BackendError(code=ErrorCode.INVALID, path=file_path, message="文件是二进制格式，请用 write() 覆盖"),
             )
 
         existing_content = existing_fd.get("content", "")
@@ -472,24 +462,17 @@ class StateBackend(ThreadAwareWorkspace):
             # Detect trailing-newline mismatch: model adds \n to old_str
             # but the file does not end with a newline.
             mismatch = detect_trailing_newline_mismatch(
-                file_path.normalized, old_str, existing_content,
+                old_str, existing_content,
             )
             if mismatch is not None:
                 return mismatch
             return EditResult(
-                error=(
-                    f"Cannot edit '{file_path}': old_str not found in file. "
-                    "Read the file first to see its exact content."
-                ),
+                error=BackendError(code=ErrorCode.OLD_STR_NOT_FOUND, path=file_path, message="未找到要替换的文本"),
             )
 
         if occurrences > 1 and not replace_all:
             return EditResult(
-                error=(
-                    f"Cannot edit '{file_path}': old_str appears {occurrences} times "
-                    f"in the file. Use replace_all=True to replace all occurrences, "
-                    f"or provide a more specific old_str with surrounding context."
-                ),
+                error=BackendError(code=ErrorCode.MULTI_OCCURRENCES, path=file_path, message=f"匹配到 {occurrences} 处，请用 replace_all=True 或提供更精确的上下文"),
             )
 
         fd: FileData = {
@@ -509,13 +492,13 @@ class StateBackend(ThreadAwareWorkspace):
         limit: int | None = None,
     ) -> GrepResult:
         if not pattern:
-            return GrepResult(error="pattern must not be empty")
+            return GrepResult(error=BackendError(code=ErrorCode.INVALID, message="搜索模式不能为空"))
         if regex:
             import re as _re
             try:
                 _re.compile(pattern)
             except _re.error as e:
-                return GrepResult(error=f"Invalid regex pattern: {e}")
+                return GrepResult(error=BackendError(code=ErrorCode.INVALID, message=f"无效正则: {e}"))
         files = self._read_files()
         raw_matches = _grep_in_memory(files, pattern, path.normalized, glob, regex, self._max_grep_matches)
         return self._apply_grep_limit(raw_matches, offset, limit)
@@ -642,7 +625,7 @@ class StateBackend(ThreadAwareWorkspace):
             fd = files.get(path.normalized)
             if fd is None:
                 results.append(
-                    DownloadFileResult(path=path.normalized, content=None, error="file_not_found")
+                    DownloadFileResult(path=path.normalized, content=None, error=BackendError(code=ErrorCode.NOT_FOUND, path=path, message="文件不存在"))
                 )
                 continue
             content = fd.get("content", "")

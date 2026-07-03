@@ -57,7 +57,7 @@ from langchain_core.messages import SystemMessage
 from langgraph.prebuilt import ToolRuntime
 
 from mambo_agents.backends.protocol import BackendProtocol
-from mambo_agents.backends.schemas import VirtualPath
+from mambo_agents.backends.schemas import ErrorCode, VirtualPath
 
 if TYPE_CHECKING:
     from collections.abc import Awaitable
@@ -370,7 +370,7 @@ class MamboMemoryMiddleware(AgentMiddleware[MemoryState, ContextT, ResponseT]):
         results = backend.download_files(list(self.sources))
         for path, response in zip(self.sources, results, strict=True):
             if response.error is not None:
-                if response.error == "file_not_found":
+                if response.error.code == ErrorCode.NOT_FOUND:
                     continue
                 msg = f"Failed to download {path}: {response.error}"
                 raise ValueError(msg)
@@ -412,7 +412,7 @@ class MamboMemoryMiddleware(AgentMiddleware[MemoryState, ContextT, ResponseT]):
         results = await backend.adownload_files(list(self.sources))
         for path, response in zip(self.sources, results, strict=True):
             if response.error is not None:
-                if response.error == "file_not_found":
+                if response.error.code == ErrorCode.NOT_FOUND:
                     continue
                 msg = f"Failed to download {path}: {response.error}"
                 raise ValueError(msg)

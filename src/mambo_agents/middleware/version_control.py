@@ -71,7 +71,7 @@ from langgraph.typing import ContextT
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from mambo_agents.backends.protocol import BackendProtocol
-from mambo_agents.backends.schemas import VirtualPath
+from mambo_agents.backends.schemas import BackendError, VirtualPath
 from mambo_agents.backends.state_schema import FilesystemState
 
 # ---------------------------------------------------------------------------
@@ -551,7 +551,7 @@ def _extract_file_path(tool_call: ToolCall) -> VirtualPath | None:
         if raw is not None:
             try:
                 return VirtualPath(raw)
-            except (ValueError, TypeError):
+            except (ValueError, TypeError, BackendError):
                 return None
     return None
 

@@ -16,7 +16,7 @@ from mambo_agents import (
     create_mambo_agent,
 )
 from mambo_agents.backends.state import StateBackend
-from mambo_agents.backends.schemas import VirtualPath
+from mambo_agents.backends.schemas import BackendError, ErrorCode, VirtualPath
 from tests.test_state_backend import _simulate_graph
 from mambo_agents.middleware.summarization import (
     DEFAULT_MAMBO_CHAINED_SUMMARY_PROMPT,
@@ -352,7 +352,7 @@ AI: old response
         model = _make_mock_summary_model()
         backend = _make_mock_backend()
         backend.download_files.return_value = []
-        backend.write.return_value = MagicMock(error="disk full")
+        backend.write.return_value = MagicMock(error=BackendError(code=ErrorCode.IO_ERROR, message="disk full"))
 
         mw = MamboSummarizationMiddleware(model=model, backend=backend, offload_to_backend=True)
         runtime = MagicMock(spec=[])

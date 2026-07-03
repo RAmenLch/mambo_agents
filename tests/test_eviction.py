@@ -9,7 +9,7 @@ from langchain_core.messages import ToolMessage
 from langgraph.prebuilt.tool_node import ToolCallRequest
 
 from mambo_agents.backends.state import StateBackend
-from mambo_agents.backends.schemas import VirtualPath
+from mambo_agents.backends.schemas import BackendError, ErrorCode, VirtualPath
 from tests.test_state_backend import _simulate_graph
 from mambo_agents.middleware.backend_tools import (
     BackendToolsMiddleware,
@@ -310,7 +310,7 @@ class TestEviction:
         class FailWriteBackend(StateBackend):
             def write(self, file_path: str, content: str):
                 from mambo_agents.backends.protocol import WriteResult
-                return WriteResult(error="Disk full", path=str(file_path))
+                return WriteResult(error=BackendError(code=ErrorCode.IO_ERROR, path=str(file_path), message="Disk full"), path=str(file_path))
 
         mw.backend = FailWriteBackend()
 
