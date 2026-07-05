@@ -525,13 +525,18 @@ class VersionControlMiddleware(AgentMiddleware[FilesystemState, ContextT, Any]):
            (first ``invoke()`` call).
         """
         configurable = config.get("configurable", {})
+        # 自定义字段，由 chat_worker 注入，不会被 LangGraph per-task config 覆盖
+        vc_parent = configurable.get("version_control_parent_cp")
+        if vc_parent:
+            return vc_parent
+
         cp_id = configurable.get("checkpoint_id")
+        cp_map = configurable.get("checkpoint_map", {})
+        checkpoint_ns = configurable.get("checkpoint_ns", "")
+        parent_cp = cp_map.get(checkpoint_ns) or cp_map.get("")
         if cp_id:
             return cp_id
 
-        cp_map = configurable.get("checkpoint_map", {})
-        checkpoint_ns = configurable.get("checkpoint_ns", "")
-        parent_cp = cp_map.get(checkpoint_ns)
         if parent_cp:
             return parent_cp
 

@@ -1391,16 +1391,13 @@ class SshBackend(BackendProtocol):
                 continue
             filtered_files.append((parent, name, size))
 
-        # Build TreeEntry list
-        entries: list[TreeEntry] = []
+        # Build (sort_path, TreeEntry) tuples — sort by full path so that
+        # files appear immediately after their parent directory instead of
+        # all being grouped at the bottom.
+        dir_file_entries: list[tuple[str, TreeEntry]] = []
 
-        # Add path root itself
-        root_name = path.name
-        entries.append(TreeEntry(name=root_name + "/", depth=0))
-
-        # Sort dirs by depth then name
-        sorted_dirs = sorted(filtered_dirs, key=lambda d: (_path_depth(d), d))
-        for d in sorted_dirs:
+        # Directories
+        for d in filtered_dirs:
             d_depth = _path_depth(d)
             if d_depth > depth:
                 continue
@@ -1428,33 +1425,45 @@ class SshBackend(BackendProtocol):
                 if not has_children:
                     marker = "empty"
 
-            entries.append(TreeEntry(
+            # Sort path: directory paths get trailing "/" so they sort
+            # before files in the same directory (e.g. "0849fe09/" < "0849fe09/file.png")
+            sort_path = d + "/"
+            dir_file_entries.append((sort_path, TreeEntry(
                 name=PurePosixPath(d).name + "/",
                 depth=d_depth,
                 marker=marker,
-            ))
+            )))
 
         # Add ignored dirs (show but with ignore marker, no children)
         for ign in sorted(ignore_rel_paths):
             if ign in dirs:  # only if it actually exists
-                entries.append(TreeEntry(
+                sort_path = ign + "/"
+                dir_file_entries.append((sort_path, TreeEntry(
                     name=ign.split("/")[-1] + "/",
                     depth=ign.count("/") + 1,
                     marker="ignore",
-                ))
+                )))
 
-        # Sort files by depth then name
-        for parent, name, size in sorted(
-            filtered_files,
-            key=lambda f: ((f[0] + "/" + f[1]).count("/") if f[0] != "." else f[1].count("/"), f[0], f[1]),
-        ):
+        # Files
+        for parent, name, size in filtered_files:
             d = (parent + "/" + name).count("/") + 1 if parent != "." else 1
             if d > depth:
                 continue
-            entries.append(TreeEntry(
+            sort_path = (parent + "/" + name) if parent != "." else name
+            dir_file_entries.append((sort_path, TreeEntry(
                 name=f"{name} ({human_size(size)})",
                 depth=d,
-            ))
+            )))
+
+        # Sort all entries by their full relative path so children
+        # appear right after their parent directory
+        dir_file_entries.sort(key=lambda x: x[0])
+
+        # Build final entries list
+        entries: list[TreeEntry] = []
+        root_name = path.name
+        entries.append(TreeEntry(name=root_name + "/", depth=0))
+        entries.extend(e[1] for e in dir_file_entries)
 
         return format_tree_entries(entries)
 

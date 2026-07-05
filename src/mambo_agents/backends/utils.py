@@ -141,7 +141,7 @@ def format_tree_entries(
             lines.append(display)
         else:
             prefix_parts: list[str] = []
-            for level in range(1, depth + 1):
+            for level in range(1, depth):  # parent levels only; own level uses connector
                 active = False
                 for j in range(i + 1, len(entries)):
                     if entries[j].depth < level:
