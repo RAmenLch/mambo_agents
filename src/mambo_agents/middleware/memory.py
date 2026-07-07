@@ -13,11 +13,11 @@ evolves through use.
 ## Usage
 
 ```python
-from mambo_agents.backends.state import StateBackend
+from mambo_agents.backends.store import StoreBackend
 from mambo_agents.middleware.memory import MamboMemoryMiddleware
 
 middleware = MamboMemoryMiddleware(
-    backend=StateBackend(),
+    backend=StoreBackend(),
     sources=[VirtualPath("/.mambo/memory/AGENTS.md")],
 )
 ```
@@ -267,11 +267,11 @@ class MamboMemoryMiddleware(AgentMiddleware[MemoryState, ContextT, ResponseT]):
 
     Example:
         ```python
-        from mambo_agents.backends.state import StateBackend
+        from mambo_agents.backends.store import StoreBackend
         from mambo_agents.middleware.memory import MamboMemoryMiddleware
 
         middleware = MamboMemoryMiddleware(
-            backend=StateBackend(),
+            backend=StoreBackend(),
             sources=[VirtualPath("/.mambo/memory/AGENTS.md")],
         )
         ```
@@ -291,7 +291,7 @@ class MamboMemoryMiddleware(AgentMiddleware[MemoryState, ContextT, ResponseT]):
         Args:
             backend: Backend instance or factory ``(runtime) → backend``.
                 Use a factory for backends that need runtime context
-                (e.g. ``StateBackend``).
+                (e.g. ``StoreBackend``).
             sources: List of memory file paths to load.  Sources are
                 loaded in order and all content is included.
             format_prompt: Optional custom formatter.  Receives the

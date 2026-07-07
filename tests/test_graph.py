@@ -1,6 +1,6 @@
 """Dedicated unit tests for ``create_mambo_agent()`` — branch coverage.
 
-All tests use ``FakeListChatModel`` (no real LLM), ``StateBackend`` (in-memory),
+All tests use ``FakeListChatModel`` (no real LLM), ``StoreBackend`` (in-memory),
 and ``MemorySaver`` — fully safe, zero network.
 """
 
@@ -8,9 +8,10 @@ import pytest
 from langchain_core.language_models import FakeListChatModel
 from langchain_core.tools import StructuredTool
 from langgraph.checkpoint.memory import MemorySaver
+from langgraph.store.memory import InMemoryStore
 
 from mambo_agents import create_mambo_agent
-from mambo_agents.backends.state import StateBackend
+from mambo_agents.backends.store import StoreBackend
 from mambo_agents.middleware.security_review import SecurityReviewConfig
 
 
@@ -23,20 +24,24 @@ def _create_model():
     return FakeListChatModel(responses=["done"])
 
 
+def _make_backend():
+    return StoreBackend(store=InMemoryStore())
+
+
 # ============================================================================
 # Constructor — default routing
 # ============================================================================
 
 
 class TestDefaultBackend:
-    """No backend → StateBackend() default."""
+    """No backend → StoreBackend() default."""
 
-    def test_no_backend_defaults_to_state_backend(self):
+    def test_no_backend_defaults_to_store_backend(self):
         agent = create_mambo_agent(_create_model())
         assert agent is not None
 
-    def test_explicit_state_backend(self):
-        agent = create_mambo_agent(_create_model(), backend=StateBackend())
+    def test_explicit_store_backend(self):
+        agent = create_mambo_agent(_create_model(), backend=_make_backend())
         assert agent is not None
 
 
@@ -50,7 +55,7 @@ class TestSkillsRouting:
         """skills=None → no SkillsMiddleware."""
         agent = create_mambo_agent(
             _create_model(),
-            backend=StateBackend(),
+            backend=_make_backend(),
             skills=None,
         )
         assert agent is not None
@@ -59,7 +64,7 @@ class TestSkillsRouting:
         """skills list → SkillsMiddleware added."""
         agent = create_mambo_agent(
             _create_model(),
-            backend=StateBackend(),
+            backend=_make_backend(),
             skills=["/skills/user/"],
         )
         assert agent is not None
@@ -68,7 +73,7 @@ class TestSkillsRouting:
         """Mixed source types (path + tuple)."""
         agent = create_mambo_agent(
             _create_model(),
-            backend=StateBackend(),
+            backend=_make_backend(),
             skills=["/skills/user/", ("/skills/project/", "Project")],
         )
         assert agent is not None
@@ -84,7 +89,7 @@ class TestSummarizationRouting:
         """summarization=None → no summarization middleware."""
         agent = create_mambo_agent(
             _create_model(),
-            backend=StateBackend(),
+            backend=_make_backend(),
             summarization=None,
         )
         assert agent is not None
@@ -94,7 +99,7 @@ class TestSummarizationRouting:
 
         agent = create_mambo_agent(
             _create_model(),
-            backend=StateBackend(),
+            backend=_make_backend(),
             summarization=SummarizationConfig(
                 trigger=("tokens", 100000),
                 keep=("messages", 20),
@@ -107,7 +112,7 @@ class TestSummarizationRouting:
 
         agent = create_mambo_agent(
             _create_model(),
-            backend=StateBackend(),
+            backend=_make_backend(),
             summarization=SummarizationConfig(
                 trigger=("messages", 50),
                 offload_to_backend=True,
@@ -126,7 +131,7 @@ class TestSubagentsRouting:
         """Without subagents and include_general_purpose=False, no task tool."""
         agent = create_mambo_agent(
             _create_model(),
-            backend=StateBackend(),
+            backend=_make_backend(),
             subagents=None,
             include_general_purpose=False,
         )
@@ -137,7 +142,7 @@ class TestSubagentsRouting:
         """include_general_purpose=True auto-adds general-purpose subagent."""
         agent = create_mambo_agent(
             _create_model(),
-            backend=StateBackend(),
+            backend=_make_backend(),
             include_general_purpose=True,
         )
         assert agent is not None
@@ -152,7 +157,7 @@ class TestSubagentsRouting:
 
         agent = create_mambo_agent(
             _create_model(),
-            backend=StateBackend(),
+            backend=_make_backend(),
             subagents=[
                 SubAgent(
                     name=GENERAL_PURPOSE_NAME,
@@ -171,7 +176,7 @@ class TestSubagentsRouting:
         from mambo_agents.middleware.subagents import SubAgent
         agent = create_mambo_agent(
             _create_model(),
-            backend=StateBackend(),
+            backend=_make_backend(),
             subagents=[
                 SubAgent(
                     name="worker",
@@ -195,7 +200,7 @@ class TestAsyncSubagentsRouting:
     def test_async_subagents_none(self):
         agent = create_mambo_agent(
             _create_model(),
-            backend=StateBackend(),
+            backend=_make_backend(),
             async_subagents=None,
         )
         assert agent is not None
@@ -211,7 +216,7 @@ class TestInterruptOnRouting:
         with pytest.raises(ValueError, match="checkpointer"):
             create_mambo_agent(
                 _create_model(),
-                backend=StateBackend(),
+                backend=_make_backend(),
                 interrupt_on={"write": True},
             )
 
@@ -219,7 +224,7 @@ class TestInterruptOnRouting:
         """interrupt_on with checkpointer → HumanInTheLoopMiddleware."""
         agent = create_mambo_agent(
             _create_model(),
-            backend=StateBackend(),
+            backend=_make_backend(),
             interrupt_on={"write": True},
             checkpointer=MemorySaver(),
         )
@@ -229,7 +234,7 @@ class TestInterruptOnRouting:
         """interrupt_on + security_review → AutoSecurityReviewMiddleware."""
         agent = create_mambo_agent(
             _create_model(),
-            backend=StateBackend(),
+            backend=_make_backend(),
             interrupt_on={"write": True},
             security_review=SecurityReviewConfig(),
             checkpointer=MemorySaver(),
@@ -251,7 +256,7 @@ class TestMiddlewareRouting:
 
         agent = create_mambo_agent(
             _create_model(),
-            backend=StateBackend(),
+            backend=_make_backend(),
             middleware=[NoOpMiddleware()],
         )
         assert agent is not None
@@ -263,7 +268,7 @@ class TestMiddlewareRouting:
 
         agent = create_mambo_agent(
             _create_model(),
-            backend=StateBackend(),
+            backend=_make_backend(),
             middleware=[MamboPlanMiddleware()],
             summarization=SummarizationConfig(
                 trigger=("tokens", 100000),
@@ -283,7 +288,7 @@ class TestToolsRouting:
         stub = _make_stub_tool("extra_tool")
         agent = create_mambo_agent(
             _create_model(),
-            backend=StateBackend(),
+            backend=_make_backend(),
             tools=[stub],
         )
         assert agent is not None
@@ -291,7 +296,7 @@ class TestToolsRouting:
     def test_tools_none(self):
         agent = create_mambo_agent(
             _create_model(),
-            backend=StateBackend(),
+            backend=_make_backend(),
             tools=None,
         )
         assert agent is not None
@@ -306,7 +311,7 @@ class TestSystemPromptRouting:
     def test_custom_system_prompt(self):
         agent = create_mambo_agent(
             _create_model(),
-            backend=StateBackend(),
+            backend=_make_backend(),
             system_prompt="Custom directions here.",
         )
         assert agent is not None
@@ -314,7 +319,7 @@ class TestSystemPromptRouting:
     def test_none_system_prompt_uses_default(self):
         agent = create_mambo_agent(
             _create_model(),
-            backend=StateBackend(),
+            backend=_make_backend(),
             system_prompt=None,
         )
         assert agent is not None

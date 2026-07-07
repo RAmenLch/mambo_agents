@@ -1,13 +1,14 @@
 """Tests for skills middleware pure functions and core logic in ``mambo_agents.middleware.skills``.
 
-All tests use ``StateBackend`` (in-memory) — no real filesystem needed.
+All tests use ``StoreBackend`` (in-memory) — no real filesystem needed.
 """
 
 from unittest.mock import MagicMock
 
 import pytest
+from langgraph.store.memory import InMemoryStore
 
-from mambo_agents.backends.state import StateBackend
+from mambo_agents.backends.store import StoreBackend
 from mambo_agents.backends.schemas import VirtualPath
 from mambo_agents.middleware.skills import (
     MAX_SKILL_DESCRIPTION_LENGTH,
@@ -27,7 +28,7 @@ from mambo_agents.middleware.skills import (
     _validate_tuple_source,
     to_posix_path,
 )
-from tests.test_state_backend import _simulate_graph
+from tests.test_store_backend import _simulate_graph
 
 
 # ============================================================================
@@ -388,14 +389,14 @@ class TestFormatSkillAnnotations:
 
 class TestSkillsMiddlewareInit:
     def test_basic_init(self):
-        backend = StateBackend()
+        backend = StoreBackend(store=InMemoryStore())
         mw = SkillsMiddleware(backend=backend, sources=["/skills/user/"])
         assert mw.sources == ["/skills/user/"]
         assert mw.source_labels == ["User"]
         assert mw.system_prompt_template is not None
 
     def test_multiple_sources(self):
-        backend = StateBackend()
+        backend = StoreBackend(store=InMemoryStore())
         mw = SkillsMiddleware(
             backend=backend,
             sources=["/skills/base/", "/skills/project/"],
@@ -404,7 +405,7 @@ class TestSkillsMiddlewareInit:
         assert len(mw.source_labels) == 2
 
     def test_mixed_source_types(self):
-        backend = StateBackend()
+        backend = StoreBackend(store=InMemoryStore())
         mw = SkillsMiddleware(
             backend=backend,
             sources=[
@@ -417,7 +418,7 @@ class TestSkillsMiddlewareInit:
 
 class TestFormatSkillsLocations:
     def test_single_source(self):
-        backend = StateBackend()
+        backend = StoreBackend(store=InMemoryStore())
         mw = SkillsMiddleware(backend=backend, sources=["/skills/user/"])
         result = mw._format_skills_locations()
         assert "/skills/user/" in result
@@ -425,7 +426,7 @@ class TestFormatSkillsLocations:
         assert "higher priority" in result
 
     def test_multiple_sources_last_has_priority(self):
-        backend = StateBackend()
+        backend = StoreBackend(store=InMemoryStore())
         mw = SkillsMiddleware(
             backend=backend,
             sources=["/skills/base/", "/skills/project/"],
@@ -439,13 +440,13 @@ class TestFormatSkillsLocations:
 
 class TestFormatSkillsList:
     def test_empty_skills(self):
-        backend = StateBackend()
+        backend = StoreBackend(store=InMemoryStore())
         mw = SkillsMiddleware(backend=backend, sources=["/skills/user/"])
         result = mw._format_skills_list([])
         assert "No skills available" in result
 
     def test_single_skill(self):
-        backend = StateBackend()
+        backend = StoreBackend(store=InMemoryStore())
         mw = SkillsMiddleware(backend=backend, sources=["/skills/user/"])
         skill = SkillMetadata(
             name="research",
@@ -462,7 +463,7 @@ class TestFormatSkillsList:
         assert "/skills/user/research/SKILL.md" in result
 
     def test_skill_with_allowed_tools(self):
-        backend = StateBackend()
+        backend = StoreBackend(store=InMemoryStore())
         mw = SkillsMiddleware(backend=backend, sources=["/skills/user/"])
         skill = SkillMetadata(
             name="tool-user",
@@ -479,12 +480,12 @@ class TestFormatSkillsList:
 
 class TestFormatSkillsLoadWarnings:
     def test_no_errors(self):
-        backend = StateBackend()
+        backend = StoreBackend(store=InMemoryStore())
         mw = SkillsMiddleware(backend=backend, sources=[])
         assert mw._format_skills_load_warnings([]) == ""
 
     def test_with_errors(self):
-        backend = StateBackend()
+        backend = StoreBackend(store=InMemoryStore())
         mw = SkillsMiddleware(backend=backend, sources=[])
         result = mw._format_skills_load_warnings(["Error 1", "Error 2"])
         assert "Skill Loading Warnings" in result
@@ -492,7 +493,7 @@ class TestFormatSkillsLoadWarnings:
         assert "Error 2" in result
 
     def test_truncated_when_too_many(self):
-        backend = StateBackend()
+        backend = StoreBackend(store=InMemoryStore())
         mw = SkillsMiddleware(backend=backend, sources=[])
         errors = [f"Error {i}" for i in range(MAX_SKILLS_LOAD_WARNINGS + 5)]
         result = mw._format_skills_load_warnings(errors)
@@ -507,7 +508,7 @@ class TestFormatSkillsLoadWarnings:
 class TestBeforeAgent:
     def test_skips_when_already_loaded(self):
         """before_agent returns None when skills_metadata is already in state."""
-        backend = StateBackend()
+        backend = StoreBackend(store=InMemoryStore())
         mw = SkillsMiddleware(backend=backend, sources=["/skills/user/"])
         state: dict = {"skills_metadata": []}
         # before_agent should early-return since skills_metadata already exists
@@ -521,7 +522,7 @@ class TestBeforeAgent:
 
     def test_loads_skills_from_backend(self):
         """before_agent loads skills from backend sources."""
-        backend = StateBackend()
+        backend = StoreBackend(store=InMemoryStore())
         skill_content = """---
 name: test-skill
 description: A test skill
@@ -546,7 +547,7 @@ description: A test skill
 
     def test_empty_source_no_skills(self):
         """Empty source → no skills, no error."""
-        backend = StateBackend()
+        backend = StoreBackend(store=InMemoryStore())
         mw = SkillsMiddleware(backend=backend, sources=[])
 
         from langgraph.runtime import Runtime
@@ -571,7 +572,7 @@ class TestModifyRequest:
         from langchain.agents.middleware.types import ModelRequest
         from langchain_core.messages import SystemMessage
 
-        backend = StateBackend()
+        backend = StoreBackend(store=InMemoryStore())
         mw = SkillsMiddleware(backend=backend, sources=["/skills/user/"])
 
         req = ModelRequest(

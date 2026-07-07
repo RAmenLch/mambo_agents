@@ -16,6 +16,7 @@ from typing import Annotated
 
 from langchain.agents.middleware.types import (
     AgentMiddleware,
+    AgentState,
     ModelRequest,
     ModelResponse,
     ResponseT,
@@ -30,7 +31,6 @@ from pydantic import BaseModel, Field
 
 from mambo_agents.backends.protocol import BackendProtocol, ReadResult, ToolTimeoutError
 from mambo_agents.backends.schemas import BackendError, VirtualPath
-from mambo_agents.backends.state_schema import FilesystemState
 from mambo_agents.backends.utils import format_validation_error
 
 
@@ -526,7 +526,7 @@ def build_tool_descriptions(
 # ---------------------------------------------------------------------------
 
 
-class BackendToolsMiddleware(AgentMiddleware[FilesystemState, ContextT, ResponseT]):
+class BackendToolsMiddleware(AgentMiddleware[AgentState, ContextT, ResponseT]):
     """Middleware that registers all tools: core + backend extras.
 
     Also intercepts oversized tool results and evicts them to the
@@ -542,7 +542,7 @@ class BackendToolsMiddleware(AgentMiddleware[FilesystemState, ContextT, Response
             Defaults to 20000.
     """
 
-    state_schema = FilesystemState
+    state_schema = AgentState
 
     def __init__(
         self,

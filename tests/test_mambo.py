@@ -1,15 +1,16 @@
-"""Tests for Mambo Agents – StateBackend and create_mambo_agent."""
+"""Tests for Mambo Agents – StoreBackend and create_mambo_agent."""
 
 import os
 
 import pytest
 from langchain_core.messages import HumanMessage
+from langgraph.store.memory import InMemoryStore
 
 from mambo_agents import create_mambo_agent
 from mambo_agents.backends.protocol import BackendProtocol
 from mambo_agents.backends.schemas import VirtualPath
-from mambo_agents.backends.state import StateBackend
-from tests.test_state_backend import _simulate_graph
+from mambo_agents.backends.store import StoreBackend
+from tests.test_store_backend import _simulate_graph
 
 
 _MODEL_NAME = "Pro/zai-org/GLM-4.7"
@@ -28,14 +29,18 @@ def _get_model():
     )
 
 
+def _make_backend(**kwargs):
+    return StoreBackend(store=InMemoryStore(), **kwargs)
+
+
 # ---------------------------------------------------------------------------
-# Unit tests – StateBackend
+# Unit tests – StoreBackend
 # ---------------------------------------------------------------------------
 
 
-class TestStateBackend:
+class TestStoreBackend:
     def test_write_and_read(self):
-        backend = StateBackend()
+        backend = _make_backend()
         with _simulate_graph(backend):
             r = backend.write(VirtualPath("/workspace/hello.txt"), "Hello World")
             assert r.error is None
@@ -47,7 +52,7 @@ class TestStateBackend:
 
     def test_write_fails_if_exists(self):
         """Write fails if file already exists — use edit instead."""
-        backend = StateBackend()
+        backend = _make_backend()
         with _simulate_graph(backend):
             backend.write(VirtualPath("/workspace/a.txt"), "original")
             r = backend.write(VirtualPath("/workspace/a.txt"), "modified")
@@ -56,7 +61,7 @@ class TestStateBackend:
 
     def test_edit_replaces_text(self):
         """Edit replaces the matched old_str with new_str."""
-        backend = StateBackend()
+        backend = _make_backend()
         with _simulate_graph(backend):
             backend.write(VirtualPath("/workspace/code.py"), "x = 1\ny = 2")
             r = backend.edit(VirtualPath("/workspace/code.py"), "x = 1", "100")
@@ -67,7 +72,7 @@ class TestStateBackend:
 
     def test_edit_old_str_not_found(self):
         """Edit fails if old_str not in file."""
-        backend = StateBackend()
+        backend = _make_backend()
         with _simulate_graph(backend):
             backend.write(VirtualPath("/workspace/code.py"), "hello world")
             r = backend.edit(VirtualPath("/workspace/code.py"), "not there", "replacement")
@@ -76,14 +81,14 @@ class TestStateBackend:
 
     def test_edit_file_not_found(self):
         """Edit fails if file doesn't exist."""
-        backend = StateBackend()
+        backend = _make_backend()
         with _simulate_graph(backend):
             r = backend.edit(VirtualPath("/workspace/no_file.py"), "something", "x")
         assert r.error is not None
         assert "不存在" in str(r.error)
 
     def test_ls_shows_files(self):
-        backend = StateBackend()
+        backend = _make_backend()
         with _simulate_graph(backend):
             backend.write(VirtualPath("/workspace/a.py"), "print(1)")
             backend.write(VirtualPath("/workspace/b.py"), "print(2)")
@@ -95,7 +100,7 @@ class TestStateBackend:
         assert "/workspace/b.py" in paths
 
     def test_ls_shows_subdirs(self):
-        backend = StateBackend()
+        backend = _make_backend()
         with _simulate_graph(backend):
             backend.write(VirtualPath("/workspace/sub/file.txt"), "hello")
 
@@ -105,7 +110,7 @@ class TestStateBackend:
         assert any(p == "/workspace/sub" for p in paths)
 
     def test_grep_finds_pattern(self):
-        backend = StateBackend()
+        backend = _make_backend()
         with _simulate_graph(backend):
             backend.write(VirtualPath("/workspace/a.py"), "def foo():\n    pass")
             backend.write(VirtualPath("/workspace/b.py"), "def bar():\n    pass")
@@ -115,7 +120,7 @@ class TestStateBackend:
         assert any("foo" in m.text for m in result.matches)
 
     def test_glob_finds_files(self):
-        backend = StateBackend()
+        backend = _make_backend()
         with _simulate_graph(backend):
             backend.write(VirtualPath("/workspace/src/main.py"), "code")
             backend.write(VirtualPath("/workspace/src/util.py"), "code")
@@ -129,7 +134,7 @@ class TestStateBackend:
 
     def test_tree_output_is_str(self):
         """tree() returns a plain string."""
-        backend = StateBackend()
+        backend = _make_backend()
         with _simulate_graph(backend):
             backend.write(VirtualPath("/workspace/a.txt"), "a")
             backend.write(VirtualPath("/workspace/sub/b.txt"), "b")
@@ -139,7 +144,7 @@ class TestStateBackend:
         assert len(result) > 0
 
     def test_read_not_found(self):
-        backend = StateBackend()
+        backend = _make_backend()
         with _simulate_graph(backend):
             result = backend.read(VirtualPath("/workspace/nonexistent.txt"))
         assert result.error is not None
@@ -152,13 +157,13 @@ class TestStateBackend:
 
 
 class TestTools:
-    def test_state_backend_tools_extra_only(self):
+    def test_store_backend_tools_extra_only(self):
         """backend.tools returns only extra tools, NOT core tools.
-        
+
         Core tools (ls, read, write, edit, grep, glob) are built by
         BackendToolsMiddleware — they do NOT appear in backend.tools.
         """
-        backend = StateBackend()
+        backend = _make_backend()
         tool_names = {t.name for t in backend.tools}
         # Only extra tool is tree
         assert "tree" in tool_names
@@ -173,15 +178,15 @@ class TestTools:
     def test_tools_are_structured(self):
         from langchain_core.tools import StructuredTool
 
-        backend = StateBackend()
+        backend = _make_backend()
         for tool in backend.tools:
             assert isinstance(tool, StructuredTool), (
                 f"{tool.name} should be StructuredTool"
             )
 
-    def test_state_backend_size_is_from_content_length(self):
+    def test_store_backend_size_is_from_content_length(self):
         """FileInfo.size reflects content length."""
-        backend = StateBackend()
+        backend = _make_backend()
         with _simulate_graph(backend):
             backend.write(VirtualPath("/workspace/test.txt"), "hello")  # 5 chars
             result = backend.glob("/workspace/test.txt", path=VirtualPath("/workspace"))
@@ -190,7 +195,7 @@ class TestTools:
 
 
 # ---------------------------------------------------------------------------
-# Integration tests – create_mambo_agent with StateBackend
+# Integration tests – create_mambo_agent with StoreBackend
 # ---------------------------------------------------------------------------
 
 
@@ -199,7 +204,7 @@ class TestCreateAgent:
     def test_basic_agent_creation(self):
         """Smoke test: creates an agent without errors."""
         model = _get_model()
-        backend = StateBackend()
+        backend = _make_backend()
         agent = create_mambo_agent(model, backend=backend)
         assert agent is not None
 
@@ -207,7 +212,7 @@ class TestCreateAgent:
     def test_agent_file_write_then_read(self):
         """End-to-end: agent creates a file and verifies it in backend."""
         model = _get_model()
-        backend = StateBackend()
+        backend = _make_backend()
         agent = create_mambo_agent(model, backend=backend)
 
         result = agent.invoke(

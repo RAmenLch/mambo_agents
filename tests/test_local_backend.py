@@ -12,7 +12,7 @@ from langgraph.checkpoint.memory import MemorySaver
 from mambo_agents import create_mambo_agent
 from mambo_agents.backends.local import LocalBackend
 from mambo_agents.backends.schemas import BackendError, VirtualPath
-from mambo_agents.backends.state import StateBackend
+from mambo_agents.backends.store import StoreBackend
 
 
 _MODEL_NAME = "Pro/zai-org/GLM-4.7"

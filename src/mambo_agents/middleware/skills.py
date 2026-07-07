@@ -52,7 +52,7 @@ Example sources:
 ## Usage
 
 ```python
-from mambo_agents.backends.state import StateBackend
+from mambo_agents.backends.store import StoreBackend
 from mambo_agents.middleware.skills import SkillsMiddleware
 
 middleware = SkillsMiddleware(
@@ -655,11 +655,11 @@ class SkillsMiddleware(AgentMiddleware[SkillsState, ContextT, ResponseT]):
 
     Example:
         ```python
-        from mambo_agents.backends.state import StateBackend
+        from mambo_agents.backends.store import StoreBackend
         from mambo_agents.middleware.skills import SkillsMiddleware
 
         middleware = SkillsMiddleware(
-            backend=StateBackend(),
+            backend=StoreBackend(),
             sources=[
                 "/skills/user/",
                 "/skills/project/",
@@ -669,7 +669,7 @@ class SkillsMiddleware(AgentMiddleware[SkillsState, ContextT, ResponseT]):
         ```
 
     Args:
-        backend: Backend instance (e.g. StateBackend, LocalBackend) for
+        backend: Backend instance (e.g. StoreBackend, LocalBackend) for
             file operations. Also accepts a factory function ``(runtime) → backend``.
         sources: List of skill sources. Each entry is either a bare path or a
             ``(path, label)`` tuple.

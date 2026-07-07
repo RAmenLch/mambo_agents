@@ -10,18 +10,19 @@ import yaml
 from langchain_core.tools import StructuredTool
 from pydantic import Field, ValidationError, create_model
 
+from langgraph.store.memory import InMemoryStore
+
 from mambo_agents.backends.hybrid_workspace import HybridWorkspaceBackend
 from mambo_agents.backends.local import LocalBackend
 from mambo_agents.backends.protocol import (
     BackendProtocol,
     DownloadFileResult,
-    ThreadAwareWorkspace,
     UploadFileResult,
 )
-from mambo_agents.backends.state import StateBackend
+from mambo_agents.backends.store import StoreBackend
 from mambo_agents.backends.schemas import BackendError, ErrorCode, VirtualPath
 
-from tests.test_state_backend import _simulate_graph
+from tests.test_store_backend import _simulate_graph
 
 
 _W = "/workspace"
@@ -124,14 +125,12 @@ class _FakeBackend(BackendProtocol):
         return GlobResult(matches=results)
 
 
-class _FakeThreadAwareBackend(ThreadAwareWorkspace):
-    """In-memory stub that implements ThreadAwareWorkspace — records received thread_id."""
+class _FakeThreadAwareBackend(BackendProtocol):
+    """In-memory stub — a minimal BackendProtocol implementation."""
 
     def __init__(self):
         super().__init__()
         self._files: dict[str, str] = {}
-        self._last_upload_thread_id: str | None = None
-        self._last_download_thread_id: str | None = None
 
     @property
     def tools(self) -> list[StructuredTool]:
@@ -216,8 +215,7 @@ class _FakeThreadAwareBackend(ThreadAwareWorkspace):
                 results.append(FileInfo(path=fp, is_dir=False, size=len(self._files[fp])))
         return GlobResult(matches=results)
 
-    def upload_files(self, files, *, thread_id=None):
-        self._last_upload_thread_id = thread_id
+    def upload_files(self, files):
         results: list[UploadFileResult] = []
         for path, raw_content in files:
             s = str(path)
@@ -229,8 +227,7 @@ class _FakeThreadAwareBackend(ThreadAwareWorkspace):
             results.append(UploadFileResult(path=s, error=None))
         return results
 
-    def download_files(self, paths, *, thread_id=None):
-        self._last_download_thread_id = thread_id
+    def download_files(self, paths):
         results: list[DownloadFileResult] = []
         for path in paths:
             s = str(path)
@@ -264,7 +261,7 @@ def hybrid_ws(tmp_root: Path) -> HybridWorkspaceBackend:
 def _write_virtual(hws: HybridWorkspaceBackend, path: str, content: str):
     """Write a file under /.mambo/ via graph simulation."""
     target, stripped = hws._route(VirtualPath(path))
-    if isinstance(target, StateBackend):
+    if isinstance(target, StoreBackend):
         with _simulate_graph(target):
             r = target.write(stripped, content, overwrite=True)
         assert r.error is None, r.error
@@ -275,7 +272,7 @@ def _write_virtual(hws: HybridWorkspaceBackend, path: str, content: str):
 
 def _read_virtual(hws: HybridWorkspaceBackend, path: str) -> str:
     target, stripped = hws._route(VirtualPath(path))
-    if isinstance(target, StateBackend):
+    if isinstance(target, StoreBackend):
         with _simulate_graph(target):
             r = target.read(stripped)
     else:
@@ -309,7 +306,7 @@ class TestPathRouting:
         assert path == f"{_W}/project/main.py"
 
     def test_route_named_workspace(self, tmp_root: Path):
-        skills_be = StateBackend()
+        skills_be = StoreBackend(store=InMemoryStore())
         hws = HybridWorkspaceBackend(
             real_backend=LocalBackend(root_dir=str(tmp_root)),
             virtual_workspaces={"skills": skills_be},
@@ -319,7 +316,7 @@ class TestPathRouting:
         assert path == "/workspace/guidelines.md"
 
     def test_route_named_workspace_exact(self, tmp_root: Path):
-        skills_be = StateBackend()
+        skills_be = StoreBackend(store=InMemoryStore())
         hws = HybridWorkspaceBackend(
             real_backend=LocalBackend(root_dir=str(tmp_root)),
             virtual_workspaces={"skills": skills_be},
@@ -329,7 +326,7 @@ class TestPathRouting:
         assert path == "/workspace"
 
     def test_route_named_does_not_collide_with_default(self, tmp_root: Path):
-        skills_be = StateBackend()
+        skills_be = StoreBackend(store=InMemoryStore())
         hws = HybridWorkspaceBackend(
             real_backend=LocalBackend(root_dir=str(tmp_root)),
             virtual_workspaces={"skills": skills_be},
@@ -340,7 +337,7 @@ class TestPathRouting:
         assert path == "/workspace/skills_other/f.txt"
 
     def test_route_dot_overrides_default(self, tmp_root: Path):
-        custom = StateBackend()
+        custom = StoreBackend(store=InMemoryStore())
         hws = HybridWorkspaceBackend(
             real_backend=LocalBackend(root_dir=str(tmp_root)),
             virtual_workspaces={".": custom},
@@ -364,7 +361,7 @@ class TestStripPrefix:
         assert not str(path).startswith("/.mambo")
 
     def test_named_strips_full_prefix(self, tmp_root: Path):
-        skills_be = StateBackend()
+        skills_be = StoreBackend(store=InMemoryStore())
         hws = HybridWorkspaceBackend(
             real_backend=LocalBackend(root_dir=str(tmp_root)),
             virtual_workspaces={"skills": skills_be},
@@ -409,7 +406,7 @@ class TestCoreOpsRouting:
         assert r.error is not None
 
     def test_named_workspace_isolated(self, tmp_root: Path):
-        skills_be = StateBackend()
+        skills_be = StoreBackend(store=InMemoryStore())
         hws = HybridWorkspaceBackend(
             real_backend=LocalBackend(root_dir=str(tmp_root)),
             virtual_workspaces={"skills": skills_be},
@@ -693,7 +690,7 @@ class TestUploadDownload:
         assert len(results) == 4
         assert all(r.error is None for r in results)
 
-        # Verify workspace files in default StateBackend
+        # Verify workspace files in default StoreBackend
         _, a_path = hws._route(VirtualPath("/.mambo/workspace/a.txt"))
         _, c_path = hws._route(VirtualPath("/.mambo/workspace/c.txt"))
         with _simulate_graph(hws._default_mambo):
@@ -726,7 +723,7 @@ class TestUploadDownload:
         assert results[1].content == b"backend file"
 
     def test_upload_named_workspace(self, tmp_root: Path):
-        skills_be = StateBackend()
+        skills_be = StoreBackend(store=InMemoryStore())
         hws = HybridWorkspaceBackend(
             real_backend=LocalBackend(root_dir=str(tmp_root)),
             virtual_workspaces={"skills": skills_be},
@@ -756,19 +753,17 @@ class TestUploadDownload:
         assert "default scratch" in (r.content or "")
 
     # ------------------------------------------------------------------
-    # Regression: non-ThreadAwareWorkspace virtual workspace
+    # Regression: virtual workspace upload/download
     # ------------------------------------------------------------------
 
-    def test_non_thread_aware_virtual_workspace_no_type_error(self, tmp_root: Path):
-        """A non-ThreadAwareWorkspace backend in a virtual slot must not
-        receive thread_id — no TypeError on upload_files/download_files."""
+    def test_virtual_workspace_upload_download(self, tmp_root: Path):
+        """Virtual workspace backend handles upload_files/download_files."""
         plain_be = _FakeBackend()
         hws = HybridWorkspaceBackend(
             real_backend=LocalBackend(root_dir=str(tmp_root)),
             virtual_workspaces={"plain": plain_be},
         )
 
-        # upload_files with mixed targets (real + non-ThreadAware virtual)
         files: list[tuple[VirtualPath, bytes]] = [
             (VirtualPath("/.mambo/plain/a.txt"), b"virtual a"),
             (VirtualPath(f"{_W}/project/b.txt"), b"real b"),
@@ -777,7 +772,6 @@ class TestUploadDownload:
         assert len(results) == 2
         assert all(r.error is None for r in results)
 
-        # download_files with mixed targets
         results = hws.download_files([
             VirtualPath("/.mambo/plain/a.txt"),
             VirtualPath(f"{_W}/project/b.txt"),
@@ -786,28 +780,8 @@ class TestUploadDownload:
         assert results[0].content == b"virtual a"
         assert results[1].content == b"real b"
 
-    def test_thread_aware_virtual_workspace_receives_thread_id(self, tmp_root: Path):
-        """A ThreadAwareWorkspace backend in a virtual slot receives thread_id."""
-        aware_be = _FakeThreadAwareBackend()
-        hws = HybridWorkspaceBackend(
-            real_backend=LocalBackend(root_dir=str(tmp_root)),
-            virtual_workspaces={"aware": aware_be},
-        )
-
-        hws.upload_files(
-            [(VirtualPath("/.mambo/aware/x.txt"), b"hello")],
-            thread_id="session-42",
-        )
-        assert aware_be._last_upload_thread_id == "session-42"
-
-        hws.download_files(
-            [VirtualPath("/.mambo/aware/x.txt")],
-            thread_id="session-99",
-        )
-        assert aware_be._last_download_thread_id == "session-99"
-
-    def test_mixed_thread_aware_and_plain_virtual_workspaces(self, tmp_root: Path):
-        """Mixed ThreadAware + non-ThreadAware virtual workspaces — no TypeError."""
+    def test_named_virtual_workspace_upload_download(self, tmp_root: Path):
+        """Named virtual workspace handles upload/download."""
         aware_be = _FakeThreadAwareBackend()
         plain_be = _FakeBackend()
         hws = HybridWorkspaceBackend(
@@ -820,17 +794,12 @@ class TestUploadDownload:
             (VirtualPath("/.mambo/plain/b.txt"), b"plain b"),
             (VirtualPath(f"{_W}/real.txt"), b"real"),
         ]
-        results = hws.upload_files(files, thread_id="mixed-test")
+        results = hws.upload_files(files)
         assert len(results) == 3
         assert all(r.error is None for r in results)
-        # ThreadAware received thread_id
-        assert aware_be._last_upload_thread_id == "mixed-test"
-        # Plain backend is unaffected (its upload_files is from BackendProtocol base,
-        # which delegates to write() and ignores thread_id)
 
-    def test_dot_override_non_thread_aware_default(self, tmp_root: Path):
-        """Default virtual workspace replaced with non-ThreadAwareWorkspace
-        backend — must not crash on upload_files/download_files."""
+    def test_dot_override_default_virtual_workspace(self, tmp_root: Path):
+        """Default virtual workspace replaced with custom backend."""
         plain_be = _FakeBackend()
         hws = HybridWorkspaceBackend(
             real_backend=LocalBackend(root_dir=str(tmp_root)),
@@ -839,14 +808,12 @@ class TestUploadDownload:
 
         results = hws.upload_files(
             [(VirtualPath("/.mambo/scratch.txt"), b"scratch")],
-            thread_id="any-thread",
         )
         assert len(results) == 1
         assert results[0].error is None
 
         dl = hws.download_files(
             [VirtualPath("/.mambo/scratch.txt")],
-            thread_id="any-thread",
         )
         assert len(dl) == 1
         assert dl[0].content == b"scratch"
@@ -859,7 +826,7 @@ class TestUploadDownload:
 
 class TestDotOverride:
     def test_dot_overrides_default_state_backend(self, tmp_root: Path):
-        custom = StateBackend(initial_files={"/config.yml": "port: 8080"})
+        custom = StoreBackend(store=InMemoryStore(), initial_files={"/config.yml": "port: 8080"})
         hws = HybridWorkspaceBackend(
             real_backend=LocalBackend(root_dir=str(tmp_root)),
             virtual_workspaces={".": custom},
@@ -872,8 +839,8 @@ class TestDotOverride:
         assert "port: 8080" in (r.content or "")
 
     def test_dot_with_named_workspaces(self, tmp_root: Path):
-        default_be = StateBackend()
-        skills_be = StateBackend()
+        default_be = StoreBackend(store=InMemoryStore())
+        skills_be = StoreBackend(store=InMemoryStore())
         hws = HybridWorkspaceBackend(
             real_backend=LocalBackend(root_dir=str(tmp_root)),
             virtual_workspaces={
@@ -942,7 +909,7 @@ class TestCopy:
         assert "hello from real" in (r.content or "")
 
     def test_copy_between_virtual_workspaces(self, tmp_root: Path):
-        skills_be = StateBackend()
+        skills_be = StoreBackend(store=InMemoryStore())
         hws = HybridWorkspaceBackend(
             real_backend=LocalBackend(root_dir=str(tmp_root)),
             virtual_workspaces={"skills": skills_be},
@@ -1036,7 +1003,7 @@ class TestWorkspaceRootRewrite:
 
     def test_virtual_backend_with_custom_wsroot(self, tmp_root: Path):
         """Virtual backend gets paths under its own workspace_root."""
-        skills_be = StateBackend()
+        skills_be = StoreBackend(store=InMemoryStore())
         hws = HybridWorkspaceBackend(
             real_backend=LocalBackend(root_dir=str(tmp_root)),
             virtual_workspaces={"skills": skills_be},
@@ -1609,7 +1576,7 @@ class TestOutOfWorkspacePaths:
 
     @pytest.fixture
     def hws(self, tmp_path: Path) -> HybridWorkspaceBackend:
-        skills_be = StateBackend()
+        skills_be = StoreBackend(store=InMemoryStore())
         return HybridWorkspaceBackend(
             real_backend=LocalBackend(root_dir=str(tmp_path)),
             virtual_workspaces={"skills": skills_be},

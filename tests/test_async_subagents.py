@@ -10,6 +10,8 @@ import pytest
 from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
 from langchain_core.runnables import Runnable, RunnableLambda
 
+from langgraph.store.memory import InMemoryStore
+
 from mambo_agents.backends.schemas import VirtualPath
 from mambo_agents.middleware.async_subagents import (
     ASYNC_TASK_SYSTEM_PROMPT,
@@ -34,7 +36,7 @@ from mambo_agents.middleware.async_subagents import (
     _append_to_system_message,
 )
 from mambo_agents.middleware.subagents import CompiledSubAgent
-from mambo_agents.backends.state import StateBackend
+from mambo_agents.backends.store import StoreBackend
 
 
 # ---------------------------------------------------------------------------
@@ -771,12 +773,12 @@ class TestAppendToSystemMessage:
 
 class TestAsyncSubAgentMiddlewareInit:
     def test_requires_at_least_one_subagent(self):
-        backend = StateBackend()
+        backend = StoreBackend(store=InMemoryStore())
         with pytest.raises(ValueError, match="At least one async_subagent"):
             AsyncSubAgentMiddleware(backend=backend, async_subagents=[])
 
     def test_basic_initialization(self):
-        backend = StateBackend()
+        backend = StoreBackend(store=InMemoryStore())
         mw = AsyncSubAgentMiddleware(
             backend=backend,
             async_subagents=[_stub_subagent_spec("deployer")],
@@ -787,7 +789,7 @@ class TestAsyncSubAgentMiddlewareInit:
         assert tool_names == {"async_task", "async_status", "async_list", "async_cancel"}
 
     def test_duplicate_names_raises(self):
-        backend = StateBackend()
+        backend = StoreBackend(store=InMemoryStore())
         with pytest.raises(ValueError, match="Duplicate"):
             AsyncSubAgentMiddleware(
                 backend=backend,
@@ -798,7 +800,7 @@ class TestAsyncSubAgentMiddlewareInit:
             )
 
     def test_multiple_subagent_types(self):
-        backend = StateBackend()
+        backend = StoreBackend(store=InMemoryStore())
         mw = AsyncSubAgentMiddleware(
             backend=backend,
             async_subagents=[
@@ -809,7 +811,7 @@ class TestAsyncSubAgentMiddlewareInit:
         assert mw is not None
 
     def test_system_prompt_injected(self):
-        backend = StateBackend()
+        backend = StoreBackend(store=InMemoryStore())
         mw = AsyncSubAgentMiddleware(
             backend=backend,
             async_subagents=[_stub_subagent_spec("deployer")],
@@ -821,7 +823,7 @@ class TestAsyncSubAgentMiddlewareInit:
         from langchain.agents.middleware.types import ModelRequest
         from langchain_core.messages import SystemMessage
 
-        backend = StateBackend()
+        backend = StoreBackend(store=InMemoryStore())
         mw = AsyncSubAgentMiddleware(
             backend=backend,
             async_subagents=[_stub_subagent_spec("deployer")],

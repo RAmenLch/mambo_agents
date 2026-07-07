@@ -1,7 +1,7 @@
 """Shared helpers used across multiple backend implementations.
 
 Constants, formatters, and common edit logic that would otherwise be
-duplicated between ``LocalBackend``, ``StateBackend``, and protocol.
+duplicated between ``LocalBackend``, ``StoreBackend``, and protocol.
 """
 
 from __future__ import annotations

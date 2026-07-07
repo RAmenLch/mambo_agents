@@ -33,8 +33,8 @@
 |----------|------------|--------------|----------|
 | **本地文件+执行** | `LocalShellBackend`（`FilesystemBackend` + `SandboxBackendProtocol`）<br>• 通过继承 `SandboxBackendProtocol` 获得 `execute()`<br>• 使用 `subprocess.run(shell=True)` 直连宿主机，无隔离 | `LocalBackend`（自带 `execute()`）<br>• `execute()` 是后端自身方法，无需额外协议层<br>• 同样直连宿主机，但内聚在单一类中 | Mambo 不做 LocalShellBackend/FilesystemBackend 两套类分离，本地文件操作和本地 shell 执行天然一体 |
 | **远程文件+执行** | `LangSmithSandbox`（继承 `BaseSandbox`）<br>• 对接 LangSmith 云端容器服务，实现真正的进程隔离<br>• 文件操作全部委托给 `execute()`，通过 SDK 收发命令 | `SshBackend`（基于 paramiko）<br>• `execute()` 通过 SSH 信道在远端执行<br>• 文件操作直接操作远端文件系统（ls/read/write 等不走 execute，有原生实现） | deepagents 的远程方案绑定特定云服务（LangSmith），适合容器化配置好的环境；Mambo 的 SSH 方案更通用，任何有 sshd 的机器都可用 |
-| **execute 架构理念** | `execute()` 需要通过 `SandboxBackendProtocol` 获得<br>• 协议层次：`BackendProtocol`（纯文件）→ `SandboxBackendProtocol`（+ execute）→ `BaseSandbox`（便利封装）<br>• 只有声明为 "Sandbox" 的后端才能执行命令 | `execute()` 是后端自带的可选能力<br>• 协议层次：只有 `BackendProtocol`，任何后端想加 execute 直接在自家类上实现即可<br>• `LocalBackend`、`SshBackend` 各怀 execute，`StateBackend` 没有 — 按需启用，不强制分类 | Mambo 追求更通用、更灵活的 execute 启用方式：不引入独立的 Sandbox 协议层，execute 就是一个普通的方法，由各后端自行决定是否提供 |
-| **跨会话持久化** | ✅ `StoreBackend`（基于 LangGraph BaseStore） | ❌ 未实现 StoreBackend | 当前阶段聚焦单会话场景，未来按需添加 |
+| **execute 架构理念** | `execute()` 需要通过 `SandboxBackendProtocol` 获得<br>• 协议层次：`BackendProtocol`（纯文件）→ `SandboxBackendProtocol`（+ execute）→ `BaseSandbox`（便利封装）<br>• 只有声明为 "Sandbox" 的后端才能执行命令 | `execute()` 是后端自带的可选能力<br>• 协议层次：只有 `BackendProtocol`，任何后端想加 execute 直接在自家类上实现即可<br>• `LocalBackend`、`SshBackend` 各怀 execute，`StoreBackend` 没有 — 按需启用，不强制分类 | Mambo 追求更通用、更灵活的 execute 启用方式：不引入独立的 Sandbox 协议层，execute 就是一个普通的方法，由各后端自行决定是否提供 |
+| **跨会话持久化** | ✅ `StoreBackend`（基于 LangGraph BaseStore） | ✅ `StoreBackend`（基于 LangGraph BaseStore，`thread_id` 锁死在构造时） | Mambo 的 StoreBackend 是自行实现的，继承自 `BackendProtocol`，构造时锁死 `thread_id` 实现会话隔离 |
 
 ### 2.2 中间件栈差异
 
@@ -69,11 +69,11 @@
 | 功能 | deepagents | Mambo Agents |
 |------|------------|--------------|
 | 协议定义 | `BackendProtocol` + `SandboxBackendProtocol`（independent execute layer） | `BackendProtocol`（execute is also a backend method，no independent protocol layer） |
-| 内存存储 | `StateBackend` | `StateBackend`（reconstructed） |
+| 内存存储 | `StateBackend` | `StoreBackend`（自实现，基于 LangGraph BaseStore，构造时锁死 `thread_id`） |
 | 本地 execute | `LocalShellBackend`（`FilesystemBackend` + `SandboxBackendProtocol`，two layers of parent classes） | `LocalBackend`（single class with built-in `execute()`，`tree`，`delete`） |
 | 远程 execute | `LangSmithSandbox`（cloud container service，all file operation are delegated to `execute()`） | `SshBackend`（native SSH，`execute()` via SSH channel，file operation has native implementations） |
 | 路径路由 | `CompositeBackend`（灵活多后端路由，任意前缀 → 任意后端；`execute()` 可能绕过路由层） | `HybridWorkspaceBackend`（1 真实 + N 虚拟路由：`/.mambo/<name>/` → 内存，其余 → 真实后端；System prompt 显式告知 AI workspace 语义） |
-| 跨会话存储 | `StoreBackend` | ❌ |
+| 跨会话存储 | `StoreBackend` | `StoreBackend`（自实现） |
 
 ### 3.2 中间件（Middleware）
 

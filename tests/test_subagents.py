@@ -8,6 +8,7 @@ from langchain_core.messages import HumanMessage
 from langchain_core.runnables import Runnable
 from langchain_core.tools import StructuredTool
 from langgraph.graph.state import CompiledStateGraph
+from langgraph.store.memory import InMemoryStore
 
 from mambo_agents import (
     CompiledSubAgent,
@@ -16,8 +17,8 @@ from mambo_agents import (
     SubAgentMiddleware,
     create_mambo_agent,
 )
-from mambo_agents.backends.state import StateBackend
-from tests.test_state_backend import _simulate_graph
+from mambo_agents.backends.store import StoreBackend
+from tests.test_store_backend import _simulate_graph
 from mambo_agents.middleware.subagents import (
     DEFAULT_GENERAL_PURPOSE_DESCRIPTION,
     DEFAULT_SUBAGENT_PROMPT,
@@ -95,14 +96,14 @@ def _make_tool_runtime(
 class TestSubAgentMiddlewareInit:
     def test_requires_at_least_one_subagent(self):
         """SubAgentMiddleware must not be created without subagents."""
-        backend = StateBackend()
+        backend = StoreBackend(store=InMemoryStore())
         with pytest.raises(ValueError, match="At least one subagent"):
             SubAgentMiddleware(backend=backend, subagents=[])
 
     @pytest.mark.integration
     def test_basic_initialization(self):
         """SubAgentMiddleware initializes with a valid SubAgent spec."""
-        backend = StateBackend()
+        backend = StoreBackend(store=InMemoryStore())
         subagent = SubAgent(
             name="test-agent",
             description="A test subagent",
@@ -117,7 +118,7 @@ class TestSubAgentMiddlewareInit:
 
     def test_requires_model_for_subagent(self):
         """SubAgent must specify 'model' — validated before model init."""
-        backend = StateBackend()
+        backend = StoreBackend(store=InMemoryStore())
         subagent = SubAgent(
             name="bad-agent",
             description="Missing model",
@@ -128,7 +129,7 @@ class TestSubAgentMiddlewareInit:
 
     def test_compiled_subagent(self):
         """CompiledSubAgent works without model/tools fields."""
-        backend = StateBackend()
+        backend = StoreBackend(store=InMemoryStore())
         compiled = CompiledSubAgent(
             name="pre-built",
             description="Pre-compiled agent",
@@ -141,7 +142,7 @@ class TestSubAgentMiddlewareInit:
     @pytest.mark.integration
     def test_mixed_subagents(self):
         """Mixed SubAgent and CompiledSubAgent specs."""
-        backend = StateBackend()
+        backend = StoreBackend(store=InMemoryStore())
         compiled = CompiledSubAgent(
             name="compiled",
             description="Compiled",
@@ -167,7 +168,7 @@ class TestEventGranularity:
     @pytest.mark.integration
     def test_default_granularity_is_updates(self):
         """Default event_granularity is 'updates'."""
-        backend = StateBackend()
+        backend = StoreBackend(store=InMemoryStore())
         subagent = SubAgent(
             name="agent",
             description="desc",
@@ -181,7 +182,7 @@ class TestEventGranularity:
     @pytest.mark.integration
     def test_explicit_granularity_messages(self):
         """event_granularity='messages' is accepted."""
-        backend = StateBackend()
+        backend = StoreBackend(store=InMemoryStore())
         subagent = SubAgent(
             name="agent",
             description="desc",
@@ -199,7 +200,7 @@ class TestEventGranularity:
     @pytest.mark.integration
     def test_explicit_granularity_values(self):
         """event_granularity='values' is accepted."""
-        backend = StateBackend()
+        backend = StoreBackend(store=InMemoryStore())
         subagent = SubAgent(
             name="agent",
             description="desc",
@@ -221,7 +222,7 @@ class TestEventGranularity:
             "mambo_agents.middleware.subagents._build_task_tool"
         ) as mock_build:
             mock_build.return_value = _make_stub_tool("task")
-            backend = StateBackend()
+            backend = StoreBackend(store=InMemoryStore())
             subagent = SubAgent(
                 name="agent",
                 description="desc",
@@ -247,7 +248,7 @@ class TestSystemPrompt:
     @pytest.mark.integration
     def test_default_system_prompt_includes_agents(self):
         """System prompt includes available subagent types."""
-        backend = StateBackend()
+        backend = StoreBackend(store=InMemoryStore())
         subagent = SubAgent(
             name="researcher",
             description="Research topics thoroughly",
@@ -263,7 +264,7 @@ class TestSystemPrompt:
     @pytest.mark.integration
     def test_custom_system_prompt(self):
         """Custom system_prompt is used."""
-        backend = StateBackend()
+        backend = StoreBackend(store=InMemoryStore())
         subagent = SubAgent(
             name="agent",
             description="desc",
@@ -282,7 +283,7 @@ class TestSystemPrompt:
     @pytest.mark.integration
     def test_none_system_prompt(self):
         """system_prompt=None suppresses injection."""
-        backend = StateBackend()
+        backend = StoreBackend(store=InMemoryStore())
         subagent = SubAgent(
             name="agent",
             description="desc",
@@ -307,7 +308,7 @@ class TestInterruptOn:
     @pytest.mark.integration
     def test_interrupt_on_adds_human_in_the_loop(self):
         """interrupt_on triggers HumanInTheLoopMiddleware (no crash)."""
-        backend = StateBackend()
+        backend = StoreBackend(store=InMemoryStore())
         subagent = SubAgent(
             name="agent",
             description="desc",
@@ -329,7 +330,7 @@ class TestCreateMamboAgentSubagents:
     @pytest.mark.integration
     def test_create_with_subagents(self):
         """create_mambo_agent accepts subagents parameter."""
-        backend = StateBackend()
+        backend = StoreBackend(store=InMemoryStore())
         model = _get_model()
         agent = create_mambo_agent(
             model,
@@ -353,7 +354,7 @@ class TestCreateMamboAgentSubagents:
     @pytest.mark.integration
     def test_create_with_compiled_subagent(self):
         """create_mambo_agent accepts CompiledSubAgent."""
-        backend = StateBackend()
+        backend = StoreBackend(store=InMemoryStore())
         model = _get_model()
         compiled = CompiledSubAgent(
             name="pre-built",
@@ -371,7 +372,7 @@ class TestCreateMamboAgentSubagents:
     @pytest.mark.integration
     def test_include_general_purpose_default_false(self):
         """By default, general-purpose subagent is NOT auto-added."""
-        backend = StateBackend()
+        backend = StoreBackend(store=InMemoryStore())
         model = _get_model()
         agent = create_mambo_agent(model, backend=backend)
         assert not _graph_has_task_tool(agent), (
@@ -382,7 +383,7 @@ class TestCreateMamboAgentSubagents:
     @pytest.mark.integration
     def test_include_general_purpose_true(self):
         """include_general_purpose=True auto-adds general-purpose subagent."""
-        backend = StateBackend()
+        backend = StoreBackend(store=InMemoryStore())
         model = _get_model()
         agent = create_mambo_agent(
             model,
@@ -396,7 +397,7 @@ class TestCreateMamboAgentSubagents:
     @pytest.mark.integration
     def test_general_purpose_not_duplicated(self):
         """general-purpose is not added twice if already in subagents list."""
-        backend = StateBackend()
+        backend = StoreBackend(store=InMemoryStore())
         model = _get_model()
         gp_spec = SubAgent(
             name=GENERAL_PURPOSE_NAME,
@@ -417,7 +418,7 @@ class TestCreateMamboAgentSubagents:
     @pytest.mark.integration
     def test_event_granularity_plumbed(self):
         """event_granularity is passed through to the middleware (no crash)."""
-        backend = StateBackend()
+        backend = StoreBackend(store=InMemoryStore())
         model = _get_model()
         subagent = SubAgent(
             name="worker",
@@ -438,7 +439,7 @@ class TestCreateMamboAgentSubagents:
     @pytest.mark.integration
     def test_subagent_middleware_position(self):
         """SubAgentMiddleware works alongside HITL."""
-        backend = StateBackend()
+        backend = StoreBackend(store=InMemoryStore())
         model = _get_model()
         from langgraph.checkpoint.memory import MemorySaver
 
@@ -647,7 +648,7 @@ class TestSubagentStreamingE2E:
         carries ``tool_call_id``, ``subagent_type``, and ``chunk``.
         """
         model = _get_model()
-        backend = StateBackend()
+        backend = StoreBackend(store=InMemoryStore())
         agent = create_mambo_agent(
             model,
             backend=backend,
@@ -704,7 +705,7 @@ class TestSubagentStreamingE2E:
     async def test_parallel_subagents_distinct_tool_call_ids(self):
         """Parallel subagent invocations yield events with distinct tool_call_ids."""
         model = _get_model()
-        backend = StateBackend()
+        backend = StoreBackend(store=InMemoryStore())
         agent = create_mambo_agent(
             model,
             backend=backend,

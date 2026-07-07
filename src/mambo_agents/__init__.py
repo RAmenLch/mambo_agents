@@ -2,8 +2,7 @@
 
 from mambo_agents.backends.protocol import BackendProtocol
 from mambo_agents.backends.readonly import ReadOnlyBackend
-from mambo_agents.backends.state import StateBackend
-from mambo_agents.backends.state_schema import FileData, FilesystemState
+from mambo_agents.backends.store import StoreBackend
 from mambo_agents.backends.hybrid_workspace import HybridWorkspaceBackend
 from mambo_agents.graph import create_mambo_agent
 from mambo_agents.middleware.async_subagents import (
@@ -48,8 +47,6 @@ __all__ = [
     "BackendProtocol",
     "CompiledSubAgent",
     "EventGranularity",
-    "FileData",
-    "FilesystemState",
     "FinalReviewResult",
     "MamboMemoryMiddleware",
     "MamboPlanMiddleware",
@@ -60,7 +57,7 @@ __all__ = [
     "SkillMetadata",
     "SkillSource",
     "SkillsMiddleware",
-    "StateBackend",
+    "StoreBackend",
     "HybridWorkspaceBackend",
     "SubAgent",
     "SubAgentMiddleware",

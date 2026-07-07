@@ -47,11 +47,11 @@ from mambo_agents.middleware.summarization import (
     SummaryHookContext,
 )
 from mambo_agents.middleware.version_control import (
+    BackupEvent,
     Snapshot,
     VersionControlConfig,
     VersionControlMiddleware,
     VersionIndex,
-    VersionRollbackConfig,
     VersionStore,
 )
 
@@ -60,6 +60,7 @@ __all__ = [
     "AsyncTaskData",
     "AutoSecurityReviewMiddleware",
     "BackendToolsMiddleware",
+    "BackupEvent",
     "CompiledSubAgent",
     "DEFAULT_MAMBO_CHAINED_SUMMARY_PROMPT",
     "DEFAULT_MAMBO_SUMMARY_PROMPT",
@@ -87,7 +88,6 @@ __all__ = [
     "VersionControlConfig",
     "VersionControlMiddleware",
     "VersionIndex",
-    "VersionRollbackConfig",
     "VersionStore",
     "WritePlansInput",
     "create_review_agent",

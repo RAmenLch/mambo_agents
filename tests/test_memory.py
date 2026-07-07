@@ -1,6 +1,6 @@
 """Tests for memory middleware in ``mambo_agents.middleware.memory``.
 
-All tests use ``StateBackend`` (in-memory) — no real filesystem needed.
+All tests use ``StoreBackend`` (in-memory) — no real filesystem needed.
 """
 
 from __future__ import annotations
@@ -9,8 +9,9 @@ import pytest
 from langchain.agents.middleware.types import ModelRequest
 from langchain_core.messages import SystemMessage
 from langgraph.runtime import Runtime
+from langgraph.store.memory import InMemoryStore
 
-from mambo_agents.backends.state import StateBackend
+from mambo_agents.backends.store import StoreBackend
 from mambo_agents.backends.schemas import VirtualPath
 from mambo_agents.middleware.memory import (
     MAMBO_MEMORY_SYSTEM_PROMPT,
@@ -19,7 +20,7 @@ from mambo_agents.middleware.memory import (
     _append_to_system_message,
     _default_format_prompt,
 )
-from tests.test_state_backend import _simulate_graph
+from tests.test_store_backend import _simulate_graph
 
 # ---------------------------------------------------------------------------
 # Test constants
@@ -135,13 +136,13 @@ class TestDefaultFormatPrompt:
 
 class TestMamboMemoryMiddlewareInit:
     def test_basic_init(self):
-        backend = StateBackend()
+        backend = StoreBackend(store=InMemoryStore())
         mw = MamboMemoryMiddleware(backend=backend, sources=[VirtualPath(MEMORY_PATH)])
         assert mw.sources == [VirtualPath(MEMORY_PATH)]
         assert mw.state_schema is MemoryState
 
     def test_multiple_sources(self):
-        backend = StateBackend()
+        backend = StoreBackend(store=InMemoryStore())
         mw = MamboMemoryMiddleware(
             backend=backend,
             sources=[VirtualPath(MEMORY_PATH), VirtualPath("/.mambo/memory/team.md")],
@@ -149,7 +150,7 @@ class TestMamboMemoryMiddlewareInit:
         assert len(mw.sources) == 2
 
     def test_custom_format_prompt(self):
-        backend = StateBackend()
+        backend = StoreBackend(store=InMemoryStore())
 
         def custom_fmt(contents: dict[str, str]) -> str:
             return f"CUSTOM: {len(contents)} files loaded"
@@ -163,7 +164,7 @@ class TestMamboMemoryMiddlewareInit:
         assert result == "CUSTOM: 1 files loaded"
 
     def test_factory_backend(self):
-        backend = StateBackend()
+        backend = StoreBackend(store=InMemoryStore())
         factory_called = []
 
         def factory(rt):
@@ -187,7 +188,7 @@ class TestMamboMemoryMiddlewareInit:
 
 class TestBeforeAgent:
     def test_skips_when_already_loaded(self):
-        backend = StateBackend()
+        backend = StoreBackend(store=InMemoryStore())
         mw = MamboMemoryMiddleware(backend=backend, sources=[VirtualPath(MEMORY_PATH)])
         state: dict = {"memory_contents": {MEMORY_PATH: "cached"}}
         rt = _make_runtime()
@@ -196,7 +197,7 @@ class TestBeforeAgent:
 
     def test_loads_file_from_backend(self):
         memory_text = "# My Memory\n\nThis is the agent memory."
-        backend = StateBackend()
+        backend = StoreBackend(store=InMemoryStore())
         with _simulate_graph(backend, thread_id="mem_test"):
             backend.write(VirtualPath(MEMORY_PATH), memory_text, overwrite=True)
 
@@ -212,7 +213,7 @@ class TestBeforeAgent:
         assert contents[MEMORY_PATH] == memory_text
 
     def test_file_not_found_silent_skip(self):
-        backend = StateBackend()
+        backend = StoreBackend(store=InMemoryStore())
         mw = MamboMemoryMiddleware(backend=backend, sources=[VirtualPath(MEMORY_PATH)])
         rt = _make_runtime()
         with _simulate_graph(backend, thread_id="mem_not_found"):
@@ -223,7 +224,7 @@ class TestBeforeAgent:
         assert result["memory_contents"] == {}
 
     def test_partial_sources_some_found(self):
-        backend = StateBackend()
+        backend = StoreBackend(store=InMemoryStore())
         with _simulate_graph(backend, thread_id="mem_test"):
             backend.write(VirtualPath(MEMORY_PATH), "my memory", overwrite=True)
 
@@ -241,7 +242,7 @@ class TestBeforeAgent:
         assert contents[MEMORY_PATH] == "my memory"
 
     def test_empty_sources_list(self):
-        backend = StateBackend()
+        backend = StoreBackend(store=InMemoryStore())
         mw = MamboMemoryMiddleware(backend=backend, sources=[])
         rt = _make_runtime()
         with _simulate_graph(backend, thread_id="mem_test"):
@@ -258,7 +259,7 @@ class TestBeforeAgent:
 
 class TestModifyRequest:
     def test_injects_memory_into_system_message(self):
-        backend = StateBackend()
+        backend = StoreBackend(store=InMemoryStore())
         mw = MamboMemoryMiddleware(backend=backend, sources=[VirtualPath(MEMORY_PATH)])
 
         req = _make_request(
@@ -277,7 +278,7 @@ class TestModifyRequest:
         assert "<memory_guidelines>" in content
 
     def test_no_memory_contents_shows_empty(self):
-        backend = StateBackend()
+        backend = StoreBackend(store=InMemoryStore())
         mw = MamboMemoryMiddleware(backend=backend, sources=[VirtualPath(MEMORY_PATH)])
 
         req = _make_request(
@@ -291,7 +292,7 @@ class TestModifyRequest:
         assert "(No memory loaded)" in content
 
     def test_empty_memory_contents_shows_empty(self):
-        backend = StateBackend()
+        backend = StoreBackend(store=InMemoryStore())
         mw = MamboMemoryMiddleware(backend=backend, sources=[VirtualPath(MEMORY_PATH)])
 
         req = _make_request(
@@ -304,7 +305,7 @@ class TestModifyRequest:
         assert "(No memory loaded)" in content
 
     def test_custom_format_prompt_used(self):
-        backend = StateBackend()
+        backend = StoreBackend(store=InMemoryStore())
         format_calls = []
 
         def custom_fmt(contents: dict[str, str]) -> str:
@@ -336,7 +337,7 @@ class TestModifyRequest:
 
 class TestWrapModelCall:
     def test_handles_system_message_is_none(self):
-        backend = StateBackend()
+        backend = StoreBackend(store=InMemoryStore())
         mw = MamboMemoryMiddleware(backend=backend, sources=[VirtualPath(MEMORY_PATH)])
 
         req = _make_request(

@@ -104,7 +104,7 @@ class VirtualPath(BaseModel):
     Trailing slashes are preserved — ``"/workspace/"`` is distinct from
     ``"/workspace"``.  Use :attr:`normalized` for the no-trailing-slash
     form in internal file-system lookups.  Methods like
-    :meth:`StateBackend.write` reject paths ending in ``"/"``.
+    ``write()`` reject paths ending in ``"/"``.
 
     Supports three construction styles::
 

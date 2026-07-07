@@ -26,7 +26,7 @@ from mambo_agents._version import __version__
 from mambo_agents.backends.protocol import BackendProtocol
 from mambo_agents.backends.readonly import ReadOnlyBackend
 from mambo_agents.backends.schemas import VirtualPath
-from mambo_agents.backends.state import StateBackend
+from mambo_agents.backends.store import StoreBackend
 from mambo_agents.middleware.backend_tools import (
     BackendToolsMiddleware,
     build_tool_descriptions,
@@ -108,7 +108,7 @@ def create_mambo_agent(
 
     Args:
         model: Chat model (string name or ``BaseChatModel`` instance).
-        backend: File-system backend.  Defaults to ``StateBackend()``.
+        backend: File-system backend.  Defaults to ``StoreBackend()``.
         system_prompt: Custom system prompt (replaces the default).
         subagents: Optional subagent specs.  Each can be a ``SubAgent``
             dict or a pre-compiled ``CompiledSubAgent``.
@@ -245,7 +245,7 @@ def create_mambo_agent(
 
         agent = create_mambo_agent(
             "gpt-4o",
-            backend=StateBackend(initial_files={
+            backend=StoreBackend(initial_files={
                 "/config.json": '{"port": 8080}',
             }),
         )
@@ -257,7 +257,7 @@ def create_mambo_agent(
 
         agent = create_mambo_agent(
             "gpt-4o",
-            backend=StateBackend(),
+            backend=StoreBackend(),
             subagents=[
                 SubAgent(
                     name="researcher",
@@ -302,7 +302,7 @@ def create_mambo_agent(
         # Agent reads progress/result via async_status
     """
     if backend is None:
-        backend = StateBackend()
+        backend = StoreBackend(store=store)
 
     # Build middleware stack
     mw: list[AgentMiddleware] = [
@@ -336,11 +336,9 @@ def create_mambo_agent(
         if isinstance(version_control, VersionStore):
             vc_store = version_control
         elif isinstance(version_control, VersionControlConfig):
-            vc_store = VersionStore(storage_dir=version_control.store_dir)
-        elif isinstance(version_control, str):
-            vc_store = VersionStore(storage_dir=version_control)
+            vc_store = VersionStore(store=version_control.store)
         else:
-            # bool True or anything else
+            # bool True or anything else → auto-resolve store
             vc_store = VersionStore()
 
         mw.append(

@@ -1,7 +1,7 @@
 """Tests for AutoSecurityReviewMiddleware — AI-based gate before HITL.
 
 **Safety**: all tests use mocked LLM calls (no real API), mocked
-``interrupt()``, and ``StateBackend`` (in-memory — no real filesystem).
+``interrupt()``, and ``StoreBackend`` (in-memory — no real filesystem).
 """
 
 from __future__ import annotations
@@ -998,21 +998,22 @@ class TestAfterModelPreservesNonInterruptTools:
 class TestIntegrationWithCreateAgent:
     """End-to-end: create_mambo_agent with security_review using mocked model.
 
-    Uses FakeListChatModel + StateBackend + MemorySaver so no real LLM
+    Uses FakeListChatModel + StoreBackend + MemorySaver so no real LLM
     calls, no real filesystem, no real persistence — fully safe.
     """
 
     def test_agent_created_with_security_review_config(self) -> None:
         """Smoke: agent creation succeeds with security_review."""
         from langgraph.checkpoint.memory import MemorySaver
+        from langgraph.store.memory import InMemoryStore
 
         from mambo_agents import create_mambo_agent
-        from mambo_agents.backends.state import StateBackend
+        from mambo_agents.backends.store import StoreBackend
         from mambo_agents.middleware import SecurityReviewConfig
 
         agent = create_mambo_agent(
             FakeListChatModel(responses=["done"]),
-            backend=StateBackend(),
+            backend=StoreBackend(store=InMemoryStore()),
             interrupt_on={"write": True},
             security_review=SecurityReviewConfig(),
             checkpointer=MemorySaver(),
@@ -1022,14 +1023,15 @@ class TestIntegrationWithCreateAgent:
     def test_agent_with_security_review_selective_tools(self) -> None:
         """Only edit gets AI-reviewed; write is direct HITL."""
         from langgraph.checkpoint.memory import MemorySaver
+        from langgraph.store.memory import InMemoryStore
 
         from mambo_agents import create_mambo_agent
-        from mambo_agents.backends.state import StateBackend
+        from mambo_agents.backends.store import StoreBackend
         from mambo_agents.middleware import SecurityReviewConfig
 
         agent = create_mambo_agent(
             FakeListChatModel(responses=["done"]),
-            backend=StateBackend(),
+            backend=StoreBackend(store=InMemoryStore()),
             interrupt_on={"write": True, "edit": True},
             security_review=SecurityReviewConfig(
                 model=FakeListChatModel(responses=[]),
@@ -1042,14 +1044,15 @@ class TestIntegrationWithCreateAgent:
     def test_agent_with_custom_security_prompt(self) -> None:
         """Custom security review prompt is accepted."""
         from langgraph.checkpoint.memory import MemorySaver
+        from langgraph.store.memory import InMemoryStore
 
         from mambo_agents import create_mambo_agent
-        from mambo_agents.backends.state import StateBackend
+        from mambo_agents.backends.store import StoreBackend
         from mambo_agents.middleware import SecurityReviewConfig
 
         agent = create_mambo_agent(
             FakeListChatModel(responses=["done"]),
-            backend=StateBackend(),
+            backend=StoreBackend(store=InMemoryStore()),
             interrupt_on={"write": True},
             security_review=SecurityReviewConfig(
                 system_prompt="You are a paranoid security auditor. Flag EVERYTHING.",

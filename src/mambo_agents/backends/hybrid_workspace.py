@@ -2,12 +2,12 @@
 
 Routes file operations based on path prefix:
 
-- ``/.mambo/<name>/`` → named virtual workspace (StateBackend)
-- ``/.mambo/``         → default virtual workspace (StateBackend, auto-created)
+- ``/.mambo/<name>/`` → named virtual workspace (StoreBackend)
+- ``/.mambo/``         → default virtual workspace (StoreBackend, auto-created)
 - Everything else      → real backend (e.g. LocalBackend for real files)
 
-The default StateBackend at ``/.mambo/`` is always present.  Pass ``"."``
-in *virtual_workspaces* to override it with a custom StateBackend instance.
+The default StoreBackend at ``/.mambo/`` is always present.  Pass ``"."``
+in *virtual_workspaces* to override it with a custom StoreBackend instance.
 
 The AI is told via the system prompt that ``/.mambo/`` is a virtual scratchpad:
 
@@ -41,20 +41,19 @@ from mambo_agents.backends.protocol import (
     ReadResult,
     ReadSummarizer,
     Result,
-    ThreadAwareWorkspace,
     ToolTimeouts,
     UploadFileResult,
     WriteResult,
 )
 from mambo_agents.backends.schemas import BackendError, ErrorCode, check_no_path_traversal, GrepMatch, VirtualPath
-from mambo_agents.backends.state import StateBackend
+from mambo_agents.backends.store import StoreBackend
 
 # ---------------------------------------------------------------------------
 # Default workspace prefix
 # ---------------------------------------------------------------------------
 
 DEFAULT_MAMBO_PREFIX = "/.mambo/"
-"""Default path prefix for the virtual scratchpad managed by StateBackend."""
+"""Default path prefix for the virtual scratchpad managed by StoreBackend."""
 
 
 # ============================================================================
@@ -112,10 +111,10 @@ def _validate_workspace_name(name: str) -> str:
 # ============================================================================
 
 
-class HybridWorkspaceBackend(ThreadAwareWorkspace):
+class HybridWorkspaceBackend(BackendProtocol):
     """Multi-backend router: 1 real + N virtual workspaces under ``/.mambo/``.
 
-    A default StateBackend is always mounted at ``/.mambo/``.  Additional
+    A default StoreBackend is always mounted at ``/.mambo/``.  Additional
     named virtual workspaces live at ``/.mambo/<name>/``.  Everything outside
     ``/.mambo/`` routes to *real_backend*.
 
@@ -128,9 +127,9 @@ class HybridWorkspaceBackend(ThreadAwareWorkspace):
             (e.g. :class:`LocalBackend`).
         virtual_workspaces:
             Named virtual workspaces.  Key ``"."`` overrides the default
-            ``/.mambo/`` StateBackend; other keys create
+            ``/.mambo/`` StoreBackend; other keys create
             ``/.mambo/<name>/`` namespaces.  Each value is a
-            :class:`BackendProtocol` (typically :class:`StateBackend`).
+            :class:`BackendProtocol` (typically :class:`StoreBackend`).
             Virtual backends see their workspace as rooted at ``"/"`` —
             the ``/.mambo/<name>/`` prefix is stripped before delegation.
         mambo_prefix:
@@ -173,12 +172,14 @@ class HybridWorkspaceBackend(ThreadAwareWorkspace):
         # --- Build virtual workspaces ---------------------------------
         vw = dict(virtual_workspaces or {})
 
-        # "." key → override default /.mambo/ StateBackend
+        # "." key → override default /.mambo/ StoreBackend
         if "." in vw:
             self._default_mambo = vw.pop(".")
         else:
-            self._default_mambo = StateBackend(
-                max_read_chars=max_read_chars, summarizer=summarizer, tool_timeouts=_merged,
+            self._default_mambo = StoreBackend(
+                max_read_chars=max_read_chars,
+                max_grep_matches=1000,
+                summarizer=summarizer, tool_timeouts=_merged,
             )
 
         # Remaining entries → /.mambo/<name>/ namespaces
@@ -849,73 +850,35 @@ class HybridWorkspaceBackend(ThreadAwareWorkspace):
     # ------------------------------------------------------------------
 
     # ------------------------------------------------------------------
-    # copy helpers — thread_id resolution to avoid Pregel deadlocks
+    # copy helpers — simplified (no thread_id forwarding needed)
     # ------------------------------------------------------------------
-
-    @staticmethod
-    def _resolve_copy_thread_id() -> str | None:
-        """Resolve ``thread_id`` from the current LangGraph config.
-
-        Returns ``None`` when outside graph context — callers fall back
-        to the backend's default path resolution.
-        """
-        try:
-            from langgraph.config import get_config
-            config = get_config()
-            return config.get("configurable", {}).get("thread_id")
-        except (RuntimeError, KeyError):
-            return None
 
     @staticmethod
     def _download_for_copy(
         be: BackendProtocol,
         paths: list[VirtualPath],
-        thread_id: str | None,
     ) -> list[DownloadFileResult]:
-        """Return ``be.download_files(paths)``, forwarding *thread_id*
-        when *be* is :class:`ThreadAwareWorkspace` and *thread_id* is set."""
-        if isinstance(be, ThreadAwareWorkspace) and thread_id is not None:
-            return list(be.download_files(paths, thread_id=thread_id))
         return list(be.download_files(paths))
 
     @staticmethod
     def _upload_for_copy(
         be: BackendProtocol,
         files: list[tuple[VirtualPath, bytes]],
-        thread_id: str | None,
     ) -> list[UploadFileResult]:
-        """Return ``be.upload_files(files)``, forwarding *thread_id*
-        when *be* is :class:`ThreadAwareWorkspace` and *thread_id* is set."""
-        if isinstance(be, ThreadAwareWorkspace) and thread_id is not None:
-            return list(be.upload_files(files, thread_id=thread_id))
         return list(be.upload_files(files))
 
     @staticmethod
     async def _adownload_for_copy(
         be: BackendProtocol,
         paths: list[VirtualPath],
-        thread_id: str | None,
     ) -> list[DownloadFileResult]:
-        """Async variant of :meth:`_download_for_copy`.
-
-        Uses ``be.adownload_files`` for non-thread-aware backends
-        (e.g. SshBackend's ``_async_lock`` path), and an explicit
-        ``asyncio.to_thread`` call with *thread_id* forwarding for
-        :class:`ThreadAwareWorkspace` backends.
-        """
-        if isinstance(be, ThreadAwareWorkspace) and thread_id is not None:
-            return list(await asyncio.to_thread(be.download_files, paths, thread_id=thread_id))
         return list(await be.adownload_files(paths))
 
     @staticmethod
     async def _aupload_for_copy(
         be: BackendProtocol,
         files: list[tuple[VirtualPath, bytes]],
-        thread_id: str | None,
     ) -> list[UploadFileResult]:
-        """Async variant of :meth:`_upload_for_copy`."""
-        if isinstance(be, ThreadAwareWorkspace) and thread_id is not None:
-            return list(await asyncio.to_thread(be.upload_files, files, thread_id=thread_id))
         return list(await be.aupload_files(files))
 
     # ------------------------------------------------------------------
@@ -923,19 +886,7 @@ class HybridWorkspaceBackend(ThreadAwareWorkspace):
     # ------------------------------------------------------------------
 
     def copy(self, source: VirtualPath, destination: VirtualPath) -> CopyResult:
-        """Copy a single file, potentially across different backends.
-
-        Reads the source file as raw bytes via :meth:`download_files` on the
-        source backend, then writes to the destination **always overwriting**
-        (copy semantics — the destination is replaced if it already exists).
-
-        Explicit *thread_id* is resolved and forwarded to
-        :class:`ThreadAwareWorkspace` backends so they use the **graph-out**
-        path.  This is critical: ``copy()`` runs in a daemon thread (via
-        ``_wrap_sync_with_timeout``), and calling the graph-in path
-        (Pregel ``read`` / ``send``) from that thread **deadlocks** because
-        the Pregel loop is already awaiting this tool call.
-        """
+        """Copy a single file, potentially across different backends."""
         try:
             src_be, src_path = self._route(source)
         except BackendError as e:
@@ -945,10 +896,7 @@ class HybridWorkspaceBackend(ThreadAwareWorkspace):
         except BackendError as e:
             return CopyResult(error=e)
 
-        tid = self._resolve_copy_thread_id()
-
-        # Download source as raw bytes
-        dl_results = self._download_for_copy(src_be, [src_path], tid)
+        dl_results = self._download_for_copy(src_be, [src_path])
         if not dl_results:
             return CopyResult(error=BackendError(code=ErrorCode.INVALID, path=source, message=f"No result returned when reading '{source}'"))
         dl = dl_results[0]
@@ -957,8 +905,7 @@ class HybridWorkspaceBackend(ThreadAwareWorkspace):
         if dl.content is None:
             return CopyResult(error=BackendError(code=ErrorCode.INVALID, path=source, message=f"'{source}' is empty or unreadable"))
 
-        # Upload to destination (all backends' upload_files overwrite by default)
-        ul_results = self._upload_for_copy(dst_be, [(dst_path, dl.content)], tid)
+        ul_results = self._upload_for_copy(dst_be, [(dst_path, dl.content)])
         if not ul_results:
             return CopyResult(error=BackendError(code=ErrorCode.INVALID, path=destination, message=f"No result returned when writing '{destination}'"))
         ul = ul_results[0]
@@ -968,14 +915,7 @@ class HybridWorkspaceBackend(ThreadAwareWorkspace):
         return CopyResult(source=source, destination=destination)
 
     async def acopy(self, source: VirtualPath, destination: VirtualPath) -> CopyResult:
-        """Async: Copy a single file across backends.
-
-        Uses async download/upload when the backend provides them
-        (e.g. :class:`SshBackend` acquires ``_async_lock``), and
-        forwards *thread_id* to :class:`ThreadAwareWorkspace` backends
-        to avoid the same Pregel-channel deadlock described in
-        :meth:`copy`.  Always overwrites the destination.
-        """
+        """Async: Copy a single file across backends."""
         try:
             src_be, src_path = self._route(source)
         except BackendError as e:
@@ -985,10 +925,7 @@ class HybridWorkspaceBackend(ThreadAwareWorkspace):
         except BackendError as e:
             return CopyResult(error=e)
 
-        tid = self._resolve_copy_thread_id()
-
-        # Download source as raw bytes (async)
-        dl_results = await self._adownload_for_copy(src_be, [src_path], tid)
+        dl_results = await self._adownload_for_copy(src_be, [src_path])
         if not dl_results:
             return CopyResult(error=BackendError(code=ErrorCode.INVALID, path=source, message=f"No result returned when reading '{source}'"))
         dl = dl_results[0]
@@ -997,8 +934,7 @@ class HybridWorkspaceBackend(ThreadAwareWorkspace):
         if dl.content is None:
             return CopyResult(error=BackendError(code=ErrorCode.INVALID, path=source, message=f"'{source}' is empty or unreadable"))
 
-        # Upload to destination (all backends' upload_files overwrite by default)
-        ul_results = await self._aupload_for_copy(dst_be, [(dst_path, dl.content)], tid)
+        ul_results = await self._aupload_for_copy(dst_be, [(dst_path, dl.content)])
         if not ul_results:
             return CopyResult(error=BackendError(code=ErrorCode.INVALID, path=destination, message=f"No result returned when writing '{destination}'"))
         ul = ul_results[0]
@@ -1014,17 +950,13 @@ class HybridWorkspaceBackend(ThreadAwareWorkspace):
     def upload_files(
         self,
         files: list[tuple[VirtualPath, bytes]],
-        *,
-        thread_id: str | None = None,
     ) -> list[UploadFileResult]:
         """Upload files, routing each to the correct backend by prefix."""
-        # Group files by target backend
-        groups: dict[int, list[tuple[VirtualPath, bytes]]] = {}  # backend_id → files
+        groups: dict[int, list[tuple[VirtualPath, bytes]]] = {}
         targets: list[BackendProtocol] = []
-        index_map: list[tuple[int, int, int]] = []  # (orig_idx, target_idx, file_idx_in_group)
-        routing_errors: dict[int, BackendError] = {}  # file_orig_index → error
+        index_map: list[tuple[int, int, int]] = []
+        routing_errors: dict[int, BackendError] = {}
         _reverse_info: dict[tuple[int, int], tuple[VirtualPath, VirtualPath]] = {}
-        # (target_idx, file_idx) → (target_ws_root, virtual_prefix)
 
         for orig_idx, (orig_path, data) in enumerate(files):
             try:
@@ -1032,7 +964,6 @@ class HybridWorkspaceBackend(ThreadAwareWorkspace):
             except BackendError as e:
                 routing_errors[orig_idx] = e
                 continue
-            # Find or register target
             idx = None
             for i, t in enumerate(targets):
                 if t is target:
@@ -1047,24 +978,16 @@ class HybridWorkspaceBackend(ThreadAwareWorkspace):
             _reverse_info[(idx, fi)] = (target.workspace_root, self._get_virtual_prefix(orig_path))
             index_map.append((orig_idx, idx, fi))
 
-        # Execute uploads per target
         results_per_target: dict[int, list[UploadFileResult]] = {}
         for idx, group_files in groups.items():
             be = targets[idx]
-            if isinstance(be, ThreadAwareWorkspace):
-                raw_results = list(
-                    be.upload_files(group_files, thread_id=thread_id)
-                )
-            else:
-                raw_results = list(be.upload_files(group_files))
-            # Reverse-translate each result's path
+            raw_results = list(be.upload_files(group_files))
             translated: list[UploadFileResult] = []
             for fi, result in enumerate(raw_results):
                 twsr, vprefix = _reverse_info[(idx, fi)]
                 translated.append(result.apply_reverse_translation(self._reverse_path, twsr, vprefix))
             results_per_target[idx] = translated
 
-        # Reassemble in original order
         results: list[UploadFileResult] = []
         for orig_idx in range(len(files)):
             if orig_idx in routing_errors:
@@ -1072,7 +995,6 @@ class HybridWorkspaceBackend(ThreadAwareWorkspace):
                 path_str = path.value if isinstance(path, VirtualPath) else str(path)
                 results.append(UploadFileResult(path=path_str, error=routing_errors[orig_idx]))
             else:
-                # find the matching entry in index_map
                 for oi, target_idx, file_idx in index_map:
                     if oi == orig_idx:
                         results.append(results_per_target[target_idx][file_idx])
@@ -1082,8 +1004,6 @@ class HybridWorkspaceBackend(ThreadAwareWorkspace):
     def download_files(
         self,
         paths: list[VirtualPath],
-        *,
-        thread_id: str | None = None,
     ) -> list[DownloadFileResult]:
         """Download files, routing each to the correct backend by prefix."""
         groups: dict[int, list[VirtualPath]] = {}
@@ -1091,7 +1011,6 @@ class HybridWorkspaceBackend(ThreadAwareWorkspace):
         index_map: list[tuple[int, int, int]] = []
         routing_errors: dict[int, BackendError] = {}
         _reverse_info: dict[tuple[int, int], tuple[VirtualPath, VirtualPath]] = {}
-        # (target_idx, file_idx) → (target_ws_root, virtual_prefix)
 
         for orig_idx, orig_path in enumerate(paths):
             try:
@@ -1116,13 +1035,7 @@ class HybridWorkspaceBackend(ThreadAwareWorkspace):
         results_per_target: dict[int, list[DownloadFileResult]] = {}
         for idx, group_paths in groups.items():
             be = targets[idx]
-            if isinstance(be, ThreadAwareWorkspace):
-                raw_results = list(
-                    be.download_files(group_paths, thread_id=thread_id)
-                )
-            else:
-                raw_results = list(be.download_files(group_paths))
-            # Reverse-translate each result's path
+            raw_results = list(be.download_files(group_paths))
             translated: list[DownloadFileResult] = []
             for fi, result in enumerate(raw_results):
                 twsr, vprefix = _reverse_info[(idx, fi)]
@@ -1143,25 +1056,19 @@ class HybridWorkspaceBackend(ThreadAwareWorkspace):
         return results
 
     # ------------------------------------------------------------------
-    # Async bulk — route per-group to each target backend's async method
-    # so that backends with _async_lock (e.g. SshBackend) serialize
-    # SFTP access and avoid paramiko deadlocks.
+    # Async bulk
     # ------------------------------------------------------------------
 
     async def aupload_files(
         self,
         files: list[tuple[VirtualPath, bytes]],
-        *,
-        thread_id: str | None = None,
     ) -> list[UploadFileResult]:
         """Async: upload files, routing each to the correct backend."""
-        # Group files by target backend (same logic as sync upload_files)
         groups: dict[int, list[tuple[VirtualPath, bytes]]] = {}
         targets: list[BackendProtocol] = []
         index_map: list[tuple[int, int, int]] = []
         routing_errors: dict[int, BackendError] = {}
         _reverse_info: dict[tuple[int, int], tuple[VirtualPath, VirtualPath]] = {}
-        # (target_idx, file_idx) → (target_ws_root, virtual_prefix)
 
         for orig_idx, (orig_path, data) in enumerate(files):
             try:
@@ -1183,21 +1090,16 @@ class HybridWorkspaceBackend(ThreadAwareWorkspace):
             _reverse_info[(idx, fi)] = (target.workspace_root, self._get_virtual_prefix(orig_path))
             index_map.append((orig_idx, idx, fi))
 
-        # Execute uploads per target via each backend's async method
         results_per_target: dict[int, list[UploadFileResult]] = {}
         for idx, group_files in groups.items():
             be = targets[idx]
-            raw_results = list(
-                await be.aupload_files(group_files)
-            )
-            # Reverse-translate each result's path
+            raw_results = list(await be.aupload_files(group_files))
             translated: list[UploadFileResult] = []
             for fi, result in enumerate(raw_results):
                 twsr, vprefix = _reverse_info[(idx, fi)]
                 translated.append(result.apply_reverse_translation(self._reverse_path, twsr, vprefix))
             results_per_target[idx] = translated
 
-        # Reassemble in original order
         results: list[UploadFileResult] = []
         for orig_idx in range(len(files)):
             if orig_idx in routing_errors:
@@ -1214,17 +1116,13 @@ class HybridWorkspaceBackend(ThreadAwareWorkspace):
     async def adownload_files(
         self,
         paths: list[VirtualPath],
-        *,
-        thread_id: str | None = None,
     ) -> list[DownloadFileResult]:
         """Async: download files, routing each to the correct backend."""
-        # Group paths by target backend (same logic as sync download_files)
         groups: dict[int, list[VirtualPath]] = {}
         targets: list[BackendProtocol] = []
         index_map: list[tuple[int, int, int]] = []
         routing_errors: dict[int, BackendError] = {}
         _reverse_info: dict[tuple[int, int], tuple[VirtualPath, VirtualPath]] = {}
-        # (target_idx, file_idx) → (target_ws_root, virtual_prefix)
 
         for orig_idx, orig_path in enumerate(paths):
             try:
@@ -1246,21 +1144,16 @@ class HybridWorkspaceBackend(ThreadAwareWorkspace):
             _reverse_info[(idx, fi)] = (target.workspace_root, self._get_virtual_prefix(orig_path))
             index_map.append((orig_idx, idx, fi))
 
-        # Execute downloads per target via each backend's async method
         results_per_target: dict[int, list[DownloadFileResult]] = {}
         for idx, group_paths in groups.items():
             be = targets[idx]
-            raw_results = list(
-                await be.adownload_files(group_paths)
-            )
-            # Reverse-translate each result's path
+            raw_results = list(await be.adownload_files(group_paths))
             translated: list[DownloadFileResult] = []
             for fi, result in enumerate(raw_results):
                 twsr, vprefix = _reverse_info[(idx, fi)]
                 translated.append(result.apply_reverse_translation(self._reverse_path, twsr, vprefix))
             results_per_target[idx] = translated
 
-        # Reassemble in original order
         results: list[DownloadFileResult] = []
         for orig_idx in range(len(paths)):
             if orig_idx in routing_errors:

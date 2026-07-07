@@ -49,7 +49,7 @@ Mambo Agents 在 LangGraph 基础上构建，通过**工厂函数 + 中间件栈
 ### 3.1 最简单用法
 
 ```python
-from mambo_agents import create_mambo_agent, StateBackend
+from mambo_agents import create_mambo_agent, StoreBackend
 from langchain_core.messages import HumanMessage
 
 agent = create_mambo_agent("gpt-4o")
@@ -162,7 +162,7 @@ def create_mambo_agent(
 
 | 参数 | 类型 | 默认值 | 说明 |
 |------|------|--------|------|
-| `backend` | `BackendProtocol` | `StateBackend()` | 文件系统后端 |
+| `backend` | `BackendProtocol` | `StoreBackend()` | 文件系统后端 |
 | `system_prompt` | `str` | 内置默认 | 系统提示词 |
 | `summarization` | `SummarizationConfig` | `None` | 对话摘要配置 |
 | `subagents` | `list` | `None` | 同步子代理列表 |
@@ -178,11 +178,11 @@ def create_mambo_agent(
 **示例：**
 
 ```python
-from mambo_agents import create_mambo_agent, StateBackend
+from mambo_agents import create_mambo_agent, StoreBackend
 
 agent = create_mambo_agent(
     "gpt-4o",
-    backend=StateBackend(initial_files={
+    backend=StoreBackend(initial_files={
         "/config.json": '{"port": 8080}',
     }),
     summarization={
@@ -214,14 +214,14 @@ agent = create_mambo_agent(
 
 每个后端还可以通过 `tools` 属性暴露额外的工具（如 `tree`、`delete`、`execute`）。
 
-### 5.2 StateBackend — 内存文件系统
+### 5.2 StoreBackend — 内存文件系统
 
-文件存储在 LangGraph 的 `files` 状态通道中，自动参与检查点。
+文件存储在 LangGraph 的 `BaseStore` 中，以命名空间实现会话隔离。
 
 ```python
-from mambo_agents import StateBackend
+from mambo_agents import StoreBackend
 
-backend = StateBackend(
+backend = StoreBackend(
     initial_files={
         "/config.json": '{"port": 8080}',
         "/README.md": "# My Project",
@@ -232,9 +232,14 @@ backend = StateBackend(
 **额外工具：** `tree`
 
 **特点：**
-- 自动参与 LangGraph 检查点（支持暂停/恢复/回滚）
-- 多线程安全（`thread_id` 隔离）
+- 会话隔离：`(thread_id, "mambo_fs")` 命名空间
+- 图内/图外均可用
 - 轻量级，无需磁盘访问
+- `thread_id` 锁死在构造时，图外操作简便：
+  ```python
+  be = StoreBackend(thread_id="my-session")
+  be.upload_files([(path, data)])  # 自动写入 "my-session"
+  ```
 
 ### 5.3 LocalBackend — 本地文件系统
 
@@ -285,14 +290,14 @@ backend = SshBackend(
 ### 5.5 HybridWorkspaceBackend — 多后端路由
 
 真实后端 + N 个虚拟 workspace，统一在 `/.mambo/` 下路由。
-每个虚拟 workspace 由独立的 `StateBackend` 驱动，只支持核心 protocol 工具。
+每个虚拟 workspace 由独立的 `StoreBackend` 驱动，只支持核心 protocol 工具。
 
 ```python
 from mambo_agents.backends.hybrid_workspace import HybridWorkspaceBackend
 from mambo_agents.backends.local import LocalBackend
-from mambo_agents import StateBackend
+from mambo_agents import StoreBackend
 
-# 最简用法：自动创建 /.mambo/ 默认 StateBackend
+# 最简用法：自动创建 /.mambo/ 默认 StoreBackend
 backend = HybridWorkspaceBackend(
     real_backend=LocalBackend(root_dir="/tmp/project"),
 )
@@ -301,8 +306,8 @@ backend = HybridWorkspaceBackend(
 backend = HybridWorkspaceBackend(
     real_backend=LocalBackend(root_dir="/tmp/project"),
     virtual_workspaces={
-        "skills": StateBackend(initial_files={"/python.md": "..."}),
-        "cache": StateBackend(),
+        "skills": StoreBackend(initial_files={"/python.md": "..."}),
+        "cache": StoreBackend(),
     },
 )
 
@@ -310,14 +315,14 @@ backend = HybridWorkspaceBackend(
 backend = HybridWorkspaceBackend(
     real_backend=LocalBackend(root_dir="/tmp/project"),
     virtual_workspaces={
-        ".": StateBackend(initial_files={"/config.yml": "..."}),
+        ".": StoreBackend(initial_files={"/config.yml": "..."}),
     },
 )
 ```
 
 **路径路由规则：**
 - `/.mambo/skills/xxx` → "skills" 虚拟 workspace（strip 前缀后传 `/xxx`）
-- `/.mambo/xxx` → 默认 StateBackend（strip 前缀后传 `/xxx`）
+- `/.mambo/xxx` → 默认 StoreBackend（strip 前缀后传 `/xxx`）
 - 其他路径 → 真实后端
 
 **用途：**
@@ -328,10 +333,10 @@ backend = HybridWorkspaceBackend(
 
 ### 5.6 后端对比
 
-| 特性 | StateBackend | LocalBackend | SshBackend | HybridWorkspaceBackend |
+| 特性 | StoreBackend | LocalBackend | SshBackend | HybridWorkspaceBackend |
 |------|:---:|:---:|:---:|:---:|
-| 存储位置 | 内存 | 本地磁盘 | 远程服务器 | 混合 |
-| 检查点支持 | 自动 | 手动 | 手动 | 自动(/.mambo/) |
+| 存储位置 | 内存(Store) | 本地磁盘 | 远程服务器 | 混合 |
+| 会话隔离 | 自动(命名空间) | 手动 | 手动 | 自动(/.mambo/) |
 | Shell 执行 | ❌ | 可选 | ✅ | ❌ |
 | 删除操作 | ❌ | ✅ | ✅ | ❌ |
 | grep 加速 | N/A | ripgrep | 远程 rg/grep | 继承委托 |
@@ -557,7 +562,7 @@ agent = create_mambo_agent(
     "gpt-4o",
     middleware=[
         MamboMemoryMiddleware(
-            backend=StateBackend(),
+            backend=StoreBackend(),
             sources=["/.mambo/memory/AGENTS.md"],
             format_prompt=my_formatter,
         ),
@@ -621,23 +626,26 @@ agent = create_mambo_agent(
 
 ### 6.8 VersionControlMiddleware
 
-**功能：** 以 checkpoint 为粒度自动快照文件变更，支持选择性回滚。不向 LLM 暴露任何工具，版本数据仅供调用方（如 Web 应用）查询使用。
+**功能：** 以 checkpoint 为粒度自动快照文件变更，支持**手动回滚**。不向 LLM 暴露任何工具，版本数据仅供调用方（如 Web 应用）查询使用。回滚由用户显式调用 `restore_files()` 触发 — 没有自动回滚机制。
 
 **设计原则：**
-- 存储与后端解耦 — 纯本地文件 I/O，写入 `./.mambo_versions/`
-- 即时持久化 — 每次 `wrap_tool_call` 备份同时写入 blob 和 index.json
+- 存储基于 LangGraph `BaseStore` — blob 和索引通过 `BaseStore` 持久化，使用命名空间 `(thread_id, "mambo_vc_blobs")` 和 `(thread_id, "mambo_vc_index")`。兼容 `InMemoryStore`、Postgres 等任何 `BaseStore` 实现
+- 即时持久化 — 每次 `wrap_tool_call` 备份通过 `store.put()` 同时写入 blob 和索引，`astream` 中断后数据不丢失
 - 增量快照 — 只备份 LLM 实际变更的文件
 - 内容寻址 — SHA256 存储，相同内容只存一份
+- **仅手动回滚** — 用户显式调用 `restore_files()`，没有 config 自动回滚
 
 **配置方式：**
 
 ```python
+from langgraph.store.memory import InMemoryStore
 from mambo_agents.middleware.version_control import (
+    BackupEvent,
     VersionStore,
     VersionControlMiddleware,
 )
 
-store = VersionStore(storage_dir="./.mambo_versions")
+store = VersionStore(store=InMemoryStore())
 
 agent = create_mambo_agent(
     "gpt-4o",
@@ -653,11 +661,22 @@ agent = create_mambo_agent(
 )
 ```
 
+**通过 custom stream 接收备份事件：**
+
+```python
+async for mode, chunk in agent.astream(
+    {"messages": [...]}, config, stream_mode=["updates", "custom"],
+):
+    if mode == "custom":
+        event = BackupEvent(**chunk)
+        print(f"[backup] ckpt={event.checkpoint_id} file={event.file_path}")
+```
+
 **参数说明：**
 
 | 参数 | 类型 | 默认值 | 说明 |
 |------|------|--------|------|
-| `store` | `VersionStore` | (必填) | 版本数据存储引擎 |
+| `store` | `VersionStore` | (必填) | 版本数据存储引擎（基于 LangGraph `BaseStore`） |
 | `backend` | `BackendProtocol` | (必填) | 文件系统后端（用于读写文件内容） |
 | `whitelist_folders` | `list[str]` | `[]` | **白名单模式** — 仅对此列表内的文件夹进行备份和回滚。空列表 = 不处理任何文件 |
 | `mutating_tool_names` | `list[str]` | `["write", "edit", "delete"]` | 声明哪些工具是"写入/变更"工具，调用前自动触发备份 |
@@ -691,22 +710,16 @@ VersionControlMiddleware(
 )
 ```
 
-**时间旅行回滚：**
+**手动回滚 `restore_files()`：**
 
-通过 config 中的 `version_rollback` 指定要回滚的文件：
+回滚由用户显式调用中间件实例的 `restore_files()` 方法触发（在图外部）：
 
 ```python
-config = {
-    "configurable": {
-        "thread_id": "session-1",
-        "checkpoint_id": "cp_target",       # 回滚目标 checkpoint
-        "version_rollback": {
-            "files": ["/workspace/src/main.py"],  # 指定文件列表
-            # 或 "all": True 将所有变更文件恢复到该 checkpoint
-        },
-    }
-}
-agent.astream({"messages": [...]}, config)
+# 将指定文件恢复到某个 checkpoint 的状态
+middleware.restore_files("thread-1", "cp_abc123", files=["/workspace/src/main.py"])
+
+# 或恢复该 checkpoint 下所有变更的文件
+middleware.restore_files("thread-1", "cp_abc123", all=True)
 ```
 
 注意：回滚同样受白名单限制 — 不在白名单内的文件不会被恢复。
@@ -716,7 +729,9 @@ agent.astream({"messages": [...]}, config)
 Web 应用等调用方可通过 `VersionStore` 查询版本历史：
 
 ```python
-store = VersionStore(storage_dir="./.mambo_versions")
+from langgraph.store.memory import InMemoryStore
+
+store = VersionStore(store=InMemoryStore())
 
 # 整个对话会话中改过哪些文件（去重）
 all_files = store.get_all_changed_files("thread-123")
@@ -740,11 +755,12 @@ store.get_file("thread-123", "cp_x", "/path")  # 某文件在某 checkpoint 的�
 
 ```python
 from mambo_agents.middleware.version_control import VersionControlConfig
+from langgraph.store.memory import InMemoryStore
 
 VersionControlConfig(
-    store_dir="./.mambo_versions",              # 版本存储目录
-    auto_snapshot=True,                          # 自动触发备份
-    whitelist_folders=["/workspace/src"],        # 白名单文件夹
+    store=InMemoryStore(),                        # LangGraph BaseStore 实例
+    auto_snapshot=True,                           # 变更工具调用时自动触发备份
+    whitelist_folders=["/workspace/src"],         # 白名单文件夹
     mutating_tool_names=["write", "edit", "delete"],  # 变更工具名
 )
 ```
@@ -929,7 +945,7 @@ agent = create_mambo_agent(
 ```python
 agent = create_mambo_agent(
     "gpt-4o",
-    backend=StateBackend(initial_files={
+    backend=StoreBackend(initial_files={
         "/app/main.py": "def main():\n    print('hello')",
         "/app/config.yaml": "port: 8080\ndebug: true",
         "/app/requirements.txt": "fastapi==0.100.0\nuvicorn==0.23.0",
@@ -1002,10 +1018,8 @@ from mambo_agents import (
 
     # 后端
     BackendProtocol,
-    StateBackend,
+    StoreBackend,
     HybridWorkspaceBackend,
-    FileData,
-    FilesystemState,
 
     # 同步子代理
     SubAgent,
@@ -1041,7 +1055,6 @@ from mambo_agents import (
     VersionControlMiddleware,
     VersionStore,
     VersionControlConfig,
-    VersionRollbackConfig,
 )
 ```
 

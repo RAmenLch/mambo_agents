@@ -49,7 +49,7 @@ Mambo Agents builds on LangGraph, assembling agents via the **factory function +
 ### 3.1 Simplest Usage
 
 ```python
-from mambo_agents import create_mambo_agent, StateBackend
+from mambo_agents import create_mambo_agent, StoreBackend
 from langchain_core.messages import HumanMessage
 
 agent = create_mambo_agent("gpt-4o")
@@ -162,7 +162,7 @@ def create_mambo_agent(
 
 | Parameter | Type | Default | Description |
 |-----------|------|---------|-------------|
-| `backend` | `BackendProtocol` | `StateBackend()` | Filesystem backend |
+| `backend` | `BackendProtocol` | `StoreBackend()` | Filesystem backend |
 | `system_prompt` | `str` | built-in default | System prompt |
 | `summarization` | `SummarizationConfig` | `None` | Conversation summarization config |
 | `subagents` | `list` | `None` | Synchronous sub-agent specs |
@@ -178,11 +178,11 @@ def create_mambo_agent(
 **Example:**
 
 ```python
-from mambo_agents import create_mambo_agent, StateBackend
+from mambo_agents import create_mambo_agent, StoreBackend
 
 agent = create_mambo_agent(
     "gpt-4o",
-    backend=StateBackend(initial_files={
+    backend=StoreBackend(initial_files={
         "/config.json": '{"port": 8080}',
     }),
     summarization={
@@ -214,14 +214,14 @@ Every backend must implement 6 core operations:
 
 Each backend can also expose extra tools via its `tools` property (e.g. `tree`, `delete`, `execute`).
 
-### 5.2 StateBackend — In-memory Filesystem
+### 5.2 StoreBackend — In-memory Filesystem
 
-Files are stored in the LangGraph `files` state channel, automatically participating in checkpointing.
+Files are stored in LangGraph's `BaseStore` with per-session namespace isolation.
 
 ```python
-from mambo_agents import StateBackend
+from mambo_agents import StoreBackend
 
-backend = StateBackend(
+backend = StoreBackend(
     initial_files={
         "/config.json": '{"port": 8080}',
         "/README.md": "# My Project",
@@ -232,9 +232,14 @@ backend = StateBackend(
 **Extra tools:** `tree`
 
 **Characteristics:**
-- Automatic LangGraph checkpoint integration (pause / resume / rollback)
-- Thread-safe (`thread_id` isolation)
+- Session isolation via `(thread_id, "mambo_fs")` namespace
+- Works inside and outside graph context
 - Lightweight, no disk access
+- `thread_id` locked at construction for easy graph-outside usage:
+  ```python
+  be = StoreBackend(thread_id="my-session")
+  be.upload_files([(path, data)])  # targets "my-session" automatically
+  ```
 
 ### 5.3 LocalBackend — Local Filesystem
 
@@ -285,14 +290,14 @@ backend = SshBackend(
 ### 5.5 HybridWorkspaceBackend — Multi-backend Routing
 
 One real backend + N virtual workspaces, all routed under `/.mambo/`.
-Each virtual workspace is backed by an independent `StateBackend` and only supports core protocol tools.
+Each virtual workspace is backed by an independent `StoreBackend` and only supports core protocol tools.
 
 ```python
 from mambo_agents.backends.hybrid_workspace import HybridWorkspaceBackend
 from mambo_agents.backends.local import LocalBackend
-from mambo_agents import StateBackend
+from mambo_agents import StoreBackend
 
-# Simplest: auto-create /.mambo/ default StateBackend
+# Simplest: auto-create /.mambo/ default StoreBackend
 backend = HybridWorkspaceBackend(
     real_backend=LocalBackend(root_dir="/tmp/project"),
 )
@@ -301,8 +306,8 @@ backend = HybridWorkspaceBackend(
 backend = HybridWorkspaceBackend(
     real_backend=LocalBackend(root_dir="/tmp/project"),
     virtual_workspaces={
-        "skills": StateBackend(initial_files={"/python.md": "..."}),
-        "cache": StateBackend(),
+        "skills": StoreBackend(initial_files={"/python.md": "..."}),
+        "cache": StoreBackend(),
     },
 )
 
@@ -310,14 +315,14 @@ backend = HybridWorkspaceBackend(
 backend = HybridWorkspaceBackend(
     real_backend=LocalBackend(root_dir="/tmp/project"),
     virtual_workspaces={
-        ".": StateBackend(initial_files={"/config.yml": "..."}),
+        ".": StoreBackend(initial_files={"/config.yml": "..."}),
     },
 )
 ```
 
 **Path routing rules:**
 - `/.mambo/skills/xxx` → "skills" virtual workspace (prefix stripped, passes `/xxx`)
-- `/.mambo/xxx` → default StateBackend (prefix stripped, passes `/xxx`)
+- `/.mambo/xxx` → default StoreBackend (prefix stripped, passes `/xxx`)
 - Everything else → real backend
 
 **Use cases:**
@@ -328,10 +333,10 @@ backend = HybridWorkspaceBackend(
 
 ### 5.6 Backend Comparison
 
-| Feature | StateBackend | LocalBackend | SshBackend | HybridWorkspaceBackend |
+| Feature | StoreBackend | LocalBackend | SshBackend | HybridWorkspaceBackend |
 |---------|:---:|:---:|:---:|:---:|
-| Storage Location | Memory | Local Disk | Remote Server | Hybrid |
-| Checkpoint Support | Automatic | Manual | Manual | Automatic (/.mambo/) |
+| Storage Location | Memory (Store) | Local Disk | Remote Server | Hybrid |
+| Session Isolation | Automatic (namespace) | Manual | Manual | Automatic (/.mambo/) |
 | Shell Execution | ❌ | Optional | ✅ | ❌ |
 | Delete Operation | ❌ | ✅ | ✅ | ❌ |
 | grep Acceleration | N/A | ripgrep | Remote rg/grep | Inherits delegate |
@@ -566,23 +571,26 @@ Tool Call → AI Security Review → Safe: pass through
 
 ### 6.8 VersionControlMiddleware
 
-**Purpose:** Automatically snapshots file changes at checkpoint granularity, with selective rollback support. No tools are exposed to the LLM — version data is purely for caller-side consumption (e.g. a web UI).
+**Purpose:** Automatically snapshots file changes at checkpoint granularity, with **manual rollback** support. No tools are exposed to the LLM — version data is purely for caller-side consumption (e.g. a web UI). Rollback is triggered explicitly by the user via `restore_files()` — there is no automatic rollback.
 
 **Design principles:**
-- Storage decoupled from agent backend — pure local-file I/O under `./.mambo_versions/`
-- Write-time persistence — each `wrap_tool_call` backup writes its blob and index.json atomically
+- Storage via LangGraph `BaseStore` — blobs and indices are persisted through `BaseStore`, using namespaces `(thread_id, "mambo_vc_blobs")` and `(thread_id, "mambo_vc_index")`. Works with `InMemoryStore`, Postgres, or any `BaseStore` implementation
+- Write-time persistence — each `wrap_tool_call` backup writes its blob AND updates the index atomically via `store.put()`. Survives `astream` interruption
 - Incremental — only files actually mutated by the LLM are backed up
 - Content-addressed — SHA256 blobs; identical content stored once
+- **Manual rollback only** — users call `restore_files()` explicitly. No automatic rollback via config
 
 **Configuration:**
 
 ```python
+from langgraph.store.memory import InMemoryStore
 from mambo_agents.middleware.version_control import (
+    BackupEvent,
     VersionStore,
     VersionControlMiddleware,
 )
 
-store = VersionStore(storage_dir="./.mambo_versions")
+store = VersionStore(store=InMemoryStore())
 
 agent = create_mambo_agent(
     "gpt-4o",
@@ -598,11 +606,22 @@ agent = create_mambo_agent(
 )
 ```
 
+**Receiving backup events via custom stream:**
+
+```python
+async for mode, chunk in agent.astream(
+    {"messages": [...]}, config, stream_mode=["updates", "custom"],
+):
+    if mode == "custom":
+        event = BackupEvent(**chunk)
+        print(f"[backup] ckpt={event.checkpoint_id} file={event.file_path}")
+```
+
 **Parameters:**
 
 | Parameter | Type | Default | Description |
 |-----------|------|---------|-------------|
-| `store` | `VersionStore` | (required) | Version data storage engine |
+| `store` | `VersionStore` | (required) | Version data storage engine (backed by LangGraph `BaseStore`) |
 | `backend` | `BackendProtocol` | (required) | Filesystem backend (for reading/writing file content) |
 | `whitelist_folders` | `list[str]` | `[]` | **Whitelist mode** — only backup and rollback files within these folders. Empty list = no files processed |
 | `mutating_tool_names` | `list[str]` | `["write", "edit", "delete"]` | Declares which tools are "write/change" tools to trigger pre-mutation backups |
@@ -636,22 +655,16 @@ VersionControlMiddleware(
 )
 ```
 
-**Time-travel rollback:**
+**Manual rollback via `restore_files()`:**
 
-Roll back specific files via `version_rollback` in config:
+Rollback is triggered explicitly by the user — call `restore_files()` on the middleware instance outside the graph:
 
 ```python
-config = {
-    "configurable": {
-        "thread_id": "session-1",
-        "checkpoint_id": "cp_target",       # target checkpoint
-        "version_rollback": {
-            "files": ["/workspace/src/main.py"],  # explicit file list
-            # or "all": True to restore all changed files at that checkpoint
-        },
-    }
-}
-agent.astream({"messages": [...]}, config)
+# Restore specific files to a previous checkpoint
+middleware.restore_files("thread-1", "cp_abc123", files=["/workspace/src/main.py"])
+
+# Or restore all changed files at that checkpoint
+middleware.restore_files("thread-1", "cp_abc123", all=True)
 ```
 
 Note: rollback respects whitelist — files outside the whitelist will not be restored.
@@ -661,7 +674,9 @@ Note: rollback respects whitelist — files outside the whitelist will not be re
 Web apps and other callers can query version history via `VersionStore`:
 
 ```python
-store = VersionStore(storage_dir="./.mambo_versions")
+from langgraph.store.memory import InMemoryStore
+
+store = VersionStore(store=InMemoryStore())
 
 # All unique files changed across the entire session
 all_files = store.get_all_changed_files("thread-123")
@@ -685,10 +700,11 @@ store.get_file("thread-123", "cp_x", "/path")  # file content at a checkpoint
 
 ```python
 from mambo_agents.middleware.version_control import VersionControlConfig
+from langgraph.store.memory import InMemoryStore
 
 VersionControlConfig(
-    store_dir="./.mambo_versions",               # version storage root
-    auto_snapshot=True,                           # auto-trigger backups
+    store=InMemoryStore(),                        # LangGraph BaseStore instance
+    auto_snapshot=True,                           # auto-trigger backups on mutation tool calls
     whitelist_folders=["/workspace/src"],         # whitelisted directories
     mutating_tool_names=["write", "edit", "delete"],  # mutating tool names
 )
@@ -874,7 +890,7 @@ agent = create_mambo_agent(
 ```python
 agent = create_mambo_agent(
     "gpt-4o",
-    backend=StateBackend(initial_files={
+    backend=StoreBackend(initial_files={
         "/app/main.py": "def main():\n    print('hello')",
         "/app/config.yaml": "port: 8080\ndebug: true",
         "/app/requirements.txt": "fastapi==0.100.0\nuvicorn==0.23.0",
@@ -947,10 +963,8 @@ from mambo_agents import (
 
     # Backend
     BackendProtocol,
-    StateBackend,
+    StoreBackend,
     HybridWorkspaceBackend,
-    FileData,
-    FilesystemState,
 
     # Synchronous sub-agents
     SubAgent,
@@ -986,7 +1000,6 @@ from mambo_agents import (
     VersionControlMiddleware,
     VersionStore,
     VersionControlConfig,
-    VersionRollbackConfig,
 )
 ```
 

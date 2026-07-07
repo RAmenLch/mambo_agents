@@ -23,8 +23,10 @@ from mambo_agents import (
     WritePlansInput,
     create_mambo_agent,
 )
-from mambo_agents.backends.state import StateBackend
-from tests.test_state_backend import _simulate_graph
+from langgraph.store.memory import InMemoryStore
+
+from mambo_agents.backends.store import StoreBackend
+from tests.test_store_backend import _simulate_graph
 
 
 # ---------------------------------------------------------------------------
@@ -554,7 +556,7 @@ class TestCreateAgentAutoWiring:
     def test_plan_hook_auto_wired_with_summarization(self):
         """When both PlanMiddleware and summarization are active,
         the plan hook is automatically wired."""
-        backend = StateBackend()
+        backend = StoreBackend(store=InMemoryStore())
 
         plan_mw = MamboPlanMiddleware()
         hook = plan_mw.build_summary_hook()
@@ -573,7 +575,7 @@ class TestCreateAgentAutoWiring:
     def test_create_agent_with_plan_and_summarization(self):
         """Agent creation with both PlanMiddleware and summarization succeeds."""
         model = _get_model()
-        backend = StateBackend()
+        backend = StoreBackend(store=InMemoryStore())
         agent = create_mambo_agent(
             model,
             backend=backend,
@@ -589,7 +591,7 @@ class TestCreateAgentAutoWiring:
     def test_summarization_alone__no_plan(self):
         """Summarization without PlanMiddleware works fine."""
         model = _get_model()
-        backend = StateBackend()
+        backend = StoreBackend(store=InMemoryStore())
         agent = create_mambo_agent(
             model,
             backend=backend,
@@ -601,7 +603,7 @@ class TestCreateAgentAutoWiring:
     def test_plan_alone__no_summarization(self):
         """PlanMiddleware without summarization works fine."""
         model = _get_model()
-        backend = StateBackend()
+        backend = StoreBackend(store=InMemoryStore())
         agent = create_mambo_agent(
             model,
             backend=backend,
@@ -622,7 +624,7 @@ class TestPlanSummarizationE2E:
     def test_e2e_plan_agent_writes_and_updates_plans(self):
         """Agent uses write_plans and state is tracked."""
         model = _get_model()
-        backend = StateBackend()
+        backend = StoreBackend(store=InMemoryStore())
         agent = create_mambo_agent(
             model,
             backend=backend,
@@ -689,7 +691,7 @@ class TestPlanSummarizationE2E:
     def test_e2e_plan_with_aggressive_summarization(self):
         """Plan state survives summarization compaction (key scenario)."""
         model = _get_model()
-        backend = StateBackend()
+        backend = StoreBackend(store=InMemoryStore())
 
         plan_mw = MamboPlanMiddleware()
 
@@ -886,7 +888,6 @@ class TestPlanningStateSchema:
         This test verifies that **regardless of iteration order**, the
         ``messages`` annotation always carries a callable reducer.
         """
-        from mambo_agents.backends.state_schema import FilesystemState
         from mambo_agents.middleware.memory import MemoryState
         from mambo_agents.middleware.planning import PlanningState
         from mambo_agents.middleware.skills import SkillsState
@@ -897,7 +898,6 @@ class TestPlanningStateSchema:
             MemoryState,
             SummarizationState,
             SkillsState,
-            FilesystemState,
             PlanningState,
         ]
 

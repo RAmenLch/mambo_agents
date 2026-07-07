@@ -1,12 +1,14 @@
-"""Version-control middleware — checkpoint-scoped file snapshots with selective rollback.
+"""Version-control middleware — checkpoint-scoped file snapshots with manual rollback.
 
 Provides a user-facing (not Agent-facing) mechanism to:
 
 *   Automatically back up files before ``write``/``edit``/``delete`` tool calls,
     associating every backed-up file with the **parent checkpoint** (the checkpoint
     this ``invoke()`` call started from).
-*   Selectively roll back individual files to their state at a given checkpoint
-    when LangGraph time-travel is triggered.
+*   Emit ``BackupEvent`` as custom stream events so consumers can track what
+    was backed up in real time.
+*   Restore files to a previous checkpoint via :meth:`VersionControlMiddleware.restore_files`
+    (called manually by the user — no automatic rollback).
 
 .. note::
 
@@ -15,21 +17,30 @@ Provides a user-facing (not Agent-facing) mechanism to:
 
 Design principles
 -----------------
-* **Storage decoupled from agent backend** — pure local-file I/O under
-  ``./.mambo_versions/``.  No circular dependency.
+* **Storage via LangGraph BaseStore** — blobs and indices are persisted through
+  ``BaseStore``, using namespaces ``(thread_id, "mambo_vc_blobs")`` and
+  ``(thread_id, "mambo_vc_index")``.  Works with ``InMemoryStore``, Postgres, or
+  any ``BaseStore`` implementation.  No local filesystem dependency.
 * **Write-time persistence** — each ``wrap_tool_call`` backup writes its
-  blob AND updates index.json atomically.  Survives ``astream`` interruption.
+  blob AND updates the index atomically via ``store.put()``.  Survives
+  ``astream`` interruption.
 * **Incremental** — only files actually mutated by the LLM are backed up.
 * **Content-addressed** — SHA256 blobs; identical content is only stored once.
+* **Manual rollback only** — users call ``restore_files()`` explicitly.
+  No automatic rollback via config.
 
 Usage::
 
+    from langgraph.store.memory import InMemoryStore
+
     from mambo_agents.middleware.version_control import (
+        BackupEvent,
         VersionStore,
         VersionControlMiddleware,
     )
 
-    store = VersionStore(storage_dir="./.mambo_versions")
+    store = VersionStore(store=InMemoryStore())
+    middleware = VersionControlMiddleware(store=store, backend=backend)
 
     # Graph-external inspection
     snapshots = store.list_snapshots("thread-1")
@@ -38,48 +49,44 @@ Usage::
     agent = create_mambo_agent(
         "gpt-4o",
         backend=LocalBackend(),
-        middleware=[VersionControlMiddleware(store=store, backend=...)],
+        middleware=[middleware],
     )
 
-    # Time-travel with selective file rollback
-    config = {
-        "configurable": {
-            "thread_id": "t1",
-            "checkpoint_id": "cp_abc123",
-            "version_rollback": {"files": ["/workspace/file1.py"]},
-        }
-    }
-    agent.astream({"messages": [...]}, config)
+    # Receive real-time backup events via custom stream events
+    async for mode, chunk in agent.astream(
+        {"messages": [...]}, config, stream_mode=["updates", "custom"],
+    ):
+        if mode == "custom":
+            event = BackupEvent(**chunk)
+            print(f"[backup] ckpt={event.checkpoint_id} file={event.file_path}")
+
+    # Restore files manually (outside the graph)
+    middleware.restore_files("t1", "cp_abc123", files=["/workspace/file1.py"])
 """
 
 from __future__ import annotations
 
 import hashlib
-import json
-import threading
 from datetime import datetime, timezone
-from pathlib import Path
 from typing import Any
 
 from langchain.agents.middleware.types import AgentMiddleware
 from langchain_core.messages import ToolCall, ToolMessage
 from langchain_core.runnables import RunnableConfig
-from langchain_core.tools import StructuredTool
-from langgraph.config import get_config
+from langgraph.config import get_config, get_store, get_stream_writer
 from langgraph.prebuilt.tool_node import ToolCallRequest
+from langgraph.store.base import BaseStore
 from langgraph.typing import ContextT
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field
+
+from langchain.agents.middleware.types import AgentState as _AgentState
 
 from mambo_agents.backends.protocol import BackendProtocol
 from mambo_agents.backends.schemas import BackendError, VirtualPath
-from mambo_agents.backends.state_schema import FilesystemState
 
 # ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
-
-_DEFAULT_STORAGE_DIR = "./.mambo_versions"
-"""Default root directory for version storage."""
 
 _MUTATING_TOOLS = frozenset({"write", "edit", "delete"})
 """Tool names whose invocation triggers a backup."""
@@ -125,22 +132,31 @@ class VersionIndex(BaseModel):
     """Ordered list (oldest first).  Branching is implied by checkpoint hierarchy."""
 
 
-class VersionRollbackConfig(BaseModel):
-    """Rollback directive placed in ``config["configurable"]["version_rollback"]``."""
+class BackupEvent(BaseModel):
+    """Emitted as a **custom stream event** every time a file is backed up.
 
-    files: list[str] = Field(default_factory=list)
-    """Explicit list of paths to roll back.  Mutually exclusive with ``all``."""
+    Consume via ``astream(..., stream_mode=["updates", "custom"])``::
 
-    all: bool = False
-    """If ``True``, restore every file known to have changed under this checkpoint."""
+        async for mode, chunk in agent.astream(..., stream_mode=["updates", "custom"]):
+            if mode == "custom":
+                event = BackupEvent(**chunk)
+                print(event.checkpoint_id, event.file_path)
+    """
 
-    @model_validator(mode="after")
-    def _check_mutual_exclusion(self) -> "VersionRollbackConfig":
-        if self.all and self.files:
-            raise ValueError("'all' and 'files' are mutually exclusive")
-        if not self.all and not self.files:
-            raise ValueError("either 'all=True' or 'files' must be specified")
-        return self
+    thread_id: str
+    """Thread / session identifier."""
+
+    checkpoint_id: str
+    """Parent checkpoint this backup is attached to."""
+
+    file_path: str
+    """Normalised absolute virtual path that was backed up."""
+
+    sha256: str
+    """SHA-256 hex digest of the backed-up content."""
+
+    timestamp: str = Field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
+    """ISO-8601 time the backup was created."""
 
 
 class VersionControlConfig(BaseModel):
@@ -148,9 +164,11 @@ class VersionControlConfig(BaseModel):
 
     model_config = ConfigDict(arbitrary_types_allowed=True)
 
-    store_dir: str = _DEFAULT_STORAGE_DIR
-    """Storage directory path.  Ignored when a :class:`VersionStore` is passed
-    directly to :func:`create_mambo_agent`."""
+    store: BaseStore | None = None
+    """LangGraph ``BaseStore`` to persist version data.  When ``None`` (default),
+    auto-resolved from the graph execution context via ``get_store()``,
+    falling back to a lazy ``InMemoryStore``.  Ignored when a
+    :class:`VersionStore` is passed directly to :func:`create_mambo_agent`."""
 
     auto_snapshot: bool = True
     """When ``True`` (default), mutate-tool calls automatically trigger backups."""
@@ -172,23 +190,59 @@ class VersionControlConfig(BaseModel):
 
 
 # ============================================================================
-# VersionStore — pure file-I/O storage
+# VersionStore — BaseStore-backed persistent storage
 # ============================================================================
 
 
 class VersionStore:
-    """Per-thread version journal backed by the local filesystem.
+    """Per-thread version journal backed by LangGraph ``BaseStore``.
 
-    **Zero dependency on agent backends** — all I/O goes through
-    ``json.dumps`` / ``Path.write_text`` / ``Path.read_text``.
+    Uses two namespaces per thread:
 
-    Thread-safe: ``add_file_to_snapshot`` and ``list_snapshots`` use a
-    ``threading.RLock`` to protect ``index.json``.
+    * ``(thread_id, "mambo_vc_blobs")`` — content-addressed blob storage.
+      Key = SHA256 hex digest, value = ``{"content": "..."}``.
+    * ``(thread_id, "mambo_vc_index")`` — serialised ``VersionIndex``
+      under key ``"index"``.
+
+    When *store* is ``None`` at construction, the store is resolved lazily
+    via ``get_store()`` (graph context) with an ``InMemoryStore`` fallback.
     """
 
-    def __init__(self, storage_dir: str | Path = _DEFAULT_STORAGE_DIR) -> None:
-        self._root = Path(storage_dir)
-        self._lock = threading.RLock()
+    def __init__(self, store: BaseStore | None = None) -> None:
+        self._store = store
+
+    # ------------------------------------------------------------------
+    # Store resolution
+    # ------------------------------------------------------------------
+
+    def _get_store(self) -> BaseStore:
+        """Return the store instance.
+
+        Priority: (1) explicit *store* from constructor,
+        (2) ``get_store()`` from graph execution context,
+        (3) lazy-created ``InMemoryStore`` fallback.
+        """
+        if self._store is not None:
+            return self._store
+        try:
+            return get_store()
+        except RuntimeError:
+            if self._store is None:
+                from langgraph.store.memory import InMemoryStore
+                self._store = InMemoryStore()
+            return self._store
+
+    # ------------------------------------------------------------------
+    # Namespace helpers
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _blob_ns(thread_id: str) -> tuple[str, str]:
+        return (thread_id, "mambo_vc_blobs")
+
+    @staticmethod
+    def _index_ns(thread_id: str) -> tuple[str, str]:
+        return (thread_id, "mambo_vc_index")
 
     # ------------------------------------------------------------------
     # Public graph-external query API
@@ -268,55 +322,50 @@ class VersionStore:
         """Record *path* → *sha* in the snapshot for *checkpoint_id*.
 
         Creates the snapshot automatically if it does not yet exist.
-        The ``index.json`` is re-serialised on every call, so the data
+        The index is re-serialised on every call, so the data
         survives graph interruptions.
         """
-        with self._lock:
-            index = self._load_index(thread_id)
-            snapshot = self._find_snapshot(index, checkpoint_id)
-            if snapshot is None:
-                snapshot = Snapshot(checkpoint_id=checkpoint_id)
-                index.snapshots.append(snapshot)
-            snapshot.file_blobs[path] = sha
-            self._save_index(thread_id, index)
+        index = self._load_index(thread_id)
+        snapshot = self._find_snapshot(index, checkpoint_id)
+        if snapshot is None:
+            snapshot = Snapshot(checkpoint_id=checkpoint_id)
+            index.snapshots.append(snapshot)
+        snapshot.file_blobs[path] = sha
+        self._save_index(thread_id, index)
 
     def save_blob(self, thread_id: str, sha256: str, content: str) -> None:
-        """Write *content* to ``blobs/<sha256>``.  No-op if the blob exists."""
-        blob_path = self._blob_path(thread_id, sha256)
-        if blob_path.exists():
+        """Write *content* to the blob store.  No-op if the blob exists."""
+        store = self._get_store()
+        ns = self._blob_ns(thread_id)
+        existing = store.get(ns, sha256)
+        if existing is not None:
             return
-        blob_path.parent.mkdir(parents=True, exist_ok=True)
-        blob_path.write_text(content, encoding="utf-8")
+        store.put(ns, sha256, {"content": content})
 
     # ------------------------------------------------------------------
     # Internal helpers
     # ------------------------------------------------------------------
 
     def _read_blob(self, thread_id: str, sha256: str) -> str | None:
-        blob_path = self._blob_path(thread_id, sha256)
-        if not blob_path.is_file():
+        store = self._get_store()
+        ns = self._blob_ns(thread_id)
+        item = store.get(ns, sha256)
+        if item is None:
             return None
-        return blob_path.read_text(encoding="utf-8")
-
-    def _blob_path(self, thread_id: str, sha256: str) -> Path:
-        return self._root / thread_id / "blobs" / sha256
-
-    def _index_path(self, thread_id: str) -> Path:
-        return self._root / thread_id / "index.json"
+        return item.value.get("content")
 
     def _load_index(self, thread_id: str) -> VersionIndex:
-        path = self._index_path(thread_id)
-        if not path.is_file():
+        store = self._get_store()
+        ns = self._index_ns(thread_id)
+        item = store.get(ns, "index")
+        if item is None:
             return VersionIndex(thread_id=thread_id)
-        raw = path.read_text(encoding="utf-8")
-        data = json.loads(raw)
-        return VersionIndex(**data)
+        return VersionIndex(**item.value)
 
     def _save_index(self, thread_id: str, index: VersionIndex) -> None:
-        path = self._index_path(thread_id)
-        path.parent.mkdir(parents=True, exist_ok=True)
-        serialized = index.model_dump(exclude_defaults=False)
-        path.write_text(json.dumps(serialized, indent=2, ensure_ascii=False), encoding="utf-8")
+        store = self._get_store()
+        ns = self._index_ns(thread_id)
+        store.put(ns, "index", index.model_dump(exclude_defaults=False))
 
     @staticmethod
     def _find_snapshot(index: VersionIndex, checkpoint_id: str) -> Snapshot | None:
@@ -331,9 +380,7 @@ class VersionStore:
 # ============================================================================
 
 
-class VersionControlMiddleware(AgentMiddleware[FilesystemState, ContextT, Any]):
-
-    state_schema = FilesystemState
+class VersionControlMiddleware(AgentMiddleware[_AgentState, ContextT, Any]):
 
     # ------------------------------------------------------------------
     # Construction
@@ -367,32 +414,25 @@ class VersionControlMiddleware(AgentMiddleware[FilesystemState, ContextT, Any]):
         """{thread_id: {path_normalized...}} — already backed-up in this invoke."""
 
     # ------------------------------------------------------------------
-    # before_agent — record parent_cp + execute rollback
+    # before_agent — record parent checkpoint
     # ------------------------------------------------------------------
 
     def before_agent(
         self,
-        state: FilesystemState,
+        state: _AgentState,
         runtime: Any,
     ) -> dict[str, Any] | None:
         config = get_config()
         tid = self._resolve_thread_id(config)
 
-        # 1. Record parent checkpoint
         self._current_parent_cp[tid] = self._resolve_parent_checkpoint_id(config)
         self._backed_up[tid] = set()
-
-        # 2. Execute version_rollback if requested
-        rollback_raw = raw_version_rollback(config)
-        if rollback_raw:
-            decoded = VersionRollbackConfig(**rollback_raw)
-            self._execute_rollback(tid, decoded)
 
         return None
 
     async def abefore_agent(
         self,
-        state: FilesystemState,
+        state: _AgentState,
         runtime: Any,
     ) -> dict[str, Any] | None:
         return self.before_agent(state, runtime)
@@ -468,6 +508,18 @@ class VersionControlMiddleware(AgentMiddleware[FilesystemState, ContextT, Any]):
 
         self._backed_up[tid].add(normalized)
 
+        # ── emit custom stream event (like subagents.py) ──
+        writer = get_stream_writer()
+        if writer is not None:
+            writer(
+                BackupEvent(
+                    thread_id=tid,
+                    checkpoint_id=cp,
+                    file_path=normalized,
+                    sha256=sha,
+                ).model_dump()
+            )
+
     async def _abackup_file(self, path: VirtualPath) -> None:
         # Delegate to sync version; read_raw is I/O bound so the GIL
         # holds the lock for us — and we never want to back up the
@@ -479,28 +531,53 @@ class VersionControlMiddleware(AgentMiddleware[FilesystemState, ContextT, Any]):
     # Rollback execution
     # ------------------------------------------------------------------
 
-    def _execute_rollback(
+    def restore_files(
         self,
         thread_id: str,
-        rollback: VersionRollbackConfig,
-    ) -> None:
-        cp = self._current_parent_cp.get(thread_id, "")
-        if not cp:
-            return
+        checkpoint_id: str,
+        *,
+        files: list[str] | None = None,
+        all: bool = False,
+    ) -> list[str]:
+        """Restore files to their state as of *checkpoint_id*.
 
-        files = rollback.files
-        if rollback.all:
-            files = self._store.get_changed_files(thread_id, cp)
+        Can be called at any time — inside or outside the graph —
+        and is the **only** supported rollback mechanism.
 
-        for path_str in files:
-            # ── whitelist guard ──
+        Args:
+            thread_id: Thread / session identifier.
+            checkpoint_id: Which checkpoint's snapshot to restore from.
+            files: Explicit list of file paths to restore.  Mutually
+                   exclusive with ``all=True``.
+            all: If ``True``, restore every file recorded in the snapshot
+                 for *checkpoint_id*.
+
+        Returns:
+            List of file paths that were actually restored
+            (whitelist passed + content found + write succeeded).
+        """
+        if all and files:
+            raise ValueError("'all' and 'files' are mutually exclusive")
+        if not all and not files:
+            raise ValueError("either 'all=True' or 'files' must be specified")
+
+        paths: list[str]
+        if all:
+            paths = self._store.get_changed_files(thread_id, checkpoint_id)
+        else:
+            paths = files  # type: ignore[assignment]
+
+        restored: list[str] = []
+        for path_str in paths:
             vp = VirtualPath(path_str)
             if not self._is_in_whitelist(vp):
                 continue
-
-            content = self._store.get_file(thread_id, cp, path_str)
+            content = self._store.get_file(thread_id, checkpoint_id, path_str)
             if content is not None:
                 self._backend.write(vp, content, overwrite=True)
+                restored.append(path_str)
+
+        return restored
 
     # ------------------------------------------------------------------
     # Config helpers
@@ -512,30 +589,21 @@ class VersionControlMiddleware(AgentMiddleware[FilesystemState, ContextT, Any]):
 
     @staticmethod
     def _resolve_parent_checkpoint_id(config: RunnableConfig) -> str:
-        """Extract the parent checkpoint ID this invoke is continuing from.
-
-        Priority order:
-        1. ``config["configurable"]["checkpoint_id"]`` — user-specified
-           (time-travel target).
-        2. ``config["configurable"]["checkpoint_map"]`` — LangGraph-set
-           mapping of ``checkpoint_ns → checkpoint_id`` for parent graphs.
-           For the root graph (``checkpoint_ns=""``), this holds the
-           parent checkpoint.
-        3. A sentinel value (``"__initial__"``) when neither is available
-           (first ``invoke()`` call).
-        """
         configurable = config.get("configurable", {})
-        # 自定义字段，由 chat_worker 注入，不会被 LangGraph per-task config 覆盖
-        vc_parent = configurable.get("version_control_parent_cp")
+        ## 主动指向的保存点
+        vc_parent = configurable.get("version_control_ckpt_id")
         if vc_parent:
             return vc_parent
 
-        cp_id = configurable.get("checkpoint_id")
+        ## 时间旅行的ckpt_id -> 预期为父节点的父节点或爷节点
+        cp_id = config.get("metadata",{}).get("checkpoint_id")
+        if cp_id:
+            return cp_id
+
+        ## 父节点 -> 预期为 INPUT
         cp_map = configurable.get("checkpoint_map", {})
         checkpoint_ns = configurable.get("checkpoint_ns", "")
         parent_cp = cp_map.get(checkpoint_ns) or cp_map.get("")
-        if cp_id:
-            return cp_id
 
         if parent_cp:
             return parent_cp
@@ -559,9 +627,3 @@ def _extract_file_path(tool_call: ToolCall) -> VirtualPath | None:
             except (ValueError, TypeError, BackendError):
                 return None
     return None
-
-
-def raw_version_rollback(config: RunnableConfig) -> dict[str, Any] | None:
-    """Read the raw ``version_rollback`` dict from config, or ``None``."""
-    configurable = config.get("configurable", {})
-    return configurable.get("version_rollback")

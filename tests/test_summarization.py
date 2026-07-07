@@ -15,9 +15,9 @@ from mambo_agents import (
     SummarizationConfig,
     create_mambo_agent,
 )
-from mambo_agents.backends.state import StateBackend
+from mambo_agents.backends.store import StoreBackend
 from mambo_agents.backends.schemas import BackendError, ErrorCode, VirtualPath
-from tests.test_state_backend import _simulate_graph
+from tests.test_store_backend import _simulate_graph
 from mambo_agents.middleware.summarization import (
     DEFAULT_MAMBO_CHAINED_SUMMARY_PROMPT,
     DEFAULT_MAMBO_SUMMARY_PROMPT,

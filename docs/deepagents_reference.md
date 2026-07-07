@@ -33,8 +33,8 @@ The differences below do not imply that deepagents' design is "wrong." They refl
 |-----------|------------|--------------|-----------|
 | **Local Filesystem + Execution** | `LocalShellBackend` (`FilesystemBackend` + `SandboxBackendProtocol`) <br>• Gains `execute()` by inheriting `SandboxBackendProtocol` <br>• Runs `subprocess.run(shell=True)` directly on host, no isolation | `LocalBackend` (self-contained `execute()`) <br>• `execute()` is a method on the backend itself, no additional protocol layer required <br>• Same direct host execution, but co-located in a single class | Mambo avoids the `LocalShellBackend` / `FilesystemBackend` class split; local file operations and local shell execution are naturally unified |
 | **Remote Filesystem + Execution** | `LangSmithSandbox` (extends `BaseSandbox`) <br>• Targets LangSmith's cloud container service, achieving true process isolation <br>• All file operations delegate to `execute()`, communicating via SDK | `SshBackend` (based on paramiko) <br>• `execute()` runs remotely through an SSH channel <br>• File operations directly manipulate the remote filesystem (`ls` / `read` / `write` do not go through `execute`; they have native implementations) | deepagents' remote solution is tied to the LangSmith cloud service, suitable for pre-configured containerized environments; Mambo's SSH approach is more general — any machine running sshd works |
-| **Execute Architecture Philosophy** | `execute()` requires `SandboxBackendProtocol` <br>• Protocol stack: `BackendProtocol` (files only) → `SandboxBackendProtocol` (+ execute) → `BaseSandbox` (convenience wrappers) <br>• Only backends declared as "Sandbox" can execute commands | `execute()` is an inherent, optional capability of the backend <br>• Protocol stack: only `BackendProtocol`. Any backend that wants `execute` simply implements it on its own class <br>• `LocalBackend` and `SshBackend` each carry `execute`; `StateBackend` does not — enabled on demand, no forced classification | Mambo pursues a more general, more flexible way to enable `execute`: no separate Sandbox protocol layer, `execute` is just a regular method, each backend decides for itself whether to provide it |
-| **Cross-session Persistence** | ✅ `StoreBackend` (backed by LangGraph `BaseStore`) | ❌ Not implemented | Current phase focuses on single-session scenarios; to be added as needed |
+| **Execute Architecture Philosophy** | `execute()` requires `SandboxBackendProtocol` <br>• Protocol stack: `BackendProtocol` (files only) → `SandboxBackendProtocol` (+ execute) → `BaseSandbox` (convenience wrappers) <br>• Only backends declared as "Sandbox" can execute commands | `execute()` is an inherent, optional capability of the backend <br>• Protocol stack: only `BackendProtocol`. Any backend that wants `execute` simply implements it on its own class <br>• `LocalBackend` and `SshBackend` each carry `execute`; `StoreBackend` does not — enabled on demand, no forced classification | Mambo pursues a more general, more flexible way to enable `execute`: no separate Sandbox protocol layer, `execute` is just a regular method, each backend decides for itself whether to provide it |
+| **Cross-session Persistence** | ✅ `StoreBackend` (backed by LangGraph `BaseStore`) | ✅ `StoreBackend` (backed by LangGraph `BaseStore`, `thread_id` locked at construction) | Mambo's StoreBackend is self-implemented, inherits from `BackendProtocol`, locks `thread_id` at construction for session isolation |
 
 ### 2.2 Middleware Stack Differences
 
@@ -70,11 +70,11 @@ A side-by-side mapping of equivalent capabilities:
 | Feature | deepagents | Mambo Agents |
 |---------|------------|--------------|
 | Protocol Definition | `BackendProtocol` + `SandboxBackendProtocol` (independent execute layer) | `BackendProtocol` (execute is also a backend method; no independent protocol layer) |
-| In-memory Storage | `StateBackend` | `StateBackend` (reconstructed) |
+| In-memory Storage | `StateBackend` | `StoreBackend` (self-implemented, backed by LangGraph `BaseStore`, `thread_id` locked at construction) |
 | Local Execute | `LocalShellBackend` (`FilesystemBackend` + `SandboxBackendProtocol`, two layers of parent classes) | `LocalBackend` (single class with built-in `execute()`, `tree`, `delete`) |
 | Remote Execute | `LangSmithSandbox` (cloud container service, all file operations delegated to `execute()`) | `SshBackend` (native SSH, `execute()` via SSH channel, file operations have native implementations) |
 | Path Routing | `CompositeBackend` (flexible multi-backend routing; `execute()` may bypass the routing layer) | `HybridWorkspaceBackend` (1 real + N virtual route: `/.mambo/<name>/` → memory, rest → real backend; system prompt explicitly communicates workspace semantics to the AI) |
-| Cross-session Storage | `StoreBackend` | ❌ |
+| Cross-session Storage | `StoreBackend` | `StoreBackend` (self-implemented) |
 
 ### 3.2 Middleware
 

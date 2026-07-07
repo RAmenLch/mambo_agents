@@ -8,9 +8,11 @@ import pytest
 from langchain_core.messages import ToolMessage
 from langgraph.prebuilt.tool_node import ToolCallRequest
 
-from mambo_agents.backends.state import StateBackend
+from langgraph.store.memory import InMemoryStore
+
+from mambo_agents.backends.store import StoreBackend
 from mambo_agents.backends.schemas import BackendError, ErrorCode, VirtualPath
-from tests.test_state_backend import _simulate_graph
+from tests.test_store_backend import _simulate_graph
 from mambo_agents.middleware.backend_tools import (
     BackendToolsMiddleware,
     _build_preview,
@@ -39,9 +41,9 @@ def _make_request(tool_name: str, tool_call_id: str = "call_test_001") -> ToolCa
 
 
 def _make_middleware(threshold: int | None = _THRESHOLD) -> BackendToolsMiddleware:
-    """Create a middleware with a StateBackend and the given threshold."""
+    """Create a middleware with a StoreBackend and the given threshold."""
     return BackendToolsMiddleware(
-        backend=StateBackend(),
+        backend=StoreBackend(store=InMemoryStore()),
         tool_token_limit_before_evict=threshold,
     )
 
@@ -270,7 +272,7 @@ class TestEviction:
     def test_same_tool_call_id_no_conflict(self):
         """Two evictions with the same tool_call_id: the second overwrites.
 
-        Since StateBackend.write fails on existing files, we clear the
+        Since StoreBackend.write fails on existing files, we clear the
         file from the snapshot before the second eviction to simulate
         the overwrite.
         """
@@ -286,9 +288,12 @@ class TestEviction:
         sane_id = _sanitize_tool_call_id("call_dup")
         file_path = f"{_EVICTION_PREFIX}/{sane_id}"
 
-        # Remove the file from the snapshot so overwrite succeeds
-        with mw.backend._lock:
-            mw.backend._snapshots["test"].pop(file_path, None)
+        # Remove the file from the store so overwrite succeeds.
+        # BaseStore has no public delete API; use batch with value=None
+        # (InMemoryStore's batch pops the key when value is None).
+        from langgraph.store.base import PutOp
+        store = mw.backend._get_store()
+        store.batch([PutOp(namespace=mw.backend._get_namespace("test"), key=file_path, value=None)])
 
         # Second eviction
         huge2 = "SECOND_CONTENT" * 40  # ~130 tokens
@@ -307,7 +312,7 @@ class TestEviction:
         mw = _make_middleware(threshold=10)
 
         # Use a backend that will fail on any write
-        class FailWriteBackend(StateBackend):
+        class FailWriteBackend(StoreBackend):
             def write(self, file_path: str, content: str):
                 from mambo_agents.backends.protocol import WriteResult
                 return WriteResult(error=BackendError(code=ErrorCode.IO_ERROR, path=str(file_path), message="Disk full"), path=str(file_path))
