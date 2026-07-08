@@ -116,18 +116,33 @@ class StoreBackend(BackendProtocol):
         """Return the store instance.
 
         Priority: (1) explicit ``store`` injected at construction,
-        (2) ``get_store()`` from graph execution context,
-        (3) lazy-created ``InMemoryStore`` as fallback.
+        (2) ``get_store()`` from graph execution context.
+
+        A ``RuntimeError`` from ``get_store()`` (not inside a runnable context)
+        is handled by falling back to ``InMemoryStore``.
+
+        If ``get_store()`` returns ``None`` (which means the graph was
+        compiled without a ``store=``), a clear error is raised — this is a
+        configuration mistake that must be fixed by the caller.
         """
         if self._store is not None:
             return self._store
         try:
-            return get_store()
+            store_result = get_store()
         except RuntimeError:
-            if self._store is None:
-                from langgraph.store.memory import InMemoryStore
-                self._store = InMemoryStore()
+            # Not inside a graph runnable context — use InMemoryStore as fallback
+            from langgraph.store.memory import InMemoryStore
+            self._store = InMemoryStore()
             return self._store
+
+        if store_result is None:
+            raise RuntimeError(
+                "StoreBackend requires a LangGraph store, but get_store() returned None. "
+                "The graph was likely compiled without a store= parameter. "
+                "Fix: pass store= when constructing StoreBackend, "
+                "or pass store= to graph.compile()."
+            )
+        return store_result
 
     @staticmethod
     def _get_namespace(thread_id: str) -> tuple[str, str]:
@@ -222,6 +237,69 @@ class StoreBackend(BackendProtocol):
         namespace = self._get_namespace(thread_id)
         with self._lock:
             store.put(namespace, file_path, {"content": content, "encoding": encoding})
+
+    # ------------------------------------------------------------------
+    # Async file read / write helpers
+    # ------------------------------------------------------------------
+
+    async def _aget_all_files(self, thread_id: str) -> dict[str, dict[str, str]]:
+        """Async: return ``{path: {content, encoding}}`` for all files in *thread_id*."""
+        store = self._get_store()
+        namespace = self._get_namespace(thread_id)
+
+        with self._lock:
+            if thread_id not in self._initialized_threads:
+                self._inject_initial_files(store, namespace)
+                self._initialized_threads.add(thread_id)
+
+            items = await self._asearch_store_paginated(store, namespace)
+            files: dict[str, dict[str, str]] = {}
+            for item in items:
+                files[item.key] = {"content": item.value.get("content", ""),
+                                   "encoding": item.value.get("encoding", "utf-8")}
+        return files
+
+    async def _aget_file(self, thread_id: str, file_path: str) -> dict[str, str] | None:
+        """Async: return ``{content, encoding}`` for a single file, or ``None``."""
+        store = self._get_store()
+        namespace = self._get_namespace(thread_id)
+
+        with self._lock:
+            if thread_id not in self._initialized_threads:
+                self._inject_initial_files(store, namespace)
+                self._initialized_threads.add(thread_id)
+
+            item = await store.aget(namespace, file_path)
+        if item is None:
+            return None
+        return {"content": item.value.get("content", ""),
+                "encoding": item.value.get("encoding", "utf-8")}
+
+    async def _aput_file(self, thread_id: str, file_path: str, content: str, encoding: str) -> None:
+        """Async: store a single file."""
+        store = self._get_store()
+        namespace = self._get_namespace(thread_id)
+        with self._lock:
+            await store.aput(namespace, file_path, {"content": content, "encoding": encoding})
+
+    async def _asearch_store_paginated(
+        self,
+        store: BaseStore,
+        namespace: tuple[str, ...],
+    ) -> list[SearchItem]:
+        """Async: search store with automatic pagination to retrieve all items."""
+        all_items: list[SearchItem] = []
+        offset = 0
+        page_size = 100
+        while True:
+            page = await store.asearch(namespace, limit=page_size, offset=offset)
+            if not page:
+                break
+            all_items.extend(page)
+            if len(page) < page_size:
+                break
+            offset += page_size
+        return all_items
 
     # ------------------------------------------------------------------
     # tools — extra (core tools are built by middleware)

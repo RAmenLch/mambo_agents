@@ -25,9 +25,13 @@ from __future__ import annotations
 
 import asyncio
 import re
+from typing import TYPE_CHECKING
 
 from langchain_core.tools import StructuredTool
 from pydantic import BaseModel, Field, create_model
+
+if TYPE_CHECKING:
+    from langgraph.store.base import BaseStore
 
 from mambo_agents.backends.protocol import (
     BackendProtocol,
@@ -142,6 +146,11 @@ class HybridWorkspaceBackend(BackendProtocol):
             before delegating — the two can differ freely.
         custom_description:
             Extra text appended to the system-prompt description.
+        store:
+            LangGraph ``BaseStore`` instance forwarded to the default
+            ``StoreBackend`` at ``/.mambo/``.  When omitted, the store is
+            obtained from ``get_store()`` at runtime; a clear error is
+            raised if no store is available.
     """
 
     # Default per-tool timeout values specific to this backend (overridable via __init__).
@@ -158,6 +167,7 @@ class HybridWorkspaceBackend(BackendProtocol):
         max_read_chars: int = 100_000,
         summarizer: "ReadSummarizer | None" = None,
         tool_timeouts: ToolTimeouts | None = None,
+        store: "BaseStore | None" = None,
     ) -> None:
         # Merge backend-specific defaults with user overrides (user wins).
         _user = tool_timeouts.model_dump() if tool_timeouts else {}
@@ -177,6 +187,7 @@ class HybridWorkspaceBackend(BackendProtocol):
             self._default_mambo = vw.pop(".")
         else:
             self._default_mambo = StoreBackend(
+                store=store,
                 max_read_chars=max_read_chars,
                 max_grep_matches=1000,
                 summarizer=summarizer, tool_timeouts=_merged,

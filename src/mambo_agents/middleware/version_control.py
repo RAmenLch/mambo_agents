@@ -68,7 +68,7 @@ from __future__ import annotations
 
 import hashlib
 from datetime import datetime, timezone
-from typing import Any
+from typing import Any, Literal
 
 from langchain.agents.middleware.types import AgentMiddleware
 from langchain_core.messages import ToolCall, ToolMessage
@@ -142,6 +142,16 @@ class BackupEvent(BaseModel):
                 event = BackupEvent(**chunk)
                 print(event.checkpoint_id, event.file_path)
     """
+
+    model_config = ConfigDict(frozen=True)
+
+    type: Literal["backup"] = "backup"
+    """Discriminator for custom event routing."""
+
+    source: Literal["version_control"] = Field(
+        default="version_control",
+        description="Identifies the middleware source of this event.",
+    )
 
     thread_id: str
     """Thread / session identifier."""
@@ -245,7 +255,7 @@ class VersionStore:
         return (thread_id, "mambo_vc_index")
 
     # ------------------------------------------------------------------
-    # Public graph-external query API
+    # Public graph-external query API (sync)
     # ------------------------------------------------------------------
 
     def list_snapshots(self, thread_id: str) -> list[Snapshot]:
@@ -309,7 +319,61 @@ class VersionStore:
         return list(latest.file_blobs.keys())
 
     # ------------------------------------------------------------------
-    # Public graph-internal write API
+    # Public graph-external query API (async)
+    # ------------------------------------------------------------------
+
+    async def alist_snapshots(self, thread_id: str) -> list[Snapshot]:
+        """Async: return every snapshot for *thread_id* in chronological order."""
+        index = await self._aload_index(thread_id)
+        return list(index.snapshots)
+
+    async def aget_file(
+        self, thread_id: str, checkpoint_id: str, path: str,
+    ) -> str | None:
+        """Async: read the content of *path* as of *checkpoint_id*, or ``None``."""
+        index = await self._aload_index(thread_id)
+        snapshot = self._find_snapshot(index, checkpoint_id)
+        if snapshot is None:
+            return None
+        sha = snapshot.file_blobs.get(path)
+        if sha is None:
+            return None
+        return await self._aread_blob(thread_id, sha)
+
+    async def aget_changed_files(
+        self, thread_id: str, checkpoint_id: str,
+    ) -> list[str]:
+        """Async: paths recorded for *checkpoint_id*."""
+        index = await self._aload_index(thread_id)
+        snapshot = self._find_snapshot(index, checkpoint_id)
+        if snapshot is None:
+            return []
+        return list(snapshot.file_blobs.keys())
+
+    # ── High-level session queries (async) ──
+
+    async def aget_all_changed_files(self, thread_id: str) -> frozenset[str]:
+        """Async: deduplicated set of all files changed across every checkpoint."""
+        index = await self._aload_index(thread_id)
+        all_files: set[str] = set()
+        for snap in index.snapshots:
+            all_files.update(snap.file_blobs.keys())
+        return frozenset(all_files)
+
+    async def aget_latest_snapshot(self, thread_id: str) -> Snapshot | None:
+        """Async: most recent snapshot for *thread_id*, or ``None``."""
+        index = await self._aload_index(thread_id)
+        return index.snapshots[-1] if index.snapshots else None
+
+    async def aget_latest_changed_files(self, thread_id: str) -> list[str]:
+        """Async: files changed in the most recent checkpoint for *thread_id*."""
+        latest = await self.aget_latest_snapshot(thread_id)
+        if latest is None:
+            return []
+        return list(latest.file_blobs.keys())
+
+    # ------------------------------------------------------------------
+    # Public graph-internal write API (sync)
     # ------------------------------------------------------------------
 
     def add_file_to_snapshot(
@@ -343,7 +407,36 @@ class VersionStore:
         store.put(ns, sha256, {"content": content})
 
     # ------------------------------------------------------------------
-    # Internal helpers
+    # Public graph-internal write API (async)
+    # ------------------------------------------------------------------
+
+    async def aadd_file_to_snapshot(
+        self,
+        thread_id: str,
+        checkpoint_id: str,
+        path: str,
+        sha: str,
+    ) -> None:
+        """Async: record *path* → *sha* in the snapshot for *checkpoint_id*."""
+        index = await self._aload_index(thread_id)
+        snapshot = self._find_snapshot(index, checkpoint_id)
+        if snapshot is None:
+            snapshot = Snapshot(checkpoint_id=checkpoint_id)
+            index.snapshots.append(snapshot)
+        snapshot.file_blobs[path] = sha
+        await self._asave_index(thread_id, index)
+
+    async def asave_blob(self, thread_id: str, sha256: str, content: str) -> None:
+        """Async: write *content* to the blob store.  No-op if the blob exists."""
+        store = self._get_store()
+        ns = self._blob_ns(thread_id)
+        existing = await store.aget(ns, sha256)
+        if existing is not None:
+            return
+        await store.aput(ns, sha256, {"content": content})
+
+    # ------------------------------------------------------------------
+    # Internal helpers (sync)
     # ------------------------------------------------------------------
 
     def _read_blob(self, thread_id: str, sha256: str) -> str | None:
@@ -366,6 +459,31 @@ class VersionStore:
         store = self._get_store()
         ns = self._index_ns(thread_id)
         store.put(ns, "index", index.model_dump(exclude_defaults=False))
+
+    # ------------------------------------------------------------------
+    # Internal helpers (async)
+    # ------------------------------------------------------------------
+
+    async def _aread_blob(self, thread_id: str, sha256: str) -> str | None:
+        store = self._get_store()
+        ns = self._blob_ns(thread_id)
+        item = await store.aget(ns, sha256)
+        if item is None:
+            return None
+        return item.value.get("content")
+
+    async def _aload_index(self, thread_id: str) -> VersionIndex:
+        store = self._get_store()
+        ns = self._index_ns(thread_id)
+        item = await store.aget(ns, "index")
+        if item is None:
+            return VersionIndex(thread_id=thread_id)
+        return VersionIndex(**item.value)
+
+    async def _asave_index(self, thread_id: str, index: VersionIndex) -> None:
+        store = self._get_store()
+        ns = self._index_ns(thread_id)
+        await store.aput(ns, "index", index.model_dump(exclude_defaults=False))
 
     @staticmethod
     def _find_snapshot(index: VersionIndex, checkpoint_id: str) -> Snapshot | None:
@@ -521,11 +639,48 @@ class VersionControlMiddleware(AgentMiddleware[_AgentState, ContextT, Any]):
             )
 
     async def _abackup_file(self, path: VirtualPath) -> None:
-        # Delegate to sync version; read_raw is I/O bound so the GIL
-        # holds the lock for us — and we never want to back up the
-        # same file twice anyway.
-        import asyncio
-        await asyncio.to_thread(self._backup_file, path)
+        """Async backup — read file + persist blob + index via async store pipeline.
+
+        Uses ``read_raw`` (sync, but I/O-bound and GIL-safe) and then
+        calls async ``asave_blob`` / ``aadd_file_to_snapshot`` to avoid
+        ``asyncio.to_thread`` threading issues with async-only stores
+        (e.g. aiosqlite-based stores).
+        """
+        # ── whitelist guard ──
+        if not self._is_in_whitelist(path):
+            return
+
+        normalized = path.normalized
+        tid = self._resolve_thread_id(get_config())
+
+        if normalized in self._backed_up.get(tid, set()):
+            return  # already backed up in this invoke
+
+        result = self._backend.read_raw(path, limit=None)
+        if result.error or result.content is None:
+            return
+
+        sha = hashlib.sha256(result.content.encode("utf-8")).hexdigest()
+
+        # blob + index — async durable persistence
+        await self._store.asave_blob(tid, sha, result.content)
+        cp = self._current_parent_cp.get(tid, "")
+        if cp:
+            await self._store.aadd_file_to_snapshot(tid, cp, normalized, sha)
+
+        self._backed_up[tid].add(normalized)
+
+        # ── emit custom stream event ──
+        writer = get_stream_writer()
+        if writer is not None:
+            writer(
+                BackupEvent(
+                    thread_id=tid,
+                    checkpoint_id=cp,
+                    file_path=normalized,
+                    sha256=sha,
+                ).model_dump()
+            )
 
     # ------------------------------------------------------------------
     # Rollback execution
