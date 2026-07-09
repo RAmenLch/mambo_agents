@@ -975,6 +975,12 @@ class LocalBackend(BackendProtocol):
         """
         results: list[UploadFileResult] = []
         for path, raw_content in files:
+            if not self._check_edit_allowed(path):
+                results.append(UploadFileResult(
+                    path=path,
+                    error=BackendError(code=ErrorCode.EDIT_NOT_ALLOWED, path=path, message="路径不允许写入"),
+                ))
+                continue
             try:
                 resolved = self._resolve(path)
                 resolved.parent.mkdir(parents=True, exist_ok=True)
