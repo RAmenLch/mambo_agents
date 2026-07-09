@@ -367,6 +367,16 @@ class StoreBackend(BackendProtocol):
         limit: int | None = 2000,
         include_line_numbers: bool = False,
     ) -> ReadResult:
+        if offset < 0:
+            return ReadResult(error=BackendError(
+                code=ErrorCode.INVALID, path=file_path,
+                message=f"offset must be non-negative, got {offset}",
+            ))
+        if limit is not None and limit < 1:
+            return ReadResult(error=BackendError(
+                code=ErrorCode.INVALID, path=file_path,
+                message=f"limit must be >= 1 (or None for unlimited), got {limit}",
+            ))
         if file_path.value.endswith("/"):
             return ReadResult(error=BackendError(code=ErrorCode.IS_DIR, path=file_path, message="目标是目录"))
         tid = self._resolve_thread_id()

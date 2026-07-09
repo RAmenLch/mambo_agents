@@ -584,10 +584,13 @@ class HybridWorkspaceBackend(BackendProtocol):
     ) -> GrepResult:
         # Fan-out to all virtual backends when searching /.mambo root
         if str(path).rstrip("/") == self._prefix.normalized:
-            return self._apply_grep_limit(
-                self._grep_all_virtual(pattern, glob, regex),
-                offset, limit,
-            )
+            fanout_result = self._grep_all_virtual(pattern, glob, regex)
+            if fanout_result.error and not fanout_result.matches:
+                return fanout_result
+            result = self._apply_grep_limit(fanout_result.matches or [], offset, limit)
+            if fanout_result.error:
+                return result.model_copy(update={"error": fanout_result.error})
+            return result
 
         try:
             target, p = self._route(path)
@@ -700,8 +703,13 @@ class HybridWorkspaceBackend(BackendProtocol):
     ) -> GrepResult:
         # Fan-out to all virtual backends when searching /.mambo root
         if str(path).rstrip("/") == self._prefix.normalized:
-            raw_matches = await self._agrep_all_virtual(pattern, glob, regex)
-            return self._apply_grep_limit(raw_matches, offset, limit)
+            fanout_result = await self._agrep_all_virtual(pattern, glob, regex)
+            if fanout_result.error and not fanout_result.matches:
+                return fanout_result
+            result = self._apply_grep_limit(fanout_result.matches or [], offset, limit)
+            if fanout_result.error:
+                return result.model_copy(update={"error": fanout_result.error})
+            return result
 
         try:
             target, p = self._route(path)
@@ -730,14 +738,24 @@ class HybridWorkspaceBackend(BackendProtocol):
     # Fan-out helpers — search across all virtual backends at /.mambo root
     # ------------------------------------------------------------------
 
-    def _grep_all_virtual(self, pattern: str, glob: str | None, regex: bool = False) -> list[GrepMatch]:
-        """Collect raw grep matches from all virtual backends (no offset/limit)."""
-        all_matches: list = []
+    def _grep_all_virtual(self, pattern: str, glob: str | None, regex: bool = False) -> GrepResult:
+        """Collect raw grep matches from all virtual backends (no offset/limit).
+
+        Aggregates errors from individual backends so the caller can
+        distinguish "all backends failed" from "nothing matched".
+        """
+        all_matches: list[GrepMatch] = []
+        errors: list[str] = []
 
         # Default mambo
         mambo_prefix = self._prefix
         p = self._rewrite(mambo_prefix, mambo_prefix.normalized, self._default_mambo.workspace_root)
         result = self._default_mambo.grep(pattern, p, glob, regex, offset=0, limit=None)
+        if result.error:
+            translated = result.error.apply_reverse_translation(
+                self._reverse_path, self._default_mambo.workspace_root, mambo_prefix,
+            )
+            errors.append(f"[{mambo_prefix.normalized}]: {translated}")
         if result.matches:
             twsr = self._default_mambo.workspace_root
             all_matches.extend(
@@ -749,6 +767,11 @@ class HybridWorkspaceBackend(BackendProtocol):
         for name, be in self._virtual.items():
             vprefix = self._prefix.join(name)
             result = be.grep(pattern, VirtualPath(be.workspace_root), glob, regex, offset=0, limit=None)
+            if result.error:
+                translated = result.error.apply_reverse_translation(
+                    self._reverse_path, be.workspace_root, vprefix,
+                )
+                errors.append(f"[{vprefix.value}]: {translated}")
             if result.matches:
                 twsr = be.workspace_root
                 all_matches.extend(
@@ -756,7 +779,13 @@ class HybridWorkspaceBackend(BackendProtocol):
                     for m in result.matches
                 )
 
-        return all_matches
+        return GrepResult(
+            error=BackendError(
+                code=ErrorCode.INVALID,
+                message=" | ".join(errors),
+            ) if errors else None,
+            matches=all_matches if all_matches else None,
+        )
 
     def _glob_all_virtual(self, pattern: str) -> GlobResult:
         all_matches: list[FileInfo] = []
@@ -767,7 +796,10 @@ class HybridWorkspaceBackend(BackendProtocol):
         p = self._rewrite(mambo_prefix, mambo_prefix.normalized, self._default_mambo.workspace_root)
         result = self._default_mambo.glob(pattern, p)
         if result.error:
-            errors.append(f"[{mambo_prefix.normalized}]: {result.error}")
+            translated = result.error.apply_reverse_translation(
+                self._reverse_path, self._default_mambo.workspace_root, mambo_prefix,
+            )
+            errors.append(f"[{mambo_prefix.normalized}]: {translated}")
         if result.matches:
             twsr = self._default_mambo.workspace_root
             all_matches.extend(
@@ -780,7 +812,10 @@ class HybridWorkspaceBackend(BackendProtocol):
             vprefix = self._prefix.join(name)
             result = be.glob(pattern, VirtualPath(be.workspace_root))
             if result.error:
-                errors.append(f"[{vprefix.value}]: {result.error}")
+                translated = result.error.apply_reverse_translation(
+                    self._reverse_path, be.workspace_root, vprefix,
+                )
+                errors.append(f"[{vprefix.value}]: {translated}")
             if result.matches:
                 twsr = be.workspace_root
                 all_matches.extend(
@@ -789,18 +824,31 @@ class HybridWorkspaceBackend(BackendProtocol):
                 )
 
         return GlobResult(
-            error=" | ".join(errors) if errors else None,
+            error=BackendError(
+                code=ErrorCode.INVALID,
+                message=" | ".join(errors),
+            ) if errors else None,
             matches=all_matches if all_matches else None,
         )
 
-    async def _agrep_all_virtual(self, pattern: str, glob: str | None, regex: bool = False) -> list[GrepMatch]:
-        """Collect raw grep matches from all virtual backends (async, no offset/limit)."""
-        all_matches: list = []
+    async def _agrep_all_virtual(self, pattern: str, glob: str | None, regex: bool = False) -> GrepResult:
+        """Collect raw grep matches from all virtual backends (async, no offset/limit).
+
+        Aggregates errors from individual backends so the caller can
+        distinguish "all backends failed" from "nothing matched".
+        """
+        all_matches: list[GrepMatch] = []
+        errors: list[str] = []
 
         # Default mambo
         mambo_prefix = self._prefix
         p = self._rewrite(mambo_prefix, mambo_prefix.normalized, self._default_mambo.workspace_root)
         result = await self._default_mambo.agrep(pattern, p, glob, regex, offset=0, limit=None)
+        if result.error:
+            translated = result.error.apply_reverse_translation(
+                self._reverse_path, self._default_mambo.workspace_root, mambo_prefix,
+            )
+            errors.append(f"[{mambo_prefix.normalized}]: {translated}")
         if result.matches:
             twsr = self._default_mambo.workspace_root
             all_matches.extend(
@@ -812,6 +860,11 @@ class HybridWorkspaceBackend(BackendProtocol):
         for name, be in self._virtual.items():
             vprefix = self._prefix.join(name)
             result = await be.agrep(pattern, VirtualPath(be.workspace_root), glob, regex, offset=0, limit=None)
+            if result.error:
+                translated = result.error.apply_reverse_translation(
+                    self._reverse_path, be.workspace_root, vprefix,
+                )
+                errors.append(f"[{vprefix.value}]: {translated}")
             if result.matches:
                 twsr = be.workspace_root
                 all_matches.extend(
@@ -819,7 +872,13 @@ class HybridWorkspaceBackend(BackendProtocol):
                     for m in result.matches
                 )
 
-        return all_matches
+        return GrepResult(
+            error=BackendError(
+                code=ErrorCode.INVALID,
+                message=" | ".join(errors),
+            ) if errors else None,
+            matches=all_matches if all_matches else None,
+        )
 
     async def _aglob_all_virtual(self, pattern: str) -> GlobResult:
         all_matches: list[FileInfo] = []
@@ -830,7 +889,10 @@ class HybridWorkspaceBackend(BackendProtocol):
         p = self._rewrite(mambo_prefix, mambo_prefix.normalized, self._default_mambo.workspace_root)
         result = await self._default_mambo.aglob(pattern, p)
         if result.error:
-            errors.append(f"[{mambo_prefix.normalized}]: {result.error}")
+            translated = result.error.apply_reverse_translation(
+                self._reverse_path, self._default_mambo.workspace_root, mambo_prefix,
+            )
+            errors.append(f"[{mambo_prefix.normalized}]: {translated}")
         if result.matches:
             twsr = self._default_mambo.workspace_root
             all_matches.extend(
@@ -843,7 +905,10 @@ class HybridWorkspaceBackend(BackendProtocol):
             vprefix = self._prefix.join(name)
             result = await be.aglob(pattern, VirtualPath(be.workspace_root))
             if result.error:
-                errors.append(f"[{vprefix.value}]: {result.error}")
+                translated = result.error.apply_reverse_translation(
+                    self._reverse_path, be.workspace_root, vprefix,
+                )
+                errors.append(f"[{vprefix.value}]: {translated}")
             if result.matches:
                 twsr = be.workspace_root
                 all_matches.extend(
@@ -852,7 +917,10 @@ class HybridWorkspaceBackend(BackendProtocol):
                 )
 
         return GlobResult(
-            error=" | ".join(errors) if errors else None,
+            error=BackendError(
+                code=ErrorCode.INVALID,
+                message=" | ".join(errors),
+            ) if errors else None,
             matches=all_matches if all_matches else None,
         )
 

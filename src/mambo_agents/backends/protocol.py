@@ -17,9 +17,11 @@ from langchain_core.tools import StructuredTool
 from pydantic import BaseModel, ConfigDict, Field
 
 from mambo_agents.backends.schemas import (
+    BackendError,
     DeleteResult,
     DownloadFileResult,
     EditResult,
+    ErrorCode,
     FileInfo,
     FileType,
     GlobResult,
@@ -447,10 +449,11 @@ class BackendProtocol(abc.ABC):
             A ``GrepResult`` with ``truncated`` and ``total_matches`` set.
         """
         total = len(matches)
-        effective_limit = limit if limit is not None else self._max_grep_matches
-        effective_limit = min(effective_limit, self._max_grep_matches)
         if offset < 0:
             offset = 0
+        effective_limit = limit if limit is not None else self._max_grep_matches
+        effective_limit = max(effective_limit, 1)
+        effective_limit = min(effective_limit, self._max_grep_matches)
         sliced = matches[offset : offset + effective_limit]
         truncated = (offset + effective_limit) < total
         return GrepResult(
@@ -493,9 +496,17 @@ class BackendProtocol(abc.ABC):
         :meth:`read_raw` directly with ``limit=None``.
         """
         if offset < 0:
-            return ReadResult(error=f"offset must be non-negative, got {offset}")
+            return ReadResult(error=BackendError(
+                code=ErrorCode.INVALID,
+                path=file_path,
+                message=f"offset must be non-negative, got {offset}",
+            ))
         if limit < 1:
-            return ReadResult(error=f"limit must be positive, got {limit}")
+            return ReadResult(error=BackendError(
+                code=ErrorCode.INVALID,
+                path=file_path,
+                message=f"limit must be positive, got {limit}",
+            ))
         result = self.read_raw(file_path, offset, limit, include_line_numbers)
         return self._apply_read_limit(result, file_path)
 
