@@ -1306,11 +1306,14 @@ class SshBackend(BackendProtocol):
 
         Args:
             path: Root directory to display (default workspace root).
-            depth: Maximum recursion depth (default 3).
+            depth: Maximum recursion depth (default 3, must be >= 1).
 
         Returns:
             Formatted tree string.
         """
+        if depth < 1:
+            return f"Invalid depth value: {depth}. Depth must be a positive integer (>= 1)."
+
         try:
             remote = self._resolve(path)
         except BackendError as e:

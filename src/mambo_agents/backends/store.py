@@ -503,6 +503,8 @@ class StoreBackend(BackendProtocol):
     # ------------------------------------------------------------------
 
     def tree(self, path: VirtualPath, depth: int = 3) -> str:
+        if depth < 1:
+            return f"Invalid depth value: {depth}. Depth must be a positive integer (>= 1)."
         if isinstance(path, str):
             path = VirtualPath(path)
         entries = _collect_tree_entries(self, path, depth)

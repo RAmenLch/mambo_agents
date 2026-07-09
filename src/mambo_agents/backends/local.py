@@ -785,11 +785,14 @@ class LocalBackend(BackendProtocol):
 
         Args:
             path: Root directory to display (virtual path, default to workspace root).
-            depth: Maximum recursion depth (default 3).
+            depth: Maximum recursion depth (default 3, must be >= 1).
 
         Returns:
             Formatted tree string.
         """
+        if depth < 1:
+            return f"Invalid depth value: {depth}. Depth must be a positive integer (>= 1)."
+
         try:
             resolved = self._resolve(path)
         except BackendError as e:
