@@ -854,7 +854,7 @@ class SshBackend(BackendProtocol):
         pattern: str,
         path: VirtualPath = VirtualPath("/workspace"),
         glob: str | None = None,
-        regex: bool = False,
+        regex: bool = True,
         offset: int = 0,
         limit: int | None = None,
     ) -> GrepResult:
@@ -878,7 +878,7 @@ class SshBackend(BackendProtocol):
         pattern: str,
         path: VirtualPath = VirtualPath("/workspace"),
         glob: str | None = None,
-        regex: bool = False,
+        regex: bool = True,
     ) -> GrepResult:
         """Collect raw grep matches without offset/limit truncation."""
         if not pattern:
@@ -911,7 +911,7 @@ class SshBackend(BackendProtocol):
         pattern_escaped: str,
         remote: str,
         glob: str | None,
-        regex: bool = False,
+        regex: bool = True,
     ) -> list[GrepMatch] | None:
         """Run ripgrep on the remote server.  Returns ``None`` if unavailable."""
         cmd = "rg --json"
@@ -959,7 +959,7 @@ class SshBackend(BackendProtocol):
         pattern: str,
         remote: str,
         glob: str | None,
-        regex: bool = False,
+        regex: bool = True,
     ) -> GrepResult:
         """Portable grep via remote ``python3`` using :func:`os.walk` +
         :func:`fnmatch.fnmatch`.
@@ -1056,7 +1056,7 @@ class SshBackend(BackendProtocol):
         pattern_escaped: str,
         remote_escaped: str,
         glob: str | None,
-        regex: bool = False,
+        regex: bool = True,
     ) -> GrepResult:
         """Fallback grep using ``grep -rnIsH`` on the remote.
 
@@ -1689,7 +1689,7 @@ class SshBackend(BackendProtocol):
         pattern: str,
         path: VirtualPath = VirtualPath("/workspace"),
         glob: str | None = None,
-        regex: bool = False,
+        regex: bool = True,
         offset: int = 0,
         limit: int | None = None,
     ) -> GrepResult:

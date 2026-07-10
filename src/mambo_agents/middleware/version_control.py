@@ -620,11 +620,12 @@ class VersionControlMiddleware(AgentMiddleware[_AgentState, ContextT, Any]):
 
         # blob + index — both immediately durable
         self._store.save_blob(tid, sha, result.content)
-        cp = self._current_parent_cp.get(tid, "")
+        cp = self._current_parent_cp.get(tid, "") or self._resolve_parent_checkpoint_id(get_config())
         if cp:
+            self._current_parent_cp.setdefault(tid, cp)
             self._store.add_file_to_snapshot(tid, cp, normalized, sha)
 
-        self._backed_up[tid].add(normalized)
+        self._backed_up.setdefault(tid, set()).add(normalized)
 
         # ── emit custom stream event (like subagents.py) ──
         writer = get_stream_writer()
@@ -664,11 +665,12 @@ class VersionControlMiddleware(AgentMiddleware[_AgentState, ContextT, Any]):
 
         # blob + index — async durable persistence
         await self._store.asave_blob(tid, sha, result.content)
-        cp = self._current_parent_cp.get(tid, "")
+        cp = self._current_parent_cp.get(tid, "") or self._resolve_parent_checkpoint_id(get_config())
         if cp:
+            self._current_parent_cp.setdefault(tid, cp)
             await self._store.aadd_file_to_snapshot(tid, cp, normalized, sha)
 
-        self._backed_up[tid].add(normalized)
+        self._backed_up.setdefault(tid, set()).add(normalized)
 
         # ── emit custom stream event ──
         writer = get_stream_writer()

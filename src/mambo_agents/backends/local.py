@@ -10,6 +10,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import json
+import locale
 import os
 import re
 import shutil
@@ -557,7 +558,7 @@ class LocalBackend(BackendProtocol):
         pattern: str,
         path: VirtualPath = VirtualPath("/workspace"),
         glob: str | None = None,
-        regex: bool = False,
+        regex: bool = True,
         offset: int = 0,
         limit: int | None = None,
     ) -> GrepResult:
@@ -696,7 +697,7 @@ class LocalBackend(BackendProtocol):
         pattern: str,
         base_dir: Path,
         include_glob: str | None,
-        regex: bool = False,
+        regex: bool = True,
     ) -> dict[str, list[tuple[int, str]]] | None:
         """Search with ripgrep (JSON output).
 
@@ -719,10 +720,14 @@ class LocalBackend(BackendProtocol):
                 cmd,
                 capture_output=True,
                 text=True,
+                encoding="utf-8",
                 timeout=30,
                 check=False,
             )
         except (subprocess.TimeoutExpired, FileNotFoundError, PermissionError):
+            return None
+
+        if proc.stdout is None:
             return None
 
         results: dict[str, list[tuple[int, str]]] = {}
@@ -895,16 +900,37 @@ class LocalBackend(BackendProtocol):
             cmd_list = ["sh", "-c", command]
 
         try:
-            result = subprocess.run(
-                cmd_list,
-                check=False,
-                capture_output=True,
-                stdin=subprocess.DEVNULL,
-                text=True,
-                timeout=effective_timeout,
-                env=self._env if self._env else None,
-                cwd=str(self._cwd),
-            )
+            # Auto-detect system encoding: locale encoding on Windows (cp936 for
+            # Chinese GBK, cp932 for Japanese, etc.), UTF-8 on Linux/macOS.
+            system_encoding = locale.getpreferredencoding(False)
+
+            # Try locale encoding first; fall back to UTF-8 with replacement on
+            # failure (e.g. if locale encoding mismatches the actual output).
+            try:
+                result = subprocess.run(
+                    cmd_list,
+                    check=False,
+                    capture_output=True,
+                    stdin=subprocess.DEVNULL,
+                    text=True,
+                    encoding=system_encoding,
+                    timeout=effective_timeout,
+                    env=self._env if self._env else None,
+                    cwd=str(self._cwd),
+                )
+            except UnicodeDecodeError:
+                result = subprocess.run(
+                    cmd_list,
+                    check=False,
+                    capture_output=True,
+                    stdin=subprocess.DEVNULL,
+                    text=True,
+                    encoding="utf-8",
+                    errors="replace",
+                    timeout=effective_timeout,
+                    env=self._env if self._env else None,
+                    cwd=str(self._cwd),
+                )
 
             output_parts: list[str] = []
             if result.stdout:
@@ -913,15 +939,24 @@ class LocalBackend(BackendProtocol):
                 for line in result.stderr.strip().split("\n"):
                     output_parts.append(f"[stderr] {line}")
 
-            output = "\n".join(output_parts) if output_parts else "<no output>"
+            if output_parts:
+                output = "\n".join(output_parts)
+            else:
+                if result.returncode != 0:
+                    output = (
+                        f"<no output> — command failed with exit code {result.returncode}\n"
+                        f"Ran: {' '.join(cmd_list)}"
+                    )
+                else:
+                    output = "<no output>"
 
             # Truncation
             if len(output) > self._max_output_bytes:
                 output = output[: self._max_output_bytes]
                 output += f"\n\n... Output truncated at {self._max_output_bytes} bytes."
 
-            # Add exit code if non-zero
-            if result.returncode != 0:
+            # Add exit code if non-zero (only when there was output to display)
+            if result.returncode != 0 and output_parts:
                 output = f"{output.rstrip()}\n\nExit code: {result.returncode}"
 
             return output

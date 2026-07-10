@@ -94,7 +94,7 @@ class _FakeBackend(BackendProtocol):
         self._files[s] = c.replace(old_str, new_str)
         return EditResult(path=s, occurrences=c.count(old_str))
 
-    def grep(self, pattern: str, path: VirtualPath, glob=None, regex=False, offset=0, limit=None):
+    def grep(self, pattern: str, path: VirtualPath, glob=None, regex=True, offset=0, limit=None):
         from mambo_agents.backends.protocol import GrepResult, GrepMatch
 
         prefix = path.value.rstrip("/") + "/" if path.value != "/" else "/"
@@ -185,7 +185,7 @@ class _FakeThreadAwareBackend(BackendProtocol):
         self._files[s] = c.replace(old_str, new_str)
         return EditResult(path=s, occurrences=c.count(old_str))
 
-    def grep(self, pattern: str, path: VirtualPath, glob=None, regex=False, offset=0, limit=None):
+    def grep(self, pattern: str, path: VirtualPath, glob=None, regex=True, offset=0, limit=None):
         from mambo_agents.backends.protocol import GrepResult, GrepMatch
 
         prefix = path.value.rstrip("/") + "/" if path.value != "/" else "/"

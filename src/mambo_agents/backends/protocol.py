@@ -566,16 +566,16 @@ class BackendProtocol(abc.ABC):
         pattern: str,
         path: VirtualPath,
         glob: str | None = None,
-        regex: bool = False,
+        regex: bool = True,
         offset: int = 0,
         limit: int | None = None,
     ) -> GrepResult:
         """Search for a text pattern in files under *path*.
 
-        When *regex* is ``False`` (default), performs exact substring
-        matching (literal mode, fast and safe).  Set *regex* to ``True``
-        to interpret *pattern* as a Python regex with alternation,
-        character classes, quantifiers, etc.
+        By default interprets *pattern* as a Python regex with
+        alternation, character classes, quantifiers, etc.  Set *regex*
+        to ``False`` for exact substring matching (literal mode, fast
+        and safe).
 
         Args:
             offset: 0-based index into matches to start from (for pagination).
@@ -636,7 +636,7 @@ class BackendProtocol(abc.ABC):
         pattern: str,
         path: VirtualPath,
         glob: str | None = None,
-        regex: bool = False,
+        regex: bool = True,
         offset: int = 0,
         limit: int | None = None,
     ) -> GrepResult:

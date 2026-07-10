@@ -486,7 +486,7 @@ class StoreBackend(BackendProtocol):
         pattern: str,
         path: VirtualPath,
         glob: str | None = None,
-        regex: bool = False,
+        regex: bool = True,
         offset: int = 0,
         limit: int | None = None,
     ) -> GrepResult:
@@ -584,7 +584,7 @@ def _grep_in_memory(
     pattern: str,
     path: str = "/",
     file_glob: str | None = None,
-    regex: bool = False,
+    regex: bool = True,
     max_matches: int = 1000,
 ) -> list[GrepMatch]:
     import re as _re

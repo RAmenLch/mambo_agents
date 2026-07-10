@@ -331,6 +331,7 @@ def create_mambo_agent(
         )
 
     # ---- Version Control (opt-in) ------------------------------------------
+    _vc_middleware: VersionControlMiddleware | None = None
     if version_control is not None and version_control is not False:
         vc_store: VersionStore
         if isinstance(version_control, VersionStore):
@@ -341,12 +342,11 @@ def create_mambo_agent(
             # bool True or anything else → auto-resolve store
             vc_store = VersionStore()
 
-        mw.append(
-            VersionControlMiddleware(
-                store=vc_store,
-                backend=backend,
-            )
+        _vc_middleware = VersionControlMiddleware(
+            store=vc_store,
+            backend=backend,
         )
+        mw.append(_vc_middleware)
 
     # ---- Summarization (opt-in) --------------------------------------------
     if summarization is not None:
@@ -452,6 +452,8 @@ def create_mambo_agent(
         gp_middleware: list[AgentMiddleware] = [BackendToolsMiddleware(backend)]
         if _security_review_middleware is not None:
             gp_middleware.append(_security_review_middleware)
+        if _vc_middleware is not None:
+            gp_middleware.append(_vc_middleware)
 
         gp_spec = SubAgent(
             name=GENERAL_PURPOSE_NAME,

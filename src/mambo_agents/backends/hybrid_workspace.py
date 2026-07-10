@@ -578,7 +578,7 @@ class HybridWorkspaceBackend(BackendProtocol):
         pattern: str,
         path: VirtualPath,
         glob: str | None = None,
-        regex: bool = False,
+        regex: bool = True,
         offset: int = 0,
         limit: int | None = None,
     ) -> GrepResult:
@@ -697,7 +697,7 @@ class HybridWorkspaceBackend(BackendProtocol):
         pattern: str,
         path: VirtualPath,
         glob: str | None = None,
-        regex: bool = False,
+        regex: bool = True,
         offset: int = 0,
         limit: int | None = None,
     ) -> GrepResult:
@@ -738,7 +738,7 @@ class HybridWorkspaceBackend(BackendProtocol):
     # Fan-out helpers — search across all virtual backends at /.mambo root
     # ------------------------------------------------------------------
 
-    def _grep_all_virtual(self, pattern: str, glob: str | None, regex: bool = False) -> GrepResult:
+    def _grep_all_virtual(self, pattern: str, glob: str | None, regex: bool = True) -> GrepResult:
         """Collect raw grep matches from all virtual backends (no offset/limit).
 
         Aggregates errors from individual backends so the caller can
@@ -831,7 +831,7 @@ class HybridWorkspaceBackend(BackendProtocol):
             matches=all_matches if all_matches else None,
         )
 
-    async def _agrep_all_virtual(self, pattern: str, glob: str | None, regex: bool = False) -> GrepResult:
+    async def _agrep_all_virtual(self, pattern: str, glob: str | None, regex: bool = True) -> GrepResult:
         """Collect raw grep matches from all virtual backends (async, no offset/limit).
 
         Aggregates errors from individual backends so the caller can

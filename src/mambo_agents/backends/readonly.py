@@ -92,7 +92,7 @@ class ReadOnlyBackend(BackendProtocol):
         pattern: str,
         path: VirtualPath,
         glob: str | None = None,
-        regex: bool = False,
+        regex: bool = True,
         offset: int = 0,
         limit: int | None = None,
     ) -> GrepResult:
