@@ -413,22 +413,23 @@ class StoreBackend(BackendProtocol):
     ) -> WriteResult:
         if file_path.value.endswith("/"):
             return WriteResult(error=BackendError(code=ErrorCode.IS_DIR, path=file_path, message="目标是目录"))
-        tid = self._resolve_thread_id()
-        files = self._get_all_files(tid)
+        with self._lock:
+            tid = self._resolve_thread_id()
+            files = self._get_all_files(tid)
 
-        prefix = file_path.normalized + "/"
-        for fpath in files:
-            if fpath.startswith(prefix):
+            prefix = file_path.normalized + "/"
+            for fpath in files:
+                if fpath.startswith(prefix):
+                    return WriteResult(
+                        error=BackendError(code=ErrorCode.IS_DIR, path=file_path, message="目标是目录，无法写入"),
+                    )
+            if file_path.normalized in files and not overwrite:
                 return WriteResult(
-                    error=BackendError(code=ErrorCode.IS_DIR, path=file_path, message="目标是目录，无法写入"),
+                    error=BackendError(code=ErrorCode.ALREADY_EXISTS, path=file_path, message="文件已存在，请用 edit() 修改或用 overwrite=True 覆盖"),
                 )
-        if file_path.normalized in files and not overwrite:
-            return WriteResult(
-                error=BackendError(code=ErrorCode.ALREADY_EXISTS, path=file_path, message="文件已存在，请用 edit() 修改或用 overwrite=True 覆盖"),
-            )
-        encoding = "base64" if _get_file_type(file_path.normalized) != "text" else "utf-8"
-        self._put_file(tid, file_path.normalized, content, encoding)
-        return WriteResult(path=file_path.normalized)
+            encoding = "base64" if _get_file_type(file_path.normalized) != "text" else "utf-8"
+            self._put_file(tid, file_path.normalized, content, encoding)
+            return WriteResult(path=file_path.normalized)
 
     def edit(
         self,
@@ -442,44 +443,45 @@ class StoreBackend(BackendProtocol):
             return EditResult(error=BackendError(code=ErrorCode.IS_DIR, path=file_path, message="目标是目录"))
         if not old_str:
             return EditResult(error=BackendError(code=ErrorCode.INVALID, message="old_str 不能为空"))
-        tid = self._resolve_thread_id()
-        files = self._get_all_files(tid)
+        with self._lock:
+            tid = self._resolve_thread_id()
+            files = self._get_all_files(tid)
 
-        prefix = file_path.normalized + "/"
-        for fpath in files:
-            if fpath.startswith(prefix):
+            prefix = file_path.normalized + "/"
+            for fpath in files:
+                if fpath.startswith(prefix):
+                    return EditResult(
+                        error=BackendError(code=ErrorCode.IS_DIR, path=file_path, message="目标是目录，无法编辑"),
+                    )
+            existing_fd = files.get(file_path.normalized)
+            if existing_fd is None:
                 return EditResult(
-                    error=BackendError(code=ErrorCode.IS_DIR, path=file_path, message="目标是目录，无法编辑"),
+                    error=BackendError(code=ErrorCode.NOT_FOUND, path=file_path, message="文件不存在，请用 write() 创建新文件"),
                 )
-        existing_fd = files.get(file_path.normalized)
-        if existing_fd is None:
-            return EditResult(
-                error=BackendError(code=ErrorCode.NOT_FOUND, path=file_path, message="文件不存在，请用 write() 创建新文件"),
-            )
-        if existing_fd["encoding"] == "base64":
-            return EditResult(
-                error=BackendError(code=ErrorCode.INVALID, path=file_path, message="文件是二进制格式，请用 write() 覆盖"),
-            )
+            if existing_fd["encoding"] == "base64":
+                return EditResult(
+                    error=BackendError(code=ErrorCode.INVALID, path=file_path, message="文件是二进制格式，请用 write() 覆盖"),
+                )
 
-        existing_content = existing_fd["content"]
-        occurrences = existing_content.count(old_str)
+            existing_content = existing_fd["content"]
+            occurrences = existing_content.count(old_str)
 
-        if occurrences == 0:
-            mismatch = detect_trailing_newline_mismatch(old_str, existing_content)
-            if mismatch is not None:
-                return mismatch
-            return EditResult(
-                error=BackendError(code=ErrorCode.OLD_STR_NOT_FOUND, path=file_path, message="未找到要替换的文本"),
-            )
+            if occurrences == 0:
+                mismatch = detect_trailing_newline_mismatch(old_str, existing_content)
+                if mismatch is not None:
+                    return mismatch
+                return EditResult(
+                    error=BackendError(code=ErrorCode.OLD_STR_NOT_FOUND, path=file_path, message="未找到要替换的文本"),
+                )
 
-        if occurrences > 1 and not replace_all:
-            return EditResult(
-                error=BackendError(code=ErrorCode.MULTI_OCCURRENCES, path=file_path, message=f"匹配到 {occurrences} 处，请用 replace_all=True 或提供更精确的上下文"),
-            )
+            if occurrences > 1 and not replace_all:
+                return EditResult(
+                    error=BackendError(code=ErrorCode.MULTI_OCCURRENCES, path=file_path, message=f"匹配到 {occurrences} 处，请用 replace_all=True 或提供更精确的上下文"),
+                )
 
-        new_content = existing_content.replace(old_str, new_str)
-        self._put_file(tid, file_path.normalized, new_content, existing_fd["encoding"])
-        return EditResult(path=file_path.normalized, occurrences=occurrences)
+            new_content = existing_content.replace(old_str, new_str)
+            self._put_file(tid, file_path.normalized, new_content, existing_fd["encoding"])
+            return EditResult(path=file_path.normalized, occurrences=occurrences)
 
     def grep(
         self,

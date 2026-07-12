@@ -16,6 +16,8 @@ import re
 import shutil
 import subprocess
 import sys
+import threading
+from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Literal
@@ -157,6 +159,11 @@ class LocalBackend(BackendProtocol):
         self._edit_whitelist = edit_whitelist or frozenset()
         self._edit_blacklist = edit_blacklist or frozenset()
         self._ignore_dirs = ignore_dirs or frozenset()
+
+        # Per-file locks for serializing concurrent edit/write/delete.
+        # Keyed by resolved real path to prevent read-modify-write races.
+        self._file_locks: dict[str, threading.Lock] = {}
+        self._file_locks_guard = threading.Lock()
 
         # Build environment
         if inherit_env:
@@ -316,6 +323,27 @@ class LocalBackend(BackendProtocol):
             blacklist=self._edit_blacklist or None,
         )
 
+    @contextmanager
+    def _file_lock(self, resolved: Path):
+        """Acquire a per-file lock to serialize concurrent mutations.
+
+        Keyed by the resolved real filesystem path so that edit, write,
+        and delete on the same file are strictly serialized, preventing
+        read-modify-write race conditions (e.g. concurrent edit+write
+        silently overwriting each other's changes).
+        """
+        key = str(resolved)
+        with self._file_locks_guard:
+            lock = self._file_locks.get(key)
+            if lock is None:
+                lock = threading.Lock()
+                self._file_locks[key] = lock
+        lock.acquire()
+        try:
+            yield
+        finally:
+            lock.release()
+
     def ls(self, path: VirtualPath) -> LsResult:
         try:
             resolved = self._resolve(path)
@@ -454,29 +482,30 @@ class LocalBackend(BackendProtocol):
             resolved = self._resolve(file_path)
         except BackendError as e:
             return WriteResult(error=e)
-        try:
-            if resolved.is_dir():
+        with self._file_lock(resolved):
+            try:
+                if resolved.is_dir():
+                    return WriteResult(
+                        error=BackendError(code=ErrorCode.IS_DIR, path=file_path, message="目标是目录，无法写入"),
+                    )
+            except OSError as e:
+                return WriteResult(error=BackendError(code=ErrorCode.OS_ERROR, path=file_path, message=str(e)))
+            if resolved.exists() and not overwrite:
                 return WriteResult(
-                    error=BackendError(code=ErrorCode.IS_DIR, path=file_path, message="目标是目录，无法写入"),
+                    error=BackendError(code=ErrorCode.ALREADY_EXISTS, path=file_path, message="文件已存在，请用 edit() 修改或用 overwrite=True 覆盖"),
                 )
-        except OSError as e:
-            return WriteResult(error=BackendError(code=ErrorCode.OS_ERROR, path=file_path, message=str(e)))
-        if resolved.exists() and not overwrite:
-            return WriteResult(
-                error=BackendError(code=ErrorCode.ALREADY_EXISTS, path=file_path, message="文件已存在，请用 edit() 修改或用 overwrite=True 覆盖"),
-            )
 
-        try:
-            resolved.parent.mkdir(parents=True, exist_ok=True)
-            _O_NOFOLLOW = getattr(os, "O_NOFOLLOW", 0)
-            flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC | _O_NOFOLLOW
-            fd = os.open(resolved, flags, 0o644)
-            with os.fdopen(fd, "w", encoding="utf-8", newline="") as f:
-                f.write(content)
-        except OSError as e:
-            return WriteResult(error=BackendError(code=ErrorCode.IO_ERROR, path=file_path, message=str(e)))
+            try:
+                resolved.parent.mkdir(parents=True, exist_ok=True)
+                _O_NOFOLLOW = getattr(os, "O_NOFOLLOW", 0)
+                flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC | _O_NOFOLLOW
+                fd = os.open(resolved, flags, 0o644)
+                with os.fdopen(fd, "w", encoding="utf-8", newline="") as f:
+                    f.write(content)
+            except OSError as e:
+                return WriteResult(error=BackendError(code=ErrorCode.IO_ERROR, path=file_path, message=str(e)))
 
-        return WriteResult(path=file_path)
+            return WriteResult(path=file_path)
 
     def edit(
         self,
@@ -496,58 +525,59 @@ class LocalBackend(BackendProtocol):
             resolved = self._resolve(file_path)
         except BackendError as e:
             return EditResult(error=e)
-        try:
-            if not resolved.exists():
-                return EditResult(
-                    error=BackendError(code=ErrorCode.NOT_FOUND, path=file_path, message="文件不存在，请用 write() 创建新文件"),
+        with self._file_lock(resolved):
+            try:
+                if not resolved.exists():
+                    return EditResult(
+                        error=BackendError(code=ErrorCode.NOT_FOUND, path=file_path, message="文件不存在，请用 write() 创建新文件"),
+                    )
+                if resolved.is_dir():
+                    return EditResult(
+                        error=BackendError(code=ErrorCode.IS_DIR, path=file_path, message="目标是目录，无法编辑"),
+                    )
+            except OSError as e:
+                return EditResult(error=BackendError(code=ErrorCode.OS_ERROR, path=file_path, message=str(e)))
+
+            _O_NOFOLLOW = getattr(os, "O_NOFOLLOW", 0)
+            try:
+                fd = os.open(resolved, os.O_RDONLY | _O_NOFOLLOW)
+                with os.fdopen(fd, "r", encoding="utf-8") as f:
+                    content = f.read()
+            except OSError as e:
+                return EditResult(error=BackendError(code=ErrorCode.IO_ERROR, path=file_path, message=str(e)))
+
+            # Normalize line endings in old_str / new_str so that LLM-provided
+            # CRLF strings match files that were read as LF by Python text mode.
+            old_str = old_str.replace("\r\n", "\n").replace("\r", "\n")
+            new_str = new_str.replace("\r\n", "\n").replace("\r", "\n")
+
+            occurrences = content.count(old_str)
+
+            if occurrences == 0:
+                # Detect trailing-newline mismatch
+                mismatch = detect_trailing_newline_mismatch(
+                    old_str, content,
                 )
-            if resolved.is_dir():
+                if mismatch is not None:
+                    return mismatch
                 return EditResult(
-                    error=BackendError(code=ErrorCode.IS_DIR, path=file_path, message="目标是目录，无法编辑"),
+                    error=BackendError(code=ErrorCode.OLD_STR_NOT_FOUND, path=file_path, message="未找到要替换的文本，请先读文件确认内容"),
                 )
-        except OSError as e:
-            return EditResult(error=BackendError(code=ErrorCode.OS_ERROR, path=file_path, message=str(e)))
 
-        _O_NOFOLLOW = getattr(os, "O_NOFOLLOW", 0)
-        try:
-            fd = os.open(resolved, os.O_RDONLY | _O_NOFOLLOW)
-            with os.fdopen(fd, "r", encoding="utf-8") as f:
-                content = f.read()
-        except OSError as e:
-            return EditResult(error=BackendError(code=ErrorCode.IO_ERROR, path=file_path, message=str(e)))
+            if occurrences > 1 and not replace_all:
+                return EditResult(
+                    error=BackendError(code=ErrorCode.MULTI_OCCURRENCES, path=file_path, message=f"匹配到 {occurrences} 处，请用 replace_all=True 替换全部或提供更精确的上下文"),
+                )
 
-        # Normalize line endings in old_str / new_str so that LLM-provided
-        # CRLF strings match files that were read as LF by Python text mode.
-        old_str = old_str.replace("\r\n", "\n").replace("\r", "\n")
-        new_str = new_str.replace("\r\n", "\n").replace("\r", "\n")
+            try:
+                flags = os.O_WRONLY | os.O_TRUNC | _O_NOFOLLOW
+                fd = os.open(resolved, flags)
+                with os.fdopen(fd, "w", encoding="utf-8", newline="") as f:
+                    f.write(content.replace(old_str, new_str))
+            except OSError as e:
+                return EditResult(error=BackendError(code=ErrorCode.IO_ERROR, path=file_path, message=str(e)))
 
-        occurrences = content.count(old_str)
-
-        if occurrences == 0:
-            # Detect trailing-newline mismatch
-            mismatch = detect_trailing_newline_mismatch(
-                old_str, content,
-            )
-            if mismatch is not None:
-                return mismatch
-            return EditResult(
-                error=BackendError(code=ErrorCode.OLD_STR_NOT_FOUND, path=file_path, message="未找到要替换的文本，请先读文件确认内容"),
-            )
-
-        if occurrences > 1 and not replace_all:
-            return EditResult(
-                error=BackendError(code=ErrorCode.MULTI_OCCURRENCES, path=file_path, message=f"匹配到 {occurrences} 处，请用 replace_all=True 替换全部或提供更精确的上下文"),
-            )
-
-        try:
-            flags = os.O_WRONLY | os.O_TRUNC | _O_NOFOLLOW
-            fd = os.open(resolved, flags)
-            with os.fdopen(fd, "w", encoding="utf-8", newline="") as f:
-                f.write(content.replace(old_str, new_str))
-        except OSError as e:
-            return EditResult(error=BackendError(code=ErrorCode.IO_ERROR, path=file_path, message=str(e)))
-
-        return EditResult(path=file_path, occurrences=occurrences)
+            return EditResult(path=file_path, occurrences=occurrences)
 
     # ------------------------------------------------------------------
     # grep — ripgrep-first with Python fallback and file-size guard
@@ -852,21 +882,22 @@ class LocalBackend(BackendProtocol):
         if resolved == self._cwd:
             return DeleteResult(error=BackendError(code=ErrorCode.INVALID, path=path, message="不能删除根工作目录"), path=path)
 
-        if not resolved.exists():
-            return DeleteResult(error=BackendError(code=ErrorCode.NOT_FOUND, path=path, message="路径不存在"), path=path)
+        with self._file_lock(resolved):
+            if not resolved.exists():
+                return DeleteResult(error=BackendError(code=ErrorCode.NOT_FOUND, path=path, message="路径不存在"), path=path)
 
-        if resolved.is_dir():
-            return DeleteResult(
-                error=BackendError(code=ErrorCode.IS_DIR, path=path, message="目标是目录，delete 工具只能删除单个文件"),
-                path=path,
-            )
+            if resolved.is_dir():
+                return DeleteResult(
+                    error=BackendError(code=ErrorCode.IS_DIR, path=path, message="目标是目录，delete 工具只能删除单个文件"),
+                    path=path,
+                )
 
-        try:
-            resolved.unlink()
-        except OSError as e:
-            return DeleteResult(error=BackendError(code=ErrorCode.IO_ERROR, path=path, message=str(e)), path=path)
+            try:
+                resolved.unlink()
+            except OSError as e:
+                return DeleteResult(error=BackendError(code=ErrorCode.IO_ERROR, path=path, message=str(e)), path=path)
 
-        return DeleteResult(path=path)
+            return DeleteResult(path=path)
 
     def execute(
         self,
@@ -1018,8 +1049,9 @@ class LocalBackend(BackendProtocol):
                 continue
             try:
                 resolved = self._resolve(path)
-                resolved.parent.mkdir(parents=True, exist_ok=True)
-                resolved.write_bytes(raw_content)
+                with self._file_lock(resolved):
+                    resolved.parent.mkdir(parents=True, exist_ok=True)
+                    resolved.write_bytes(raw_content)
                 results.append(UploadFileResult(path=path))
             except OSError as e:
                 results.append(UploadFileResult(path=path, error=BackendError(code=ErrorCode.IO_ERROR, path=path, message=str(e))))
@@ -1049,21 +1081,22 @@ class LocalBackend(BackendProtocol):
         for path in paths:
             try:
                 resolved = self._resolve(path)
-                if not resolved.exists():
-                    results.append(
-                    DownloadFileResult(
-                        path=path, content=None, error=BackendError(code=ErrorCode.NOT_FOUND, path=path, message="文件不存在")
-                    )
-                    )
-                    continue
-                if resolved.is_dir():
-                    results.append(
+                with self._file_lock(resolved):
+                    if not resolved.exists():
+                        results.append(
                         DownloadFileResult(
-                            path=path, content=None, error=BackendError(code=ErrorCode.IS_DIR, path=path, message="目标是目录")
+                            path=path, content=None, error=BackendError(code=ErrorCode.NOT_FOUND, path=path, message="文件不存在")
                         )
-                    )
-                    continue
-                raw = resolved.read_bytes()
+                        )
+                        continue
+                    if resolved.is_dir():
+                        results.append(
+                            DownloadFileResult(
+                                path=path, content=None, error=BackendError(code=ErrorCode.IS_DIR, path=path, message="目标是目录")
+                            )
+                        )
+                        continue
+                    raw = resolved.read_bytes()
                 results.append(
                     DownloadFileResult(path=path, content=raw)
                 )
