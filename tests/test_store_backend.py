@@ -351,8 +351,81 @@ class TestStoreBackendGlob:
         backend = _make_backend()
         with _simulate_graph(backend):
             backend.write(VirtualPath("/workspace/f.txt"), "hello")
-            r = backend.glob("/workspace/f.txt", path=VirtualPath("/workspace"))
+            r = backend.glob("f.txt", path=VirtualPath("/workspace"))
         assert r.matches[0].size == 5
+
+
+class TestStoreBackendGlobPatterns:
+    """回归测试：glob pattern 应匹配 *相对于 path* 的路径，且支持
+    ``?`` / ``[...]`` / 路径分隔符 / 精确文件名等 pathlib 兼容语义。"""
+
+    @staticmethod
+    def _setup():
+        backend = _make_backend()
+        ctx = _simulate_graph(backend)
+        ctx.__enter__()
+        backend.write(VirtualPath("/workspace/abc.txt"), "1")
+        backend.write(VirtualPath("/workspace/test.txt"), "2")
+        backend.write(VirtualPath("/workspace/中文无后缀"), "3")
+        backend.write(VirtualPath("/workspace/sub/hello.md"), "4")
+        backend.write(VirtualPath("/workspace/aXc.txt"), "5")
+        return backend, ctx
+
+    def _names(self, r):
+        return sorted(fi.path.normalized.rpartition("/")[2] for fi in (r.matches or []))
+
+    def test_exact_filename(self):
+        backend, ctx = self._setup()
+        try:
+            assert self._names(backend.glob("abc.txt", path=VirtualPath("/workspace"))) == ["abc.txt"]
+            assert self._names(backend.glob("test.txt", path=VirtualPath("/workspace"))) == ["test.txt"]
+            assert self._names(backend.glob("中文无后缀", path=VirtualPath("/workspace"))) == ["中文无后缀"]
+        finally:
+            ctx.__exit__(None, None, None)
+
+    def test_question_mark_single_char(self):
+        backend, ctx = self._setup()
+        try:
+            assert self._names(backend.glob("???.*", path=VirtualPath("/workspace"))) == ["aXc.txt", "abc.txt"]
+        finally:
+            ctx.__exit__(None, None, None)
+
+    def test_question_mark_in_middle(self):
+        backend, ctx = self._setup()
+        try:
+            assert sorted(self._names(backend.glob("a?c.txt", path=VirtualPath("/workspace")))) == ["aXc.txt", "abc.txt"]
+        finally:
+            ctx.__exit__(None, None, None)
+
+    def test_character_class(self):
+        backend, ctx = self._setup()
+        try:
+            assert sorted(self._names(backend.glob("[aA]*", path=VirtualPath("/workspace")))) == ["aXc.txt", "abc.txt"]
+        finally:
+            ctx.__exit__(None, None, None)
+
+    def test_subdir_pattern(self):
+        backend, ctx = self._setup()
+        try:
+            assert self._names(backend.glob("sub/*", path=VirtualPath("/workspace"))) == ["hello.md"]
+        finally:
+            ctx.__exit__(None, None, None)
+
+    def test_subdir_exact_path(self):
+        backend, ctx = self._setup()
+        try:
+            assert self._names(backend.glob("sub/hello.md", path=VirtualPath("/workspace"))) == ["hello.md"]
+        finally:
+            ctx.__exit__(None, None, None)
+
+    def test_star_does_not_cross_separator(self):
+        """``*`` 不应跨 ``/`` 匹配（pathlib 语义）。"""
+        backend, ctx = self._setup()
+        try:
+            assert sorted(self._names(backend.glob("*.txt", path=VirtualPath("/workspace")))) == ["aXc.txt", "abc.txt", "test.txt"]
+            assert self._names(backend.glob("*.md", path=VirtualPath("/workspace"))) == []
+        finally:
+            ctx.__exit__(None, None, None)
 
 
 # ============================================================================

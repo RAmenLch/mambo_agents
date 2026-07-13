@@ -9,7 +9,6 @@ from __future__ import annotations
 
 import asyncio
 import base64
-import fnmatch
 import threading
 from typing import Any
 
@@ -581,6 +580,71 @@ class StoreBackend(BackendProtocol):
 # ============================================================================
 
 
+def _translate_glob(pattern: str):
+    """Compile a glob pattern into a regex (pathlib-compatible, posix-style).
+
+    Semantics (matched against the path *relative* to the search root):
+
+    * ``**`` matches any number of path segments (including zero)
+    * ``*`` matches any chars except the path separator ``/``
+    * ``?`` matches a single char except ``/``
+    * ``[...]`` / ``[!...]`` character classes
+    """
+    import re
+
+    i, n = 0, len(pattern)
+    res: list[str] = []
+    while i < n:
+        c = pattern[i]
+        i += 1
+        if c == "*":
+            if i < n and pattern[i] == "*":
+                i += 1
+                if i < n and pattern[i] == "/":
+                    i += 1
+                    res.append("(?:.*/)?")
+                else:
+                    res.append(".*")
+            else:
+                res.append("[^/]*")
+        elif c == "?":
+            res.append("[^/]")
+        elif c == "[":
+            j = i
+            if j < n and pattern[j] in ("!", "^"):
+                j += 1
+            if j < n and pattern[j] == "]":
+                j += 1
+            while j < n and pattern[j] != "]":
+                j += 1
+            if j >= n:
+                res.append(re.escape("["))
+            else:
+                stuff = pattern[i:j].replace("\\", "\\\\")
+                i = j + 1
+                if stuff.startswith("!"):
+                    stuff = "^" + stuff[1:]
+                res.append("[" + stuff + "]")
+        else:
+            res.append(re.escape(c))
+    return re.compile("(?s:" + "".join(res) + r")\Z")
+
+
+def _relative_to(fpath: str, path_prefix: str) -> str:
+    """Return ``fpath`` relative to ``path_prefix``.
+
+    When ``path_prefix`` is empty or ``/`` the original path is returned
+    unchanged (the search root already matches the full virtual path).
+    """
+    if not path_prefix or path_prefix == "/":
+        return fpath
+    if fpath == path_prefix:
+        return ""
+    if fpath.startswith(path_prefix + "/"):
+        return fpath[len(path_prefix) + 1:]
+    return fpath
+
+
 def _grep_in_memory(
     files: dict[str, dict[str, str]],
     pattern: str,
@@ -596,6 +660,7 @@ def _grep_in_memory(
         compiled = _re.compile(_re.escape(pattern))
 
     path_prefix = path.rstrip("/") if path != "/" else "/"
+    glob_regex = _translate_glob(file_glob) if file_glob else None
 
     matches: list[GrepMatch] = []
     for fpath, fd in sorted(files.items()):
@@ -603,7 +668,7 @@ def _grep_in_memory(
             break
         if path_prefix != "/" and not fpath.startswith(path_prefix):
             continue
-        if file_glob and not fnmatch.fnmatch(fpath, file_glob):
+        if glob_regex is not None and not glob_regex.match(_relative_to(fpath, path_prefix)):
             continue
         if fd.get("encoding") == "base64":
             continue
@@ -623,6 +688,7 @@ def _glob_in_memory(
     path: str = "/",
 ) -> GlobResult:
     path_prefix = path.rstrip("/") if path != "/" else ""
+    regex = _translate_glob(pattern)
 
     results: list[FileInfo] = []
     dirs_seen: set[str] = set()
@@ -636,12 +702,12 @@ def _glob_in_memory(
             dirs_seen.add(parent)
             parent = parent.rpartition("/")[0]
 
-        if not fnmatch.fnmatch(fpath, pattern):
+        if not regex.match(_relative_to(fpath, path_prefix)):
             continue
         results.append(FileInfo(path=VirtualPath(fpath), is_dir=False, size=len(files[fpath].get("content", ""))))
 
     for dpath in sorted(dirs_seen):
-        if not fnmatch.fnmatch(dpath, pattern):
+        if not regex.match(_relative_to(dpath, path_prefix)):
             continue
         results.append(FileInfo(path=VirtualPath(dpath), is_dir=True, size=0))
 

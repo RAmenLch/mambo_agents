@@ -189,7 +189,7 @@ class TestTools:
         backend = _make_backend()
         with _simulate_graph(backend):
             backend.write(VirtualPath("/workspace/test.txt"), "hello")  # 5 chars
-            result = backend.glob("/workspace/test.txt", path=VirtualPath("/workspace"))
+            result = backend.glob("test.txt", path=VirtualPath("/workspace"))
         assert result.matches is not None
         assert result.matches[0].size == 5
 
