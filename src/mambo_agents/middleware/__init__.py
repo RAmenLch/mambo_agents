@@ -5,6 +5,10 @@ from mambo_agents.middleware.async_subagents import (
     AsyncTaskData,
 )
 from mambo_agents.middleware.backend_tools import BackendToolsMiddleware
+from mambo_agents.middleware.mcp import (
+    MCPMiddleware,
+    MCPServerConfig,
+)
 from mambo_agents.middleware.memory import (
     MamboMemoryMiddleware,
     MemoryFormatHook,
@@ -69,6 +73,8 @@ __all__ = [
     "FinalReviewResult",
     "MamboMemoryMiddleware",
     "MamboPlanMiddleware",
+    "MCPMiddleware",
+    "MCPServerConfig",
     "MamboSummarizationMiddleware",
     "MemoryFormatHook",
     "PatchToolCallsMiddleware",
