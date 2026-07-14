@@ -49,7 +49,7 @@ from mambo_agents.backends.protocol import (
     UploadFileResult,
     WriteResult,
 )
-from mambo_agents.backends.schemas import BackendError, ErrorCode, check_no_path_traversal, GrepMatch, VirtualPath
+from mambo_agents.backends.schemas import BackendError, ErrorCode, ReversePathFn, check_no_path_traversal, GrepMatch, VirtualPath
 from mambo_agents.backends.store import StoreBackend
 
 # ---------------------------------------------------------------------------
@@ -70,6 +70,20 @@ class CopyResult(Result):
 
     source: VirtualPath | None = None
     destination: VirtualPath | None = None
+
+    def apply_reverse_translation(
+        self,
+        reverse_fn: ReversePathFn,
+        target_ws_root: VirtualPath,
+        virtual_prefix: VirtualPath,
+    ) -> "CopyResult":
+        result = super().apply_reverse_translation(reverse_fn, target_ws_root, virtual_prefix)
+        updates: dict[str, object] = {}
+        if self.source is not None:
+            updates["source"] = reverse_fn(self.source, target_ws_root, virtual_prefix)
+        if self.destination is not None:
+            updates["destination"] = reverse_fn(self.destination, target_ws_root, virtual_prefix)
+        return result.model_copy(update=updates) if updates else result
 
     def __str__(self) -> str:
         if self.error is not None:
@@ -544,6 +558,22 @@ class HybridWorkspaceBackend(BackendProtocol):
             self._reverse_path, target.workspace_root, self._get_virtual_prefix(file_path),
         )
 
+    async def aread_raw(
+        self,
+        file_path: VirtualPath,
+        offset: int = 0,
+        limit: int | None = 2000,
+        include_line_numbers: bool = False,
+    ) -> ReadResult:
+        try:
+            target, p = self._route(file_path)
+        except BackendError as e:
+            return ReadResult(error=e)
+        result = await target.aread_raw(p, offset, limit, include_line_numbers)
+        return result.apply_reverse_translation(
+            self._reverse_path, target.workspace_root, self._get_virtual_prefix(file_path),
+        )
+
     def write(
         self, file_path: VirtualPath, content: str, overwrite: bool = False,
     ) -> WriteResult:
@@ -965,7 +995,14 @@ class HybridWorkspaceBackend(BackendProtocol):
     # ------------------------------------------------------------------
 
     def copy(self, source: VirtualPath, destination: VirtualPath) -> CopyResult:
-        """Copy a single file, potentially across different backends."""
+        """Copy a single file, potentially across different backends.
+
+        If *destination* is an existing directory, the source file is copied
+        **into** that directory (like ``cp src dst/``), preserving the
+        source's basename.  If *destination* does not exist, the file is
+        written to that exact path.  If *destination* is an existing file,
+        it is overwritten.
+        """
         try:
             src_be, src_path = self._route(source)
         except BackendError as e:
@@ -975,26 +1012,53 @@ class HybridWorkspaceBackend(BackendProtocol):
         except BackendError as e:
             return CopyResult(error=e)
 
+        # --- Read source ---
         dl_results = self._download_for_copy(src_be, [src_path])
         if not dl_results:
             return CopyResult(error=BackendError(code=ErrorCode.INVALID, path=source, message=f"No result returned when reading '{source}'"))
         dl = dl_results[0]
         if dl.error:
+            if dl.error.code == ErrorCode.IS_DIR:
+                return CopyResult(error=BackendError(code=ErrorCode.IS_DIR, path=source, message=f"'{source}' 是目录，不是文件"))
             return CopyResult(error=BackendError(code=ErrorCode.IO_ERROR, path=source, message=f"Failed to read '{source}': {dl.error}"))
         if dl.content is None:
             return CopyResult(error=BackendError(code=ErrorCode.INVALID, path=source, message=f"'{source}' is empty or unreadable"))
 
-        ul_results = self._upload_for_copy(dst_be, [(dst_path, dl.content)])
+        # --- Resolve destination: if it's a directory, append source basename ---
+        final_dst_path = dst_path
+        dst_ls = dst_be.ls(dst_path)
+        if dst_ls.error is None:
+            # ls succeeded → destination is a directory → copy inside it
+            src_basename = src_path.name or source.name
+            final_dst_path = dst_path.join(src_basename)
+        elif dst_ls.error.code == ErrorCode.NOT_DIR:
+            # destination is a file → overwrite it (final_dst_path stays as dst_path)
+            pass
+        # else: NOT_FOUND or other → destination does not exist, write at dst_path
+
+        # --- Write to resolved destination ---
+        ul_results = self._upload_for_copy(dst_be, [(final_dst_path, dl.content)])
         if not ul_results:
             return CopyResult(error=BackendError(code=ErrorCode.INVALID, path=destination, message=f"No result returned when writing '{destination}'"))
         ul = ul_results[0]
         if ul.error:
             return CopyResult(error=BackendError(code=ErrorCode.IO_ERROR, path=destination, message=f"Failed to write '{destination}': {ul.error}"))
 
-        return CopyResult(source=source, destination=destination)
+        # --- Reverse-translate the internal destination path back to the user-facing virtual path ---
+        dst_virtual_prefix = self._get_virtual_prefix(destination)
+        user_dst = self._reverse_path(final_dst_path, dst_be.workspace_root, dst_virtual_prefix)
+
+        return CopyResult(source=source, destination=user_dst)
 
     async def acopy(self, source: VirtualPath, destination: VirtualPath) -> CopyResult:
-        """Async: Copy a single file across backends."""
+        """Async: Copy a single file across backends.
+
+        If *destination* is an existing directory, the source file is copied
+        **into** that directory (like ``cp src dst/``), preserving the
+        source's basename.  If *destination* does not exist, the file is
+        written to that exact path.  If *destination* is an existing file,
+        it is overwritten.
+        """
         try:
             src_be, src_path = self._route(source)
         except BackendError as e:
@@ -1004,23 +1068,43 @@ class HybridWorkspaceBackend(BackendProtocol):
         except BackendError as e:
             return CopyResult(error=e)
 
+        # --- Read source ---
         dl_results = await self._adownload_for_copy(src_be, [src_path])
         if not dl_results:
             return CopyResult(error=BackendError(code=ErrorCode.INVALID, path=source, message=f"No result returned when reading '{source}'"))
         dl = dl_results[0]
         if dl.error:
+            if dl.error.code == ErrorCode.IS_DIR:
+                return CopyResult(error=BackendError(code=ErrorCode.IS_DIR, path=source, message=f"'{source}' 是目录，不是文件"))
             return CopyResult(error=BackendError(code=ErrorCode.IO_ERROR, path=source, message=f"Failed to read '{source}': {dl.error}"))
         if dl.content is None:
             return CopyResult(error=BackendError(code=ErrorCode.INVALID, path=source, message=f"'{source}' is empty or unreadable"))
 
-        ul_results = await self._aupload_for_copy(dst_be, [(dst_path, dl.content)])
+        # --- Resolve destination: if it's a directory, append source basename ---
+        final_dst_path = dst_path
+        dst_ls = await dst_be.als(dst_path)
+        if dst_ls.error is None:
+            # ls succeeded → destination is a directory → copy inside it
+            src_basename = src_path.name or source.name
+            final_dst_path = dst_path.join(src_basename)
+        elif dst_ls.error.code == ErrorCode.NOT_DIR:
+            # destination is a file → overwrite it
+            pass
+        # else: NOT_FOUND or other → destination does not exist, write at dst_path
+
+        # --- Write to resolved destination ---
+        ul_results = await self._aupload_for_copy(dst_be, [(final_dst_path, dl.content)])
         if not ul_results:
             return CopyResult(error=BackendError(code=ErrorCode.INVALID, path=destination, message=f"No result returned when writing '{destination}'"))
         ul = ul_results[0]
         if ul.error:
             return CopyResult(error=BackendError(code=ErrorCode.IO_ERROR, path=destination, message=f"Failed to write '{destination}': {ul.error}"))
 
-        return CopyResult(source=source, destination=destination)
+        # --- Reverse-translate the internal destination path back to the user-facing virtual path ---
+        dst_virtual_prefix = self._get_virtual_prefix(destination)
+        user_dst = self._reverse_path(final_dst_path, dst_be.workspace_root, dst_virtual_prefix)
+
+        return CopyResult(source=source, destination=user_dst)
 
     # ------------------------------------------------------------------
     # Developer API — upload / download (split by prefix)

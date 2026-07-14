@@ -887,22 +887,33 @@ class SshBackend(BackendProtocol):
             remote = self._resolve(path)
         except BackendError as e:
             return GrepResult(error=e)
+        try:
+            self._sftp.stat(remote)
+        except FileNotFoundError:
+            return GrepResult(error=BackendError(code=ErrorCode.NOT_FOUND, path=path, message="路径不存在"))
+        except OSError as e:
+            return GrepResult(error=BackendError(code=ErrorCode.OS_ERROR, path=path, message=str(e)))
         remote_escaped = shlex.quote(remote)
         pattern_escaped = shlex.quote(pattern)
 
-        # 1) Try ripgrep on the remote (fastest)
+        # 1) Try ripgrep on the remote (fastest) — rg --glob has POSIX semantics
         matches = self._rg_remote(pattern_escaped, remote, glob, regex)
         if matches is not None:
             return GrepResult(matches=matches)
 
-        # 2) GNU grep (fast C program, handles most cases)
-        result = self._grep_remote(pattern_escaped, remote_escaped, glob, regex)
+        # 2) GNU grep (fast C program, handles most cases) — post-filter with POSIX glob
+        result = self._grep_remote(pattern_escaped, remote_escaped, regex)
         if result.error is None:
+            if glob and result.matches:
+                result = GrepResult(matches=_apply_glob_filter(result.matches, remote, glob))
             return result
 
-        # 3) python3 last resort
+        # 3) python3 last resort — post-filter with POSIX glob
         if self._has_python3:
-            return self._grep_python(pattern, remote, glob, regex)
+            result = self._grep_python(pattern, remote, regex)
+            if glob and result.matches:
+                result = GrepResult(matches=_apply_glob_filter(result.matches, remote, glob))
+            return result
 
         return result
 
@@ -958,14 +969,9 @@ class SshBackend(BackendProtocol):
         self,
         pattern: str,
         remote: str,
-        glob: str | None,
         regex: bool = True,
     ) -> GrepResult:
-        """Portable grep via remote ``python3`` using :func:`os.walk` +
-        :func:`fnmatch.fnmatch`.
-
-        Handles ``--include``-style filename filtering correctly
-        (unlike GNU ``grep --include=`` which may not be available).
+        """Portable grep via remote ``python3`` using :func:`os.walk`.
 
         Respects :attr:`_ignore_dirs` — directories listed there are
         skipped entirely.  Files > 1 MB and known binary extensions
@@ -974,7 +980,6 @@ class SshBackend(BackendProtocol):
         import json as _json
 
         pattern_b64 = base64.b64encode(pattern.encode()).decode()
-        glob_b64 = base64.b64encode((glob or "").encode()).decode()
         regex_b64 = base64.b64encode(str(regex).encode()).decode()
         remote_repr = repr(remote)
 
@@ -988,7 +993,7 @@ class SshBackend(BackendProtocol):
         ).decode()
 
         script = (
-            f"import base64, os, fnmatch, json, re\n"
+            f"import base64, os, json, re\n"
             f"SKIP_DIRS = set(json.loads("
             f"base64.b64decode({ignore_names_b64!r}).decode()))\n"
             f"BINARY_EXTS = {{'.pyc', '.pyo', '.so', '.o', '.a', '.bin',\n"
@@ -997,7 +1002,6 @@ class SshBackend(BackendProtocol):
             f"                '.gif', '.ico', '.pdf', '.mp3', '.mp4', '.avi'}}\n"
             f"MAX_SIZE = 1_048_576\n"  # 1 MB
             f"pat = base64.b64decode({pattern_b64!r}).decode()\n"
-            f"gpat = base64.b64decode({glob_b64!r}).decode() or None\n"
             f"use_regex = base64.b64decode({regex_b64!r}).decode() == 'True'\n"
             f"if use_regex:\n"
             f"    _regex = re.compile(pat)\n"
@@ -1012,8 +1016,6 @@ class SshBackend(BackendProtocol):
             f"        if fname.startswith('.'):\n"
             f"            continue\n"
             f"        if os.path.splitext(fname)[1].lower() in BINARY_EXTS:\n"
-            f"            continue\n"
-            f"        if gpat and not fnmatch.fnmatch(fname, gpat):\n"
             f"            continue\n"
             f"        fp = os.path.join(root, fname)\n"
             f"        try:\n"
@@ -1055,7 +1057,6 @@ class SshBackend(BackendProtocol):
         self,
         pattern_escaped: str,
         remote_escaped: str,
-        glob: str | None,
         regex: bool = True,
     ) -> GrepResult:
         """Fallback grep using ``grep -rnIsH`` on the remote.
@@ -1068,10 +1069,7 @@ class SshBackend(BackendProtocol):
             base_flags = "grep -rnIsHE"
         else:
             base_flags = "grep -rnIsHF"
-        if glob:
-            cmd = f"{base_flags} --include={shlex.quote(glob)} -- {pattern_escaped} {remote_escaped}"
-        else:
-            cmd = f"{base_flags} -- {pattern_escaped} {remote_escaped}"
+        cmd = f"{base_flags} -- {pattern_escaped} {remote_escaped}"
 
         out, err, exit_code = self._exec(cmd, timeout=60)
 
@@ -1137,6 +1135,8 @@ class SshBackend(BackendProtocol):
         for full wildcard support (``*``, ``**``, ``?``, ``[...]``).
         Falls back to ``find`` when python3 is unavailable.
         """
+        if not pattern:
+            return GlobResult(error=BackendError(code=ErrorCode.INVALID, message="搜索模式不能为空"))
         try:
             remote = self._resolve(path)
         except BackendError as e:
@@ -1768,6 +1768,39 @@ class SshBackend(BackendProtocol):
                 )
         return results
 
+
+# ---------------------------------------------------------------------------
+# Module-level helpers
+# ---------------------------------------------------------------------------
+
+
+def _apply_glob_filter(
+    matches: list[GrepMatch],
+    remote_root: str,
+    glob_pattern: str,
+) -> list[GrepMatch]:
+    """Filter grep matches by POSIX glob pattern on the relative path.
+
+    Each match's path is a physical remote path.  We strip *remote_root*
+    to get a relative path and then apply POSIX glob matching (``*``
+    does not cross ``/``, ``**`` matches any depth).
+    """
+    from mambo_agents.backends.utils import fnmatch_path
+
+    prefix = remote_root.rstrip("/") + "/"
+    filtered: list[GrepMatch] = []
+    for m in matches:
+        path_str = str(m.path)
+        if path_str.startswith(prefix):
+            rel = path_str[len(prefix):]
+        elif path_str == remote_root.rstrip("/"):
+            rel = ""
+        else:
+            continue
+        if fnmatch_path(rel, glob_pattern):
+            filtered.append(m)
+    return filtered
+
     def download_files(
         self,
         paths: list[VirtualPath],
@@ -1813,3 +1846,69 @@ class SshBackend(BackendProtocol):
                     )
                 )
         return results
+
+
+# ---------------------------------------------------------------------------
+# Module-level helpers
+# ---------------------------------------------------------------------------
+
+
+def _apply_glob_filter(
+    matches: list[GrepMatch],
+    remote_root: str,
+    glob_pattern: str,
+) -> list[GrepMatch]:
+    """Filter grep matches by POSIX glob pattern on the relative path.
+
+    Each match's path is a physical remote path.  We strip *remote_root*
+    to get a relative path and then apply POSIX glob matching (``*``
+    does not cross ``/``, ``**`` matches any depth).
+    """
+    from mambo_agents.backends.utils import fnmatch_path
+
+    prefix = remote_root.rstrip("/") + "/"
+    filtered: list[GrepMatch] = []
+    for m in matches:
+        path_str = str(m.path)
+        if path_str.startswith(prefix):
+            rel = path_str[len(prefix):]
+        elif path_str == remote_root.rstrip("/"):
+            rel = ""
+        else:
+            continue
+        if fnmatch_path(rel, glob_pattern):
+            filtered.append(m)
+    return filtered
+
+
+# ---------------------------------------------------------------------------
+# Module-level helpers
+# ---------------------------------------------------------------------------
+
+
+def _apply_glob_filter(
+    matches: list[GrepMatch],
+    remote_root: str,
+    glob_pattern: str,
+) -> list[GrepMatch]:
+    """Filter grep matches by POSIX glob pattern on the relative path.
+
+    Each match's path is a physical remote path.  We strip *remote_root*
+    to get a relative path and then apply POSIX glob matching (``*``
+    does not cross ``/``, ``**`` matches any depth).
+    """
+    from mambo_agents.backends.utils import fnmatch_path
+
+    prefix = remote_root.rstrip("/") + "/"
+    filtered: list[GrepMatch] = []
+    for m in matches:
+        path_str = str(m.path)
+        if path_str.startswith(prefix):
+            rel = path_str[len(prefix):]
+        elif path_str == remote_root.rstrip("/"):
+            rel = ""
+        else:
+            continue
+        if fnmatch_path(rel, glob_pattern):
+            filtered.append(m)
+    return filtered

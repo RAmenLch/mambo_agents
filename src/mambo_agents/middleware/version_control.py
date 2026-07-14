@@ -657,7 +657,7 @@ class VersionControlMiddleware(AgentMiddleware[_AgentState, ContextT, Any]):
         if normalized in self._backed_up.get(tid, set()):
             return  # already backed up in this invoke
 
-        result = self._backend.read_raw(path, limit=None)
+        result = await self._backend.aread_raw(path, limit=None)
         if result.error or result.content is None:
             return
 

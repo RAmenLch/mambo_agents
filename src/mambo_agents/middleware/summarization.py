@@ -72,6 +72,7 @@ from langchain_core.messages import (
     AIMessage,
     AnyMessage,
     HumanMessage,
+    ToolMessage,
     get_buffer_string,
 )
 from langchain_core.messages.utils import (
@@ -375,11 +376,16 @@ class SummarizationEvent(TypedDict):
         summary_message: The ``HumanMessage`` containing the merged summary.
         file_path: Backend path where evicted messages were offloaded,
             or ``None`` if offloading failed / was disabled.
+        last_summarized_message: The last ``HumanMessage`` or ``ToolMessage``
+            in the summarized (non-preserved) zone, or ``None`` if no such
+            message exists.  Useful for consumers that need to know the
+            exact boundary of the compaction window.
     """
 
     cutoff_index: int
     summary_message: HumanMessage
     file_path: str | None
+    last_summarized_message: HumanMessage | ToolMessage | None
 
 
 class SummarizationState(AgentState):
@@ -761,7 +767,7 @@ class MamboSummarizationMiddleware(AgentMiddleware[SummarizationState, ContextT,
             return None
         else:
             logger.debug("Offloaded %d messages to %s", len(filtered_messages), path)
-            return path
+            return str(path)
 
     async def _aoffload_to_backend(
         self,
@@ -843,7 +849,7 @@ class MamboSummarizationMiddleware(AgentMiddleware[SummarizationState, ContextT,
             return None
         else:
             logger.debug("Offloaded %d messages to %s", len(filtered_messages), path)
-            return path
+            return str(path)
 
     def _build_new_messages_with_path(self, summary: str, file_path: str | None) -> list[AnyMessage]:
         """Build the summary message with optional file path reference.
@@ -1201,6 +1207,32 @@ class MamboSummarizationMiddleware(AgentMiddleware[SummarizationState, ContextT,
         return self._adjust_cutoff_for_user_message(messages, cutoff)
 
     @staticmethod
+    def _extract_last_summarized_message(
+        messages: list[AnyMessage],
+    ) -> HumanMessage | ToolMessage | None:
+        """Extract the last ``HumanMessage`` or ``ToolMessage`` from the
+        summarized zone (non-preserved messages).
+
+        Walks the message list in reverse and returns the first
+        ``HumanMessage`` (excluding summary markers) or ``ToolMessage``
+        encountered.  Returns ``None`` if no qualifying message exists.
+
+        Args:
+            messages: The messages in the summarized (non-preserved) zone.
+
+        Returns:
+            The last qualifying message, or ``None``.
+        """
+        for msg in reversed(messages):
+            if isinstance(msg, HumanMessage) and (
+                msg.additional_kwargs.get("lc_source") != "summarization"
+            ):
+                return msg
+            if isinstance(msg, ToolMessage):
+                return msg
+        return None
+
+    @staticmethod
     def _adjust_cutoff_for_user_message(
         messages: list[AnyMessage],
         cutoff_index: int,
@@ -1322,10 +1354,13 @@ class MamboSummarizationMiddleware(AgentMiddleware[SummarizationState, ContextT,
         previous_event = request.state.get("_summarization_event")
         state_cutoff_index = self._compute_state_cutoff(previous_event, cutoff_index)
 
+        last_msg = self._extract_last_summarized_message(messages_to_summarize)
+
         new_event: SummarizationEvent = {
             "cutoff_index": state_cutoff_index,
             "summary_message": new_messages[0],
             "file_path": file_path,
+            "last_summarized_message": last_msg,
         }
 
         return ExtendedModelResponse(
@@ -1412,10 +1447,13 @@ class MamboSummarizationMiddleware(AgentMiddleware[SummarizationState, ContextT,
         previous_event = request.state.get("_summarization_event")
         state_cutoff_index = self._compute_state_cutoff(previous_event, cutoff_index)
 
+        last_msg = self._extract_last_summarized_message(messages_to_summarize)
+
         new_event: SummarizationEvent = {
             "cutoff_index": state_cutoff_index,
             "summary_message": new_messages[0],
             "file_path": file_path,
+            "last_summarized_message": last_msg,
         }
 
         return ExtendedModelResponse(

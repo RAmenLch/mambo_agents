@@ -36,7 +36,10 @@ from mambo_agents.backends.protocol import (
 )
 from mambo_agents.backends.schemas import BackendError, ErrorCode, VirtualPath, human_size
 from mambo_agents.backends.utils import (
+    TreeEntry,
     detect_trailing_newline_mismatch,
+    fnmatch_path,
+    format_tree_entries,
     format_with_line_numbers,
 )
 
@@ -381,8 +384,56 @@ class StoreBackend(BackendProtocol):
         tid = self._resolve_thread_id()
         fd = self._get_file(tid, file_path.normalized)
         if fd is None:
+            # 检查是否为目录（有子文件/目录以该路径为前缀）
+            files = self._get_all_files(tid)
+            prefix = file_path.normalized + "/"
+            for fpath in files:
+                if fpath.startswith(prefix):
+                    return ReadResult(error=BackendError(code=ErrorCode.IS_DIR, path=file_path, message="目标是目录"))
             return ReadResult(error=BackendError(code=ErrorCode.NOT_FOUND, path=file_path, message="文件不存在"))
 
+        return self._build_read_result(file_path, fd, offset, limit, include_line_numbers)
+
+    async def aread_raw(
+        self,
+        file_path: VirtualPath,
+        offset: int = 0,
+        limit: int | None = 2000,
+        include_line_numbers: bool = False,
+    ) -> ReadResult:
+        if offset < 0:
+            return ReadResult(error=BackendError(
+                code=ErrorCode.INVALID, path=file_path,
+                message=f"offset must be non-negative, got {offset}",
+            ))
+        if limit is not None and limit < 1:
+            return ReadResult(error=BackendError(
+                code=ErrorCode.INVALID, path=file_path,
+                message=f"limit must be >= 1 (or None for unlimited), got {limit}",
+            ))
+        if file_path.value.endswith("/"):
+            return ReadResult(error=BackendError(code=ErrorCode.IS_DIR, path=file_path, message="目标是目录"))
+        tid = self._resolve_thread_id()
+        fd = await self._aget_file(tid, file_path.normalized)
+        if fd is None:
+            # 检查是否为目录（有子文件/目录以该路径为前缀）
+            files = await self._aget_all_files(tid)
+            prefix = file_path.normalized + "/"
+            for fpath in files:
+                if fpath.startswith(prefix):
+                    return ReadResult(error=BackendError(code=ErrorCode.IS_DIR, path=file_path, message="目标是目录"))
+            return ReadResult(error=BackendError(code=ErrorCode.NOT_FOUND, path=file_path, message="文件不存在"))
+
+        return self._build_read_result(file_path, fd, offset, limit, include_line_numbers)
+
+    @staticmethod
+    def _build_read_result(
+        file_path: VirtualPath,
+        fd: dict[str, str],
+        offset: int,
+        limit: int | None,
+        include_line_numbers: bool,
+    ) -> ReadResult:
         content = fd["content"]
         encoding = fd["encoding"]
 
@@ -397,6 +448,11 @@ class StoreBackend(BackendProtocol):
         if lines and lines[-1] == "":
             lines = lines[:-1]
         total = len(lines)
+
+        if total > 0 and offset >= total:
+            return ReadResult(
+                error=BackendError(code=ErrorCode.INVALID, path=file_path, message=f"偏移量 {offset} 超过文件长度 ({total} 行)"),
+            )
 
         end = offset + limit if limit is not None else None
         sliced = lines[offset:end]
@@ -501,12 +557,39 @@ class StoreBackend(BackendProtocol):
                 return GrepResult(error=BackendError(code=ErrorCode.INVALID, message=f"无效正则: {e}"))
         tid = self._resolve_thread_id()
         files = self._get_all_files(tid)
+        normalized = path.normalized
+
+        # 检查路径是否存在（文件或目录）
+        if normalized != self.workspace_root.normalized:
+            # 检查是否为文件
+            if normalized in files:
+                pass  # 文件存在，可以继续（grep 单文件）
+            else:
+                # 检查是否为目录（有子文件/目录以该路径为前缀）
+                prefix = normalized + "/"
+                if not any(fpath.startswith(prefix) for fpath in files):
+                    return GrepResult(error=BackendError(code=ErrorCode.NOT_FOUND, path=path, message="路径不存在"))
+
         raw_matches = _grep_in_memory(files, pattern, path.normalized, glob, regex, self._max_grep_matches)
         return self._apply_grep_limit(raw_matches, offset, limit)
 
     def glob(self, pattern: str, path: VirtualPath) -> GlobResult:
+        if not pattern:
+            return GlobResult(error=BackendError(code=ErrorCode.INVALID, message="搜索模式不能为空"))
         tid = self._resolve_thread_id()
         files = self._get_all_files(tid)
+        normalized = path.normalized
+
+        # 验证路径存在且为目录
+        if normalized != self.workspace_root.normalized:
+            # 检查是否为文件
+            if normalized in files:
+                return GlobResult(error=BackendError(code=ErrorCode.NOT_DIR, path=path, message="目标是文件，不是目录"))
+            # 检查是否为目录（有子文件/目录以该路径为前缀）
+            prefix = normalized + "/"
+            if not any(fpath.startswith(prefix) for fpath in files):
+                return GlobResult(error=BackendError(code=ErrorCode.NOT_FOUND, path=path, message="路径不存在"))
+
         return _glob_in_memory(files, pattern, path.normalized)
 
     # ------------------------------------------------------------------
@@ -518,8 +601,27 @@ class StoreBackend(BackendProtocol):
             return f"Invalid depth value: {depth}. Depth must be a positive integer (>= 1)."
         if isinstance(path, str):
             path = VirtualPath(path)
+
+        # 验证路径存在且为目录
+        tid = self._resolve_thread_id()
+        files = self._get_all_files(tid)
+        normalized = path.normalized
+
+        # 检查是否为文件
+        if normalized in files:
+            return f"Path '{path}' is not a directory."
+
+        # 检查目录是否存在（有子文件/目录以该路径为前缀）
+        prefix = normalized + "/" if normalized != self.workspace_root.normalized else ""
+        has_children = any(
+            fpath.startswith(prefix)
+            for fpath in files
+        ) if prefix else bool(files)
+        if not has_children and normalized != self.workspace_root.normalized:
+            return f"Path '{path}' not found."
+
         entries = _collect_tree_entries(self, path, depth)
-        return _format_tree(entries)
+        return format_tree_entries(entries)
 
     async def atree(self, path: VirtualPath, depth: int = 3) -> str:
         if isinstance(path, str):
@@ -537,14 +639,25 @@ class StoreBackend(BackendProtocol):
         tid = self._resolve_thread_id()
         results: list[UploadFileResult] = []
         for path, raw_content in files:
-            try:
-                text = raw_content.decode("utf-8")
-                encoding = "utf-8"
-            except UnicodeDecodeError:
-                text = base64.b64encode(raw_content).decode("ascii")
-                encoding = "base64"
-            self._put_file(tid, path.normalized, text, encoding)
-            results.append(UploadFileResult(path=path.normalized, error=None))
+            # Check for directory conflict — same guard as write()
+            all_files = self._get_all_files(tid)
+            prefix = path.normalized + "/"
+            for fpath in all_files:
+                if fpath.startswith(prefix):
+                    results.append(UploadFileResult(
+                        path=path.normalized,
+                        error=BackendError(code=ErrorCode.IS_DIR, path=path, message="目标是目录，无法写入"),
+                    ))
+                    break
+            else:
+                try:
+                    text = raw_content.decode("utf-8")
+                    encoding = "utf-8"
+                except UnicodeDecodeError:
+                    text = base64.b64encode(raw_content).decode("ascii")
+                    encoding = "base64"
+                self._put_file(tid, path.normalized, text, encoding)
+                results.append(UploadFileResult(path=path.normalized, error=None))
         return results
 
     def download_files(
@@ -556,12 +669,23 @@ class StoreBackend(BackendProtocol):
         for path in paths:
             fd = self._get_file(tid, path.normalized)
             if fd is None:
-                results.append(
-                    DownloadFileResult(
-                        path=path.normalized, content=None,
-                        error=BackendError(code=ErrorCode.NOT_FOUND, path=path, message="文件不存在"),
+                # 检查是否为目录（有子文件/目录以该路径为前缀）
+                all_files = self._get_all_files(tid)
+                prefix = path.normalized + "/"
+                if any(fpath.startswith(prefix) for fpath in all_files):
+                    results.append(
+                        DownloadFileResult(
+                            path=path.normalized, content=None,
+                            error=BackendError(code=ErrorCode.IS_DIR, path=path, message="目标是目录"),
+                        )
                     )
-                )
+                else:
+                    results.append(
+                        DownloadFileResult(
+                            path=path.normalized, content=None,
+                            error=BackendError(code=ErrorCode.NOT_FOUND, path=path, message="文件不存在"),
+                        )
+                    )
                 continue
             content = fd["content"]
             encoding = fd["encoding"]
@@ -578,56 +702,6 @@ class StoreBackend(BackendProtocol):
 # ============================================================================
 # Internal helpers — in-memory grep / glob / tree logic
 # ============================================================================
-
-
-def _translate_glob(pattern: str):
-    """Compile a glob pattern into a regex (pathlib-compatible, posix-style).
-
-    Semantics (matched against the path *relative* to the search root):
-
-    * ``**`` matches any number of path segments (including zero)
-    * ``*`` matches any chars except the path separator ``/``
-    * ``?`` matches a single char except ``/``
-    * ``[...]`` / ``[!...]`` character classes
-    """
-    import re
-
-    i, n = 0, len(pattern)
-    res: list[str] = []
-    while i < n:
-        c = pattern[i]
-        i += 1
-        if c == "*":
-            if i < n and pattern[i] == "*":
-                i += 1
-                if i < n and pattern[i] == "/":
-                    i += 1
-                    res.append("(?:.*/)?")
-                else:
-                    res.append(".*")
-            else:
-                res.append("[^/]*")
-        elif c == "?":
-            res.append("[^/]")
-        elif c == "[":
-            j = i
-            if j < n and pattern[j] in ("!", "^"):
-                j += 1
-            if j < n and pattern[j] == "]":
-                j += 1
-            while j < n and pattern[j] != "]":
-                j += 1
-            if j >= n:
-                res.append(re.escape("["))
-            else:
-                stuff = pattern[i:j].replace("\\", "\\\\")
-                i = j + 1
-                if stuff.startswith("!"):
-                    stuff = "^" + stuff[1:]
-                res.append("[" + stuff + "]")
-        else:
-            res.append(re.escape(c))
-    return re.compile("(?s:" + "".join(res) + r")\Z")
 
 
 def _relative_to(fpath: str, path_prefix: str) -> str:
@@ -660,7 +734,6 @@ def _grep_in_memory(
         compiled = _re.compile(_re.escape(pattern))
 
     path_prefix = path.rstrip("/") if path != "/" else "/"
-    glob_regex = _translate_glob(file_glob) if file_glob else None
 
     matches: list[GrepMatch] = []
     for fpath, fd in sorted(files.items()):
@@ -668,7 +741,7 @@ def _grep_in_memory(
             break
         if path_prefix != "/" and not fpath.startswith(path_prefix):
             continue
-        if glob_regex is not None and not glob_regex.match(_relative_to(fpath, path_prefix)):
+        if file_glob is not None and not fnmatch_path(_relative_to(fpath, path_prefix), file_glob):
             continue
         if fd.get("encoding") == "base64":
             continue
@@ -688,7 +761,6 @@ def _glob_in_memory(
     path: str = "/",
 ) -> GlobResult:
     path_prefix = path.rstrip("/") if path != "/" else ""
-    regex = _translate_glob(pattern)
 
     results: list[FileInfo] = []
     dirs_seen: set[str] = set()
@@ -702,12 +774,12 @@ def _glob_in_memory(
             dirs_seen.add(parent)
             parent = parent.rpartition("/")[0]
 
-        if not regex.match(_relative_to(fpath, path_prefix)):
+        if not fnmatch_path(_relative_to(fpath, path_prefix), pattern):
             continue
         results.append(FileInfo(path=VirtualPath(fpath), is_dir=False, size=len(files[fpath].get("content", ""))))
 
     for dpath in sorted(dirs_seen):
-        if not regex.match(_relative_to(dpath, path_prefix)):
+        if not fnmatch_path(_relative_to(dpath, path_prefix), pattern):
             continue
         results.append(FileInfo(path=VirtualPath(dpath), is_dir=True, size=0))
 
@@ -718,38 +790,48 @@ def _collect_tree_entries(
     backend: StoreBackend,
     path: VirtualPath,
     depth: int,
-) -> list[tuple[str, bool, int]]:
+    current_depth: int = 0,
+) -> list[TreeEntry]:
     result = backend.ls(path)
     if result.error or not result.entries:
         return []
 
-    entries: list[tuple[str, bool, int]] = []
+    entries: list[TreeEntry] = []
     for fi in result.entries:
-        if fi.is_dir and depth > 1:
-            sub_path = fi.path.value if fi.path.value.endswith("/") else fi.path.value + "/"
-            entries.extend(
-                _collect_tree_entries(backend, VirtualPath(sub_path), depth - 1)
-            )
-    for fi in result.entries:
-        entries.append((str(fi.path), fi.is_dir, fi.size))
-    return entries
-
-
-def _format_tree(
-    entries: list[tuple[str, bool, int]],
-    prefix: str = "",
-) -> str:
-    import os as _os
-
-    lines: list[str] = []
-    for i, (p, is_dir, size) in enumerate(entries):
-        is_last = i == len(entries) - 1
-        connector = "└── " if is_last else "├── "
-        name = _os.path.basename(p.rstrip("/")) or p.rstrip("/")
-        if is_dir:
-            name += "/"
-            size_str = ""
+        if fi.is_dir:
+            display_name = fi.path.name + "/"
+            if current_depth + 1 >= depth:
+                # 深度达到上限：检查是否有子项
+                sub_prefix = fi.path.normalized + "/"
+                tid = backend._resolve_thread_id()
+                all_files = backend._get_all_files(tid)
+                has_children = any(f.startswith(sub_prefix) for f in all_files)
+                marker = "depth_exceeded" if has_children else "empty"
+                entries.append(TreeEntry(
+                    name=display_name,
+                    depth=current_depth,
+                    marker=marker,
+                ))
+            else:
+                # 递归展开子目录
+                sub_entries = _collect_tree_entries(
+                    backend, fi.path, depth, current_depth + 1,
+                )
+                if not sub_entries:
+                    entries.append(TreeEntry(
+                        name=display_name,
+                        depth=current_depth,
+                        marker="empty",
+                    ))
+                else:
+                    entries.append(TreeEntry(
+                        name=display_name,
+                        depth=current_depth,
+                    ))
+                    entries.extend(sub_entries)
         else:
-            size_str = f" ({human_size(size)})"
-        lines.append(f"{prefix}{connector}{name}{size_str}")
-    return "\n".join(lines)
+            entries.append(TreeEntry(
+                name=f"{fi.path.name} ({human_size(fi.size)})",
+                depth=current_depth,
+            ))
+    return entries

@@ -87,6 +87,20 @@ class ReadOnlyBackend(BackendProtocol):
         except Exception as exc:
             return ReadResult(error=BackendError(code=ErrorCode.INVALID, message=f"{type(exc).__name__}: {exc}"))
 
+    async def aread_raw(
+        self,
+        file_path: VirtualPath,
+        offset: int = 0,
+        limit: int | None = 2000,
+        include_line_numbers: bool = False,
+    ) -> ReadResult:
+        try:
+            return await self._backend.aread_raw(file_path, offset, limit, include_line_numbers)
+        except BackendError as exc:
+            return ReadResult(error=exc)
+        except Exception as exc:
+            return ReadResult(error=BackendError(code=ErrorCode.INVALID, message=f"{type(exc).__name__}: {exc}"))
+
     def grep(
         self,
         pattern: str,

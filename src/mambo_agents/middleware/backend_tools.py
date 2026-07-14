@@ -232,14 +232,14 @@ _CORE_TOOLS = [
             "Search for a text pattern in files. "
             "By default interprets pattern as a Python regex (supports |, .*, ^, $, character classes, etc.). "
             "Set regex=False for exact substring matching (literal mode). "
-            "Use the glob parameter to filter by filename pattern (e.g., '*.py'). "
+            "Use the glob parameter to filter by file path pattern (e.g., '*.py' for top-level only, '**/*.py' for recursive). "
             "Results are capped at 1000 matches. Use offset and limit for pagination."
         ),
         "method": "grep",
         "fields": {
             "pattern": (str, Field(description="Regex pattern (default) or text substring to find")),
             "path": (VirtualPath, Field(description="Base directory to search")),
-            "glob": (str | None, Field(default=None, description="Optional glob to filter filenames, e.g. '*.py'")),
+            "glob": (str | None, Field(default=None, description="Optional POSIX glob to filter file paths (e.g., '*.py' for top-level, '**/*.py' for recursive)")),
             "regex": (bool, Field(default=True, description="If True (default), interpret pattern as regex. Set False for literal match.")),
             "offset": (int, Field(default=0, description="0-based index to start from (for pagination)")),
             "limit": (int | None, Field(default=None, description="Max matches to return. None means up to the hard cap (1000).")),

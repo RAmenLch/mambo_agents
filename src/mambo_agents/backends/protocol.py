@@ -451,6 +451,11 @@ class BackendProtocol(abc.ABC):
         total = len(matches)
         if offset < 0:
             offset = 0
+        if total > 0 and offset >= total:
+            return GrepResult(error=BackendError(
+                code=ErrorCode.INVALID,
+                message=f"偏移量 {offset} 超过匹配总数 ({total} 条)",
+            ))
         effective_limit = limit if limit is not None else self._max_grep_matches
         effective_limit = max(effective_limit, 1)
         effective_limit = min(effective_limit, self._max_grep_matches)
@@ -529,6 +534,22 @@ class BackendProtocol(abc.ABC):
         slicing.  This is used internally by ``download_files``.
         """
         ...
+
+    async def aread_raw(
+        self,
+        file_path: VirtualPath,
+        offset: int = 0,
+        limit: int | None = 2000,
+        include_line_numbers: bool = False,
+    ) -> ReadResult:
+        """Async version of :meth:`read_raw`.
+
+        Default implementation delegates to the synchronous
+        ``read_raw``.  Backends with async stores (e.g. ``StoreBackend``)
+        MUST override this to use their async data path and avoid
+        ``InvalidStateError`` in the main event loop.
+        """
+        return self.read_raw(file_path, offset, limit, include_line_numbers)
 
     @abc.abstractmethod
     def write(

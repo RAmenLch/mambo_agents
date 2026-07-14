@@ -46,6 +46,7 @@ from mambo_agents.backends.utils import (
     TreeEntry,
     check_path_allowed,
     detect_trailing_newline_mismatch,
+    fnmatch_path,
     format_tree_entries,
     format_validation_error,
     format_with_line_numbers,
@@ -607,7 +608,7 @@ class LocalBackend(BackendProtocol):
         is_dir = resolved.is_dir()
         wr = self.workspace_root.value
 
-        # 1) Try ripgrep (handles files and dirs equally; skip glob filter for files)
+        # 1) Try ripgrep (handles files and dirs equally; rg --glob has POSIX semantics)
         rg_glob = glob if is_dir else None
         results = self._ripgrep_grep(pattern, resolved, rg_glob, regex)
         if results is not None:
@@ -628,7 +629,6 @@ class LocalBackend(BackendProtocol):
             return self._apply_grep_limit(matches, offset, limit)
 
         # 2) Python fallback with file-size guard
-        import fnmatch as _fnmatch
 
         matches: list[GrepMatch] = []
         skipped: int = 0
@@ -667,7 +667,13 @@ class LocalBackend(BackendProtocol):
                 except OSError:
                     continue
 
-                if glob and not _fnmatch.fnmatch(fp.name, glob):
+                if glob:
+                    try:
+                        rel_path = str(fp.relative_to(search_dir)).replace("\\", "/")
+                    except ValueError:
+                        continue
+                    if not fnmatch_path(rel_path, glob):
+                        continue
                     continue
                 if _get_file_type(fp.suffix) != "text":
                     continue
@@ -781,6 +787,8 @@ class LocalBackend(BackendProtocol):
         return results
 
     def glob(self, pattern: str, path: VirtualPath = VirtualPath("/workspace")) -> GlobResult:
+        if not pattern:
+            return GlobResult(error=BackendError(code=ErrorCode.INVALID, message="搜索模式不能为空"))
         try:
             resolved = self._resolve(path)
         except BackendError as e:
