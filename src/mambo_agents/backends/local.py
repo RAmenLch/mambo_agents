@@ -674,7 +674,6 @@ class LocalBackend(BackendProtocol):
                         continue
                     if not fnmatch_path(rel_path, glob):
                         continue
-                    continue
                 if _get_file_type(fp.suffix) != "text":
                     continue
 

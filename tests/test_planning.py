@@ -18,6 +18,7 @@ from mambo_agents import (
     MamboSummarizationMiddleware,
     Plan,
     SummarizationConfig,
+    SummarizationMode,
     SummaryHook,
     SummaryHookContext,
     WritePlansInput,
@@ -412,6 +413,7 @@ class TestSummarizationWithHooks:
         mock = _make_mock_summary_model("Summary text.")
         mw = MamboSummarizationMiddleware(
             model=mock,
+            mode=SummarizationMode.PER_MODEL_CALL,
             trigger=("messages", 3),
             keep=("messages", 2),
         )
@@ -453,6 +455,7 @@ class TestSummarizationWithHooks:
 
         mw = MamboSummarizationMiddleware(
             model=mock,
+            mode=SummarizationMode.PER_MODEL_CALL,
             trigger=("messages", 3),
             keep=("messages", 2),
             summary_hooks=[custom_hook],
@@ -492,6 +495,7 @@ class TestSummarizationWithHooks:
 
         mw = MamboSummarizationMiddleware(
             model=mock,
+            mode=SummarizationMode.PER_MODEL_CALL,
             trigger=("messages", 3),
             keep=("messages", 2),
             summary_hooks=[noop_hook],
@@ -521,7 +525,7 @@ class TestSummarizationWithHooks:
     def test_register_hook_runtime(self):
         """register_hook() can add hooks after construction."""
         mock = _make_mock_summary_model("Summary.")
-        mw = MamboSummarizationMiddleware(model=mock, trigger=("messages", 3), keep=("messages", 2))
+        mw = MamboSummarizationMiddleware(model=mock, mode=SummarizationMode.PER_MODEL_CALL, trigger=("messages", 3), keep=("messages", 2))
 
         def late_hook(ctx: SummaryHookContext) -> str | None:
             return "LATE_HOOK_CONTENT"

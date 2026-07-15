@@ -13,6 +13,7 @@ from langchain_core.messages import (
 from mambo_agents import (
     MamboSummarizationMiddleware,
     SummarizationConfig,
+    SummarizationMode,
     create_mambo_agent,
 )
 from mambo_agents.backends.store import StoreBackend
@@ -390,6 +391,7 @@ class TestWrapModelCallWithBackend:
         backend.download_files.return_value = []
         mw = MamboSummarizationMiddleware(
             model=mock,
+            mode=SummarizationMode.PER_MODEL_CALL,
             backend=backend,
             offload_to_backend=True,
             trigger=("messages", 3),
@@ -420,6 +422,7 @@ class TestWrapModelCallWithBackend:
         backend.download_files.return_value = []
         mw = MamboSummarizationMiddleware(
             model=mock,
+            mode=SummarizationMode.PER_MODEL_CALL,
             backend=backend,
             offload_to_backend=True,
             trigger=("messages", 3),
@@ -460,6 +463,7 @@ class TestWrapModelCallWithBackend:
 
         mw = MamboSummarizationMiddleware(
             model=mock,
+            mode=SummarizationMode.PER_MODEL_CALL,
             backend=backend,
             offload_to_backend=True,
             trigger=("messages", 3),
@@ -495,6 +499,7 @@ class TestWrapModelCallWithBackend:
         mock = _make_mock_summary_model("Plain summary.")
         mw = MamboSummarizationMiddleware(
             model=mock,
+            mode=SummarizationMode.PER_MODEL_CALL,
             trigger=("messages", 3),
             keep=("messages", 2),
         )
@@ -563,6 +568,7 @@ class TestAsyncOffload:
         backend.adownload_files.return_value = []
         mw = MamboSummarizationMiddleware(
             model=mock,
+            mode=SummarizationMode.PER_MODEL_CALL,
             backend=backend,
             offload_to_backend=True,
             trigger=("messages", 3),
@@ -866,3 +872,200 @@ class TestSummarizationConfig:
         assert config["keep"] == ("messages", 10)
         assert config["summary_prompt"] == "My prompt: {messages}"
         assert config["trim_tokens_to_summarize"] == 2000
+
+    def test_default_mode_is_per_astream(self):
+        """Default SummarizationMode is PER_ASTREAM."""
+        config = SummarizationConfig()
+        assert config.mode == SummarizationMode.PER_ASTREAM
+
+    def test_explicit_per_model_call(self):
+        """SummarizationMode can be set to PER_MODEL_CALL."""
+        config = SummarizationConfig(mode=SummarizationMode.PER_MODEL_CALL)
+        assert config.mode == SummarizationMode.PER_MODEL_CALL
+
+
+# ============================================================================
+# Per-astream mode (before_agent summarization)
+# ============================================================================
+
+
+class TestPerAstreamMode:
+    """Tests for per_astream summarization mode (before_agent)."""
+
+    def test_default_mode_skips_wrap_model_call(self):
+        """In per_astream mode, wrap_model_call does NOT trigger summarization."""
+        mock = _make_mock_summary_model("Should not be called")
+        mw = MamboSummarizationMiddleware(
+            model=mock,
+            mode=SummarizationMode.PER_ASTREAM,
+            trigger=("messages", 3),
+            keep=("messages", 2),
+        )
+
+        messages = [
+            HumanMessage(content="U1"),
+            AIMessage(content="A1"),
+            ToolMessage(content="T1", tool_call_id="c1"),
+            HumanMessage(content="U2"),
+            AIMessage(content="A2"),
+        ]
+        request = _make_request(messages)
+        received = []
+
+        def handler(req):
+            received.append(list(req.messages))
+            return "ok"
+
+        mw.wrap_model_call(request, handler)
+        # Summary model should NOT have been called
+        mock.invoke.assert_not_called()
+        # Handler received the effective messages (with _summarization_event applied)
+        assert len(received) == 1
+        # Since there's no prior event, effective == raw messages
+        assert len(received[0]) == 5
+
+    def test_before_agent_triggers_summarization(self):
+        """before_agent triggers summarization when token budget exceeded."""
+        mock = _make_mock_summary_model("Summary from before_agent.")
+        mw = MamboSummarizationMiddleware(
+            model=mock,
+            mode=SummarizationMode.PER_ASTREAM,
+            trigger=("messages", 3),
+            keep=("messages", 2),
+        )
+
+        messages = [
+            HumanMessage(content="U1"),
+            AIMessage(content="A1"),
+            ToolMessage(content="T1", tool_call_id="c1"),
+            HumanMessage(content="U2"),
+            AIMessage(content="A2"),
+        ]
+        state = {"messages": messages}
+
+        result = mw.before_agent(state, MagicMock())
+        assert result is not None
+        assert "_summarization_event" in result
+        event = result["_summarization_event"]
+        assert event is not None
+        assert "Summary from before_agent" in event["summary_message"].content
+        # cutoff_index should be an absolute state index (no prior event → same as effective)
+        assert event["cutoff_index"] > 0
+        assert event["file_path"] is None
+
+    def test_before_agent_no_summarization_when_under_budget(self):
+        """before_agent returns None when under budget."""
+        mock = _make_mock_summary_model("Should not be called")
+        mw = MamboSummarizationMiddleware(
+            model=mock,
+            mode=SummarizationMode.PER_ASTREAM,
+            trigger=("messages", 100),
+            keep=("messages", 20),
+        )
+
+        messages = [
+            HumanMessage(content="U1"),
+            AIMessage(content="A1"),
+        ]
+        state = {"messages": messages}
+
+        result = mw.before_agent(state, MagicMock())
+        assert result is None
+        mock.invoke.assert_not_called()
+
+    def test_before_agent_applies_event_to_subsequent_wrap_model_call(self):
+        """After before_agent sets _summarization_event, wrap_model_call
+        uses the compacted view."""
+        mock = _make_mock_summary_model("Compacted summary.")
+        mw = MamboSummarizationMiddleware(
+            model=mock,
+            mode=SummarizationMode.PER_ASTREAM,
+            trigger=("messages", 3),
+            keep=("messages", 2),
+        )
+
+        messages = [
+            HumanMessage(content="U1"),
+            AIMessage(content="A1"),
+            ToolMessage(content="T1", tool_call_id="c1"),
+            HumanMessage(content="U2"),
+            AIMessage(content="A2"),
+        ]
+        state = {"messages": messages}
+
+        # Step 1: before_agent compacts
+        result = mw.before_agent(state, MagicMock())
+        assert result is not None
+        event = result["_summarization_event"]
+
+        # Step 2: wrap_model_call sees the compacted view
+        state_with_event = {**state, "_summarization_event": event}
+        request = _make_request(messages, state=state_with_event)
+        received = []
+
+        def handler(req):
+            received.append(list(req.messages))
+            return "ok"
+
+        # wrap_model_call should NOT trigger another summarization —
+        # it just reconstructs effective messages and passes through
+        mw.wrap_model_call(request, handler)
+        assert len(received) == 1
+        # Effective: [summary_msg, *messages[cutoff_idx:]]
+        effective = received[0]
+        assert len(effective) < 5  # compacted
+        assert isinstance(effective[0], HumanMessage)
+        assert "Compacted summary" in effective[0].content
+
+    def test_per_model_call_mode_ignores_before_agent(self):
+        """In per_model_call mode, before_agent returns None."""
+        mock = _make_mock_summary_model("Should not be called from before_agent")
+        mw = MamboSummarizationMiddleware(
+            model=mock,
+            mode=SummarizationMode.PER_MODEL_CALL,
+            trigger=("messages", 3),
+            keep=("messages", 2),
+        )
+
+        messages = [
+            HumanMessage(content="U1"),
+            AIMessage(content="A1"),
+            ToolMessage(content="T1", tool_call_id="c1"),
+            HumanMessage(content="U2"),
+            AIMessage(content="A2"),
+        ]
+        state = {"messages": messages}
+
+        result = mw.before_agent(state, MagicMock())
+        assert result is None
+
+    def test_before_agent_with_hook_injection(self):
+        """before_agent respects summary hooks."""
+        mock = _make_mock_summary_model("Summary with hooks.")
+
+        def custom_hook(ctx):
+            return "HOOK_CONTENT"
+
+        mw = MamboSummarizationMiddleware(
+            model=mock,
+            mode=SummarizationMode.PER_ASTREAM,
+            trigger=("messages", 3),
+            keep=("messages", 2),
+            summary_hooks=[custom_hook],
+        )
+
+        messages = [
+            HumanMessage(content="U1"),
+            AIMessage(content="A1"),
+            ToolMessage(content="T1", tool_call_id="c1"),
+            HumanMessage(content="U2"),
+            AIMessage(content="A2"),
+        ]
+        state = {"messages": messages}
+
+        result = mw.before_agent(state, MagicMock())
+        assert result is not None
+        event = result["_summarization_event"]
+        content = event["summary_message"].content
+        assert "Summary with hooks" in content
+        assert "HOOK_CONTENT" in content

@@ -57,6 +57,7 @@ from mambo_agents.middleware.summarization import (
     DEFAULT_MAMBO_CHAINED_SUMMARY_PROMPT,
     MamboSummarizationMiddleware,
     SummarizationConfig,
+    SummarizationMode,
     SummaryHook,
 )
 from mambo_agents.middleware.planning import MamboPlanMiddleware
@@ -368,6 +369,7 @@ def create_mambo_agent(
         mw.append(
             MamboSummarizationMiddleware(
                 model=_summary_model,
+                mode=summarization.mode,
                 trigger=summarization.trigger,
                 keep=summarization.keep,
                 summary_prompt=summarization.summary_prompt,

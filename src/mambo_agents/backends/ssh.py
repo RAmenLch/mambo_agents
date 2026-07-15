@@ -35,7 +35,6 @@ from mambo_agents.backends.protocol import (
     LsResult,
     ReadResult,
     ReadSummarizer,
-    ToolTimeoutError,
     ToolTimeouts,
     UploadFileResult,
     WriteResult,
@@ -541,8 +540,7 @@ class SshBackend(BackendProtocol):
     @staticmethod
     def _attr_is_dir(attr: paramiko.SFTPAttributes) -> bool:
         """Check whether an SFTP attribute represents a directory."""
-        mode = attr.st_mode
-        return mode is not None and (mode & 0o40000) != 0
+        return SshBackend._attr_is_dir_maybe(attr.st_mode)
 
     # ------------------------------------------------------------------
     # Core: read
@@ -905,14 +903,14 @@ class SshBackend(BackendProtocol):
         result = self._grep_remote(pattern_escaped, remote_escaped, regex)
         if result.error is None:
             if glob and result.matches:
-                result = GrepResult(matches=_apply_glob_filter(result.matches, remote, glob))
+                result = GrepResult(matches=self._apply_glob_filter(result.matches, remote, glob))
             return result
 
         # 3) python3 last resort — post-filter with POSIX glob
         if self._has_python3:
             result = self._grep_python(pattern, remote, regex)
             if glob and result.matches:
-                result = GrepResult(matches=_apply_glob_filter(result.matches, remote, glob))
+                result = GrepResult(matches=self._apply_glob_filter(result.matches, remote, glob))
             return result
 
         return result
@@ -977,8 +975,6 @@ class SshBackend(BackendProtocol):
         skipped entirely.  Files > 1 MB and known binary extensions
         are also skipped to keep traversal fast.
         """
-        import json as _json
-
         pattern_b64 = base64.b64encode(pattern.encode()).decode()
         regex_b64 = base64.b64encode(str(regex).encode()).decode()
         remote_repr = repr(remote)
@@ -1038,8 +1034,8 @@ class SshBackend(BackendProtocol):
             return GrepResult(error=BackendError(code=ErrorCode.IO_ERROR, message=f"grep 错误(exit {exit_code}): {err or out}"))
 
         try:
-            data = _json.loads(out.strip())
-        except _json.JSONDecodeError:
+            data = json.loads(out.strip())
+        except json.JSONDecodeError:
             return GrepResult(error=BackendError(code=ErrorCode.INVALID, message=f"grep 返回异常: {out[:200]}"))
 
         matches: list[GrepMatch] = []
@@ -1124,6 +1120,34 @@ class SshBackend(BackendProtocol):
             blacklist=self._edit_blacklist or None,
         )
 
+    @staticmethod
+    def _apply_glob_filter(
+        matches: list[GrepMatch],
+        remote_root: str,
+        glob_pattern: str,
+    ) -> list[GrepMatch]:
+        """Filter grep matches by POSIX glob pattern on the relative path.
+
+        Each match's path is a physical remote path.  We strip *remote_root*
+        to get a relative path and then apply POSIX glob matching (``*``
+        does not cross ``/``, ``**`` matches any depth).
+        """
+        from mambo_agents.backends.utils import fnmatch_path
+
+        prefix = remote_root.rstrip("/") + "/"
+        filtered: list[GrepMatch] = []
+        for m in matches:
+            path_str = str(m.path)
+            if path_str.startswith(prefix):
+                rel = path_str[len(prefix):]
+            elif path_str == remote_root.rstrip("/"):
+                rel = ""
+            else:
+                continue
+            if fnmatch_path(rel, glob_pattern):
+                filtered.append(m)
+        return filtered
+
     # ------------------------------------------------------------------
     # Core: glob
     # ------------------------------------------------------------------
@@ -1170,8 +1194,6 @@ class SshBackend(BackendProtocol):
         directory, preventing path-traversal attacks via ``..`` in the
         pattern string.
         """
-        import json as _json
-
         pattern_b64 = base64.b64encode(pattern.encode()).decode()
         remote_repr = repr(remote)
 
@@ -1199,8 +1221,8 @@ class SshBackend(BackendProtocol):
             return GlobResult(error=BackendError(code=ErrorCode.IO_ERROR, message=f"glob 错误(exit {exit_code}): {err or out}"))
 
         try:
-            data = _json.loads(out.strip())
-        except _json.JSONDecodeError:
+            data = json.loads(out.strip())
+        except json.JSONDecodeError:
             return GlobResult(error=BackendError(code=ErrorCode.INVALID, message=f"glob 返回异常: {out[:200]}"))
 
         if isinstance(data, dict) and "error" in data:
@@ -1768,147 +1790,3 @@ class SshBackend(BackendProtocol):
                 )
         return results
 
-
-# ---------------------------------------------------------------------------
-# Module-level helpers
-# ---------------------------------------------------------------------------
-
-
-def _apply_glob_filter(
-    matches: list[GrepMatch],
-    remote_root: str,
-    glob_pattern: str,
-) -> list[GrepMatch]:
-    """Filter grep matches by POSIX glob pattern on the relative path.
-
-    Each match's path is a physical remote path.  We strip *remote_root*
-    to get a relative path and then apply POSIX glob matching (``*``
-    does not cross ``/``, ``**`` matches any depth).
-    """
-    from mambo_agents.backends.utils import fnmatch_path
-
-    prefix = remote_root.rstrip("/") + "/"
-    filtered: list[GrepMatch] = []
-    for m in matches:
-        path_str = str(m.path)
-        if path_str.startswith(prefix):
-            rel = path_str[len(prefix):]
-        elif path_str == remote_root.rstrip("/"):
-            rel = ""
-        else:
-            continue
-        if fnmatch_path(rel, glob_pattern):
-            filtered.append(m)
-    return filtered
-
-    def download_files(
-        self,
-        paths: list[VirtualPath],
-    ) -> list[DownloadFileResult]:
-        """Download multiple files as raw bytes from the remote server."""
-        results: list[DownloadFileResult] = []
-        for path in paths:
-            try:
-                remote = self._resolve(path)
-                try:
-                    attr = self._sftp.stat(remote)
-                except FileNotFoundError:
-                    results.append(
-                        DownloadFileResult(
-                            path=path, content=None, error=BackendError(code=ErrorCode.NOT_FOUND, path=path, message="文件不存在")
-                        )
-                    )
-                    continue
-
-                if self._attr_is_dir_maybe(attr.st_mode):
-                    results.append(
-                        DownloadFileResult(
-                            path=path, content=None, error=BackendError(code=ErrorCode.IS_DIR, path=path, message="目标是目录")
-                        )
-                    )
-                    continue
-
-                with self._sftp.open(remote, "rb") as f:
-                    raw = f.read()
-                results.append(
-                    DownloadFileResult(path=path, content=raw)
-                )
-            except OSError as e:
-                results.append(
-                    DownloadFileResult(path=path, content=None, error=BackendError(code=ErrorCode.IO_ERROR, path=path, message=str(e)))
-                )
-            except Exception as e:
-                results.append(
-                    DownloadFileResult(
-                        path=path,
-                        content=None,
-                        error=BackendError(code=ErrorCode.INVALID, path=path, message=f"{type(e).__name__}: {e}"),
-                    )
-                )
-        return results
-
-
-# ---------------------------------------------------------------------------
-# Module-level helpers
-# ---------------------------------------------------------------------------
-
-
-def _apply_glob_filter(
-    matches: list[GrepMatch],
-    remote_root: str,
-    glob_pattern: str,
-) -> list[GrepMatch]:
-    """Filter grep matches by POSIX glob pattern on the relative path.
-
-    Each match's path is a physical remote path.  We strip *remote_root*
-    to get a relative path and then apply POSIX glob matching (``*``
-    does not cross ``/``, ``**`` matches any depth).
-    """
-    from mambo_agents.backends.utils import fnmatch_path
-
-    prefix = remote_root.rstrip("/") + "/"
-    filtered: list[GrepMatch] = []
-    for m in matches:
-        path_str = str(m.path)
-        if path_str.startswith(prefix):
-            rel = path_str[len(prefix):]
-        elif path_str == remote_root.rstrip("/"):
-            rel = ""
-        else:
-            continue
-        if fnmatch_path(rel, glob_pattern):
-            filtered.append(m)
-    return filtered
-
-
-# ---------------------------------------------------------------------------
-# Module-level helpers
-# ---------------------------------------------------------------------------
-
-
-def _apply_glob_filter(
-    matches: list[GrepMatch],
-    remote_root: str,
-    glob_pattern: str,
-) -> list[GrepMatch]:
-    """Filter grep matches by POSIX glob pattern on the relative path.
-
-    Each match's path is a physical remote path.  We strip *remote_root*
-    to get a relative path and then apply POSIX glob matching (``*``
-    does not cross ``/``, ``**`` matches any depth).
-    """
-    from mambo_agents.backends.utils import fnmatch_path
-
-    prefix = remote_root.rstrip("/") + "/"
-    filtered: list[GrepMatch] = []
-    for m in matches:
-        path_str = str(m.path)
-        if path_str.startswith(prefix):
-            rel = path_str[len(prefix):]
-        elif path_str == remote_root.rstrip("/"):
-            rel = ""
-        else:
-            continue
-        if fnmatch_path(rel, glob_pattern):
-            filtered.append(m)
-    return filtered

@@ -40,12 +40,12 @@ Usage::
 from __future__ import annotations
 
 import asyncio
+import enum
 import logging
 import uuid
 import warnings
-from collections.abc import Awaitable, Callable, Iterable
+from collections.abc import Awaitable, Callable
 from datetime import datetime, timezone
-from functools import partial
 from typing import Annotated, Any
 
 from langchain.agents.middleware.summarization import (
@@ -65,6 +65,7 @@ from langchain.agents.middleware.types import (
     ResponseT,
 )
 from langgraph.config import get_config
+from langgraph.runtime import Runtime
 from langgraph.typing import ContextT
 from langgraph.types import Command
 from langchain_core.exceptions import ContextOverflowError
@@ -75,10 +76,6 @@ from langchain_core.messages import (
     ToolMessage,
     get_buffer_string,
 )
-from langchain_core.messages.utils import (
-    convert_to_messages,
-    count_tokens_approximately,
-)
 from langchain.chat_models import BaseChatModel, init_chat_model
 from pydantic import BaseModel, ConfigDict, Field
 from typing_extensions import NotRequired, TypedDict
@@ -86,6 +83,7 @@ from typing_extensions import NotRequired, TypedDict
 from mambo_agents.backends.protocol import BackendProtocol
 from mambo_agents.backends.schemas import VirtualPath
 from mambo_agents.middleware.patch_tool_calls import _unwrap_overwrite
+from mambo_agents.middleware.utils._tokens import _build_default_token_counter
 
 logger = logging.getLogger(__name__)
 
@@ -204,121 +202,28 @@ conversation after summarization — this section is critical for continuing exe
 
 
 # ---------------------------------------------------------------------------
-# Token counter construction (CJK-aware, no model-name heuristic)
+# Summarization mode
 # ---------------------------------------------------------------------------
 
-# Default chars-per-token ratios for language-aware token estimation.
-# These control how `count_tokens_approximately` converts character counts
-# into approximate token counts.  English defaults to ~4 chars/token;
-# CJK text (Chinese / Japanese / Korean) is denser — each character is
-# typically 1–2 tokens in modern subword tokenizers.
-_DEFAULT_EN_CHARS_PER_TOKEN: float = 4.0
-# Conservative estimate for CJK text — most modern tokenizers encode
-# ~1.5–2 CJK characters per token (e.g. o200k_base ≈ 1.8, cl100k ≈ 1.5).
-_DEFAULT_CJK_CHARS_PER_TOKEN: float = 1.8
 
-# Unicode blocks treated as "CJK" for ratio estimation.
-_CJK_BLOCKS: list[tuple[int, int]] = [
-    (0x4E00, 0x9FFF),  # CJK Unified Ideographs
-    (0x3400, 0x4DBF),  # CJK Unified Ideographs Extension A
-    (0x3000, 0x303F),  # CJK Symbols & Punctuation
-    (0xFF00, 0xFFEF),  # Halfwidth & Fullwidth Forms
-    (0xF900, 0xFAFF),  # CJK Compatibility Ideographs
-    (0x2F800, 0x2FA1F),  # CJK Compatibility Ideographs Supplement
-]
+class SummarizationMode(str, enum.Enum):
+    """Controls when summarization is triggered during an agent run.
 
-# Cap on characters scanned for language-ratio estimation so we don't
-# linearly scan an entire massive conversation on every token-count call.
-_MAX_RATIO_SCAN_CHARS: int = 50_000
-
-
-def _detect_cjk_ratio(messages: Iterable) -> float:
-    """Estimate what fraction of the message content is CJK.
-
-    Scans the first ``_MAX_RATIO_SCAN_CHARS`` characters across all messages
-    and returns the ratio of CJK characters to total characters.
-
-    Returns:
-        A float in ``[0.0, 1.0]``.  Returns ``0.0`` if no characters were scanned
-        (empty messages).
+    Attributes:
+        per_astream: Summarization happens **once** in ``before_agent``,
+            before the agent execution starts.  No further checks occur
+            during the entire ``astream`` / ``invoke`` cycle.  This is the
+            default — it avoids redundant summarization calls when the
+            agent loops through multiple model invocations (e.g. tool-use
+            cycles).
+        per_model_call: Summarization is checked on **every** model call
+            via ``wrap_model_call``.  Useful when the agent may accumulate
+            a large volume of messages within a single ``astream`` run and
+            needs mid-stream compaction.
     """
-    total = 0
-    cjk = 0
 
-    for msg in convert_to_messages(messages):
-        content = msg.content
-        if isinstance(content, str):
-            for ch in content:
-                if total >= _MAX_RATIO_SCAN_CHARS:
-                    break
-                total += 1
-                if _is_cjk_char(ch):
-                    cjk += 1
-        elif isinstance(content, list):
-            for block in content:
-                text = block.get("text", "") if isinstance(block, dict) else ""
-                for ch in text:
-                    if total >= _MAX_RATIO_SCAN_CHARS:
-                        break
-                    total += 1
-                    if _is_cjk_char(ch):
-                        cjk += 1
-                if total >= _MAX_RATIO_SCAN_CHARS:
-                    break
-        if total >= _MAX_RATIO_SCAN_CHARS:
-            break
-
-    return cjk / total if total > 0 else 0.0
-
-
-def _is_cjk_char(ch: str) -> bool:
-    """Return ``True`` if *ch* (single character) is in a CJK Unicode block."""
-    cp = ord(ch)
-    return any(lo <= cp <= hi for lo, hi in _CJK_BLOCKS)
-
-
-def _build_default_token_counter(
-    chars_per_token: float | None = None,
-) -> TokenCounter:
-    """Build a model-agnostic token counter.
-
-    Unlike langchain's ``_get_approximate_token_counter``, this builder:
-
-    - Does **not** inspect the model name — avoids fragile heuristics.
-    - When ``chars_per_token`` is specified, uses that value directly.
-    - When ``chars_per_token`` is ``None``, auto-detects the CJK ratio
-      from message content and blends ``_DEFAULT_EN_CHARS_PER_TOKEN`` with
-      ``_DEFAULT_CJK_CHARS_PER_TOKEN`` accordingly.
-
-    Args:
-        chars_per_token: Explicit characters-per-token ratio.
-            ``None`` means auto-detect from content.
-
-    Returns:
-        A ``TokenCounter`` callable suitable for passing to
-        ``LCSummarizationMiddleware``.
-    """
-    if chars_per_token is not None:
-        return partial(
-            count_tokens_approximately,
-            chars_per_token=float(chars_per_token),
-            use_usage_metadata_scaling=True,
-        )
-
-    def _auto(token_iterable) -> int:
-        messages = list(token_iterable)
-        cjk_ratio = _detect_cjk_ratio(messages)
-        effective_cpt = (
-            _DEFAULT_EN_CHARS_PER_TOKEN * (1.0 - cjk_ratio)
-            + _DEFAULT_CJK_CHARS_PER_TOKEN * cjk_ratio
-        )
-        return count_tokens_approximately(
-            messages,
-            chars_per_token=effective_cpt,
-            use_usage_metadata_scaling=True,
-        )
-
-    return _auto
+    PER_ASTREAM = "per_astream"
+    PER_MODEL_CALL = "per_model_call"
 
 
 # ---------------------------------------------------------------------------
@@ -376,7 +281,7 @@ class SummarizationEvent(TypedDict):
         summary_message: The ``HumanMessage`` containing the merged summary.
         file_path: Backend path where evicted messages were offloaded,
             or ``None`` if offloading failed / was disabled.
-        last_summarized_message: The last ``HumanMessage`` or ``ToolMessage``
+        last_summarized_message: The last real message
             in the summarized (non-preserved) zone, or ``None`` if no such
             message exists.  Useful for consumers that need to know the
             exact boundary of the compaction window.
@@ -385,7 +290,7 @@ class SummarizationEvent(TypedDict):
     cutoff_index: int
     summary_message: HumanMessage
     file_path: str | None
-    last_summarized_message: HumanMessage | ToolMessage | None
+    last_summarized_message: AnyMessage | None
 
 
 class SummarizationState(AgentState):
@@ -415,6 +320,13 @@ class SummarizationConfig(BaseModel):
 
     model_config = ConfigDict(frozen=True, arbitrary_types_allowed=True)
 
+    mode: SummarizationMode = Field(
+        default=SummarizationMode.PER_ASTREAM,
+        description=(
+            "When to trigger summarization.  ``per_astream`` (default) runs once "
+            "in ``before_agent``; ``per_model_call`` checks on every model call."
+        ),
+    )
     model: str | BaseChatModel | None = Field(
         default=None,
         description="Model to use for generating summaries. None = reuse main agent model.",
@@ -519,6 +431,7 @@ class MamboSummarizationMiddleware(AgentMiddleware[SummarizationState, ContextT,
         self,
         model: str | BaseChatModel,
         *,
+        mode: SummarizationMode = SummarizationMode.PER_ASTREAM,
         trigger: ContextSize | list[ContextSize] | None = None,
         keep: ContextSize = ("messages", _DEFAULT_MESSAGES_TO_KEEP),
         summary_prompt: str = DEFAULT_MAMBO_SUMMARY_PROMPT,
@@ -560,6 +473,7 @@ class MamboSummarizationMiddleware(AgentMiddleware[SummarizationState, ContextT,
         self._summary_prompt = summary_prompt
         self._chained_summary_prompt = chained_summary_prompt
 
+        self._mode = mode
         self._token_counter = token_counter
         self._offload_to_backend_flag = offload_to_backend
         self._backend = backend
@@ -969,32 +883,19 @@ class MamboSummarizationMiddleware(AgentMiddleware[SummarizationState, ContextT,
     # Chained summarization (preserves previous summaries)
     # ------------------------------------------------------------------
 
-    def _create_summary(
+    def _build_summary_prompt(
         self,
         messages_to_summarize: list[AnyMessage],
-        *,
-        latest_user_intent_section: str = "",
+        latest_user_intent_section: str,
     ) -> str:
-        """Generate a summary using the configured prompt.
+        """Build the summarization prompt (including token truncation).
 
-        When ``messages_to_summarize`` contains previous summary
-        ``HumanMessage`` objects (tagged ``lc_source="summarization"``),
-        the ``chained_summary_prompt`` is used with ``{previous_summaries}``
-        and ``{messages}``.  Otherwise the ``summary_prompt`` is used
-        with only ``{messages}``.
-
-        Args:
-            messages_to_summarize: Messages to be summarized (may include
-                previous summary messages).
-            latest_user_intent_section: The ``## LATEST USER INTENT``
-                section text, or ``""`` when the preserved zone already
-                contains a user message.
-
-        Returns:
-            The generated summary text.
+        Shared by :meth:`_create_summary` and :meth:`_acreate_summary`
+        — the only difference between them is ``model.invoke`` vs
+        ``model.ainvoke``.
         """
-        prev_summaries = [msg for msg in messages_to_summarize if self._is_summary_message(msg)]
-        non_summary = [msg for msg in messages_to_summarize if not self._is_summary_message(msg)]
+        prev_summaries = [m for m in messages_to_summarize if self._is_summary_message(m)]
+        non_summary = [m for m in messages_to_summarize if not self._is_summary_message(m)]
         buffer = get_buffer_string(non_summary)
 
         if prev_summaries:
@@ -1002,16 +903,20 @@ class MamboSummarizationMiddleware(AgentMiddleware[SummarizationState, ContextT,
                 f"### Previous Summary {i + 1}\n{msg.content}"
                 for i, msg in enumerate(prev_summaries)
             )
-            prompt = self._chained_summary_prompt.format(
-                previous_summaries=prev_text,
-                messages=buffer,
-                latest_user_intent_section=latest_user_intent_section,
-            )
+            template = self._chained_summary_prompt
+            kwargs: dict[str, str] = {
+                "previous_summaries": prev_text,
+                "messages": buffer,
+                "latest_user_intent_section": latest_user_intent_section,
+            }
         else:
-            prompt = self._summary_prompt.format(
-                messages=buffer,
-                latest_user_intent_section=latest_user_intent_section,
-            )
+            template = self._summary_prompt
+            kwargs = {
+                "messages": buffer,
+                "latest_user_intent_section": latest_user_intent_section,
+            }
+
+        prompt = template.format(**kwargs)
 
         # Respect trim_tokens_to_summarize: cap the total prompt tokens.
         max_tokens = self._lc_helper.trim_tokens_to_summarize
@@ -1021,27 +926,32 @@ class MamboSummarizationMiddleware(AgentMiddleware[SummarizationState, ContextT,
                 allowed = max(0, max_tokens - self._token_counter([
                     HumanMessage(content=prompt.split("<messages>")[0]),
                 ]))
-                truncated_buffer = self._truncate_buffer_string(buffer, allowed)
-                if prev_summaries:
-                    prompt = self._chained_summary_prompt.format(
-                        previous_summaries=prev_text,
-                        messages=truncated_buffer,
-                        latest_user_intent_section=latest_user_intent_section,
-                    )
-                else:
-                    prompt = self._summary_prompt.format(
-                        messages=truncated_buffer,
-                        latest_user_intent_section=latest_user_intent_section,
-                    )
+                kwargs["messages"] = self._truncate_buffer_string(buffer, allowed)
+                prompt = template.format(**kwargs)
 
-        response = self._lc_helper.model.invoke(
-            [HumanMessage(content=prompt)],
-            config={"metadata": {"lc_source": "summarization"}},
-        )
+        return prompt
+
+    @staticmethod
+    def _extract_response_content(response: object) -> str:
+        """Extract text content from an LLM response."""
         content = response.content
         if isinstance(content, list):
             return str(content[0]) if content else ""
         return str(content) if content else ""
+
+    def _create_summary(
+        self,
+        messages_to_summarize: list[AnyMessage],
+        *,
+        latest_user_intent_section: str = "",
+    ) -> str:
+        """Generate a summary using the configured prompt (sync)."""
+        prompt = self._build_summary_prompt(messages_to_summarize, latest_user_intent_section)
+        response = self._lc_helper.model.invoke(
+            [HumanMessage(content=prompt)],
+            config={"metadata": {"lc_source": "summarization"}},
+        )
+        return self._extract_response_content(response)
 
     async def _acreate_summary(
         self,
@@ -1050,54 +960,12 @@ class MamboSummarizationMiddleware(AgentMiddleware[SummarizationState, ContextT,
         latest_user_intent_section: str = "",
     ) -> str:
         """Async variant of :meth:`_create_summary`."""
-        prev_summaries = [msg for msg in messages_to_summarize if self._is_summary_message(msg)]
-        non_summary = [msg for msg in messages_to_summarize if not self._is_summary_message(msg)]
-        buffer = get_buffer_string(non_summary)
-
-        if prev_summaries:
-            prev_text = "\n\n".join(
-                f"### Previous Summary {i + 1}\n{msg.content}"
-                for i, msg in enumerate(prev_summaries)
-            )
-            prompt = self._chained_summary_prompt.format(
-                previous_summaries=prev_text,
-                messages=buffer,
-                latest_user_intent_section=latest_user_intent_section,
-            )
-        else:
-            prompt = self._summary_prompt.format(
-                messages=buffer,
-                latest_user_intent_section=latest_user_intent_section,
-            )
-
-        max_tokens = self._lc_helper.trim_tokens_to_summarize
-        if max_tokens is not None:
-            current = self._token_counter([HumanMessage(content=prompt)])
-            if current > max_tokens:
-                allowed = max(0, max_tokens - self._token_counter([
-                    HumanMessage(content=prompt.split("<messages>")[0]),
-                ]))
-                truncated_buffer = self._truncate_buffer_string(buffer, allowed)
-                if prev_summaries:
-                    prompt = self._chained_summary_prompt.format(
-                        previous_summaries=prev_text,
-                        messages=truncated_buffer,
-                        latest_user_intent_section=latest_user_intent_section,
-                    )
-                else:
-                    prompt = self._summary_prompt.format(
-                        messages=truncated_buffer,
-                        latest_user_intent_section=latest_user_intent_section,
-                    )
-
+        prompt = self._build_summary_prompt(messages_to_summarize, latest_user_intent_section)
         response = await self._lc_helper.model.ainvoke(
             [HumanMessage(content=prompt)],
             config={"metadata": {"lc_source": "summarization"}},
         )
-        content = response.content
-        if isinstance(content, list):
-            return str(content[0]) if content else ""
-        return str(content) if content else ""
+        return self._extract_response_content(response)
 
     @staticmethod
     def _truncate_buffer_string(buffer: str, max_tokens: int) -> str:
@@ -1126,6 +994,230 @@ class MamboSummarizationMiddleware(AgentMiddleware[SummarizationState, ContextT,
         return buffer[:cutoff]
 
     # ------------------------------------------------------------------
+    # before_agent (per_astream mode)
+    # ------------------------------------------------------------------
+
+    def before_agent(
+        self, state: SummarizationState, runtime: Runtime[ContextT],
+    ) -> dict[str, Any] | None:
+        """Run summarization once before agent execution starts.
+
+        Only active when ``self._mode == SummarizationMode.PER_ASTREAM``.
+        When the token budget is exceeded, generates a summary and returns
+        a ``_summarization_event`` state update so that ``wrap_model_call``
+        later sees the compacted view without re-checking.
+
+        Args:
+            state: The current agent state (includes ``messages`` and
+                possibly a prior ``_summarization_event``).
+            runtime: The langgraph runtime context.
+
+        Returns:
+            A dict with ``_summarization_event`` if summarization occurred,
+            or ``None`` if no action was needed.
+        """
+        if self._mode != SummarizationMode.PER_ASTREAM:
+            return None
+        return self._summarize_from_state(state, runtime)
+
+    async def abefore_agent(
+        self, state: SummarizationState, runtime: Runtime[ContextT],
+    ) -> dict[str, Any] | None:
+        """Async variant of :meth:`before_agent`."""
+        if self._mode != SummarizationMode.PER_ASTREAM:
+            return None
+        return await self._asummarize_from_state(state, runtime)
+
+    # ------------------------------------------------------------------
+    # Shared summarization-from-state logic
+    # ------------------------------------------------------------------
+
+    def _summarize_from_state(
+        self,
+        state: SummarizationState,
+        runtime: Runtime[ContextT],
+    ) -> dict[str, Any] | None:
+        """Check token budget against state messages and compact if needed.
+
+        Reconstructs effective messages from the prior
+        ``_summarization_event`` (if any), checks the token budget, and
+        performs summarization when the budget is exceeded.
+
+        Args:
+            state: The full agent state.
+            runtime: The langgraph runtime context.
+
+        Returns:
+            ``{"_summarization_event": new_event}`` if summarization
+            occurred, or ``None``.
+        """
+        raw_messages = _unwrap_overwrite(state.get("messages", []))
+        event = state.get("_summarization_event")
+        effective = self._apply_event_to_messages(list(raw_messages), event)
+
+        if not self._should_summarize(effective):
+            return None
+
+        cutoff_index = self._determine_cutoff_index(effective)
+        if cutoff_index <= 0:
+            return None
+
+        messages_to_summarize, preserved_messages = LCSummarizationMiddleware._partition_messages(
+            effective, cutoff_index
+        )
+
+        intent_section = self._resolve_intent_section(preserved_messages)
+
+        if self._offload_to_backend_flag:
+            file_path = self._offload_to_backend(messages_to_summarize, runtime)
+            if file_path is None:
+                msg = (
+                    "Offloading conversation history to backend failed during "
+                    "summarization. Older messages will not be recoverable."
+                )
+                logger.error(msg)
+                warnings.warn(msg, stacklevel=2)
+        else:
+            file_path = None
+
+        summary = self._create_summary(
+            messages_to_summarize,
+            latest_user_intent_section=intent_section,
+        )
+
+        new_messages, new_event = self._finalize_summarization(
+            summary=summary,
+            file_path=file_path,
+            messages_to_summarize=messages_to_summarize,
+            preserved_messages=preserved_messages,
+            state=state,
+            previous_event=event,
+            cutoff_index=cutoff_index,
+        )
+
+        return {"_summarization_event": new_event}
+
+    async def _asummarize_from_state(
+        self,
+        state: SummarizationState,
+        runtime: Runtime[ContextT],
+    ) -> dict[str, Any] | None:
+        """Async variant of :meth:`_summarize_from_state`."""
+        raw_messages = _unwrap_overwrite(state.get("messages", []))
+        event = state.get("_summarization_event")
+        effective = self._apply_event_to_messages(list(raw_messages), event)
+
+        if not self._should_summarize(effective):
+            return None
+
+        cutoff_index = self._determine_cutoff_index(effective)
+        if cutoff_index <= 0:
+            return None
+
+        messages_to_summarize, preserved_messages = LCSummarizationMiddleware._partition_messages(
+            effective, cutoff_index
+        )
+
+        intent_section = self._resolve_intent_section(preserved_messages)
+
+        if self._offload_to_backend_flag:
+            file_path, summary = await asyncio.gather(
+                self._aoffload_to_backend(messages_to_summarize, runtime),
+                self._acreate_summary(
+                    messages_to_summarize,
+                    latest_user_intent_section=intent_section,
+                ),
+            )
+            if file_path is None:
+                msg = (
+                    "Offloading conversation history to backend failed during "
+                    "summarization. Older messages will not be recoverable."
+                )
+                logger.error(msg)
+                warnings.warn(msg, stacklevel=2)
+        else:
+            file_path = None
+            summary = await self._acreate_summary(
+                messages_to_summarize,
+                latest_user_intent_section=intent_section,
+            )
+
+        new_messages, new_event = self._finalize_summarization(
+            summary=summary,
+            file_path=file_path,
+            messages_to_summarize=messages_to_summarize,
+            preserved_messages=preserved_messages,
+            state=state,
+            previous_event=event,
+            cutoff_index=cutoff_index,
+        )
+
+        return {"_summarization_event": new_event}
+
+    # ------------------------------------------------------------------
+    # Shared finalization (hook injection → event construction)
+    # ------------------------------------------------------------------
+
+    def _finalize_summarization(
+        self,
+        summary: str,
+        file_path: str | None,
+        messages_to_summarize: list[AnyMessage],
+        preserved_messages: list[AnyMessage],
+        state: dict[str, Any],
+        previous_event: SummarizationEvent | None,
+        cutoff_index: int,
+    ) -> tuple[list[AnyMessage], SummarizationEvent]:
+        """Build the final summary message and event.
+
+        Shared by all four summarization paths
+        (``_summarize_from_state`` / ``_asummarize_from_state`` /
+        ``_summarize_and_call`` / ``_asummarize_and_call``).
+        """
+        hook_content = self._collect_hook_content(
+            messages_to_summarize=messages_to_summarize,
+            preserved_messages=preserved_messages,
+            state=state,
+        )
+
+        new_messages = self._build_new_messages_with_path(summary, file_path)
+
+        if hook_content:
+            summary_msg = new_messages[0]
+            base = (
+                f"{summary_msg.content}"
+                f"\n\n{_SUMMARY_HOOK_SEPARATOR}\n{hook_content}"
+            )
+            new_messages = [
+                HumanMessage(
+                    content=base,
+                    additional_kwargs={"lc_source": "summarization"},
+                )
+            ]
+
+        state_cutoff_index = self._compute_state_cutoff(previous_event, cutoff_index)
+        last_msg = self._extract_last_summarized_message(messages_to_summarize)
+
+        new_event: SummarizationEvent = {
+            "cutoff_index": state_cutoff_index,
+            "summary_message": new_messages[0],
+            "file_path": file_path,
+            "last_summarized_message": last_msg,
+        }
+
+        return new_messages, new_event
+
+    @staticmethod
+    def _resolve_intent_section(preserved_messages: list[AnyMessage]) -> str:
+        """Return ``_LATEST_USER_INTENT_SECTION`` if preserved zone has no user message."""
+        has_user = any(
+            isinstance(msg, HumanMessage)
+            and msg.additional_kwargs.get("lc_source") != "summarization"
+            for msg in preserved_messages
+        )
+        return _LATEST_USER_INTENT_SECTION if not has_user else ""
+
+    # ------------------------------------------------------------------
     # wrap_model_call
     # ------------------------------------------------------------------
 
@@ -1136,20 +1228,12 @@ class MamboSummarizationMiddleware(AgentMiddleware[SummarizationState, ContextT,
     ) -> ModelResponse | ExtendedModelResponse:
         """Potentially summarize older messages before calling the model.
 
-        1. Reconstruct effective messages from the last
-           ``_summarization_event`` (so chained compactions always start
-           from the correct cursor).
-        2. If the token budget is not exceeded, call *handler* directly.
-        3. If the budget **is** exceeded:
-           a. Compute a safe cutoff index (protecting AI/Tool pairs with
-              local boundary alignment at user messages).
-           b. Partition messages into *to-summarize* and *preserved* groups.
-           c. Generate a summary (chain-aware — preserves prior summaries).
-           d. Rebuild the request with ``[summary_msg, *preserved]``.
-           e. Return ``ExtendedModelResponse`` with a new
-              ``_summarization_event``.
-        4. If a ``ContextOverflowError`` is raised during a normal call,
-           fall back to the summarization path.
+        In ``per_astream`` mode (default), summarization is handled by
+        :meth:`before_agent` — this method only reconstructs effective
+        messages and passes them through.
+
+        In ``per_model_call`` mode, the full summarization check runs here
+        on every model invocation.
 
         Returns:
             ``ModelResponse`` when no summarization occurred, otherwise
@@ -1157,6 +1241,16 @@ class MamboSummarizationMiddleware(AgentMiddleware[SummarizationState, ContextT,
         """
         effective = self._get_effective_messages(request)
 
+        if self._mode == SummarizationMode.PER_ASTREAM:
+            # Summarization already handled in before_agent —
+            # just pass through with effective messages.
+            try:
+                return handler(request.override(messages=effective))
+            except ContextOverflowError:
+                # Fall back to summarization on overflow even in per_astream mode
+                return self._summarize_and_call(request, effective, handler)
+
+        # --- per_model_call mode ---
         if not self._should_summarize(effective):
             try:
                 return handler(request.override(messages=effective))
@@ -1173,6 +1267,13 @@ class MamboSummarizationMiddleware(AgentMiddleware[SummarizationState, ContextT,
         """Async variant of :meth:`wrap_model_call`."""
         effective = self._get_effective_messages(request)
 
+        if self._mode == SummarizationMode.PER_ASTREAM:
+            try:
+                return await handler(request.override(messages=effective))
+            except ContextOverflowError:
+                return await self._asummarize_and_call(request, effective, handler)
+
+        # --- per_model_call mode ---
         if not self._should_summarize(effective):
             try:
                 return await handler(request.override(messages=effective))
@@ -1209,26 +1310,26 @@ class MamboSummarizationMiddleware(AgentMiddleware[SummarizationState, ContextT,
     @staticmethod
     def _extract_last_summarized_message(
         messages: list[AnyMessage],
-    ) -> HumanMessage | ToolMessage | None:
-        """Extract the last ``HumanMessage`` or ``ToolMessage`` from the
-        summarized zone (non-preserved messages).
+    ) -> AnyMessage | None:
+        """Extract the last real message from the summarized zone.
 
-        Walks the message list in reverse and returns the first
-        ``HumanMessage`` (excluding summary markers) or ``ToolMessage``
-        encountered.  Returns ``None`` if no qualifying message exists.
+        Walks the message list in reverse and returns the first message
+        that is **not** a summary marker (``lc_source="summarization"``).
+        This covers ``HumanMessage``, ``AIMessage`` (with or without
+        tool_calls), and ``ToolMessage``.
 
         Args:
             messages: The messages in the summarized (non-preserved) zone.
 
         Returns:
-            The last qualifying message, or ``None``.
+            The last real message in the summarized zone, or ``None``
+            if the zone is empty or contains only summary markers.
         """
         for msg in reversed(messages):
-            if isinstance(msg, HumanMessage) and (
-                msg.additional_kwargs.get("lc_source") != "summarization"
+            if not (
+                isinstance(msg, HumanMessage)
+                and msg.additional_kwargs.get("lc_source") == "summarization"
             ):
-                return msg
-            if isinstance(msg, ToolMessage):
                 return msg
         return None
 
@@ -1289,7 +1390,6 @@ class MamboSummarizationMiddleware(AgentMiddleware[SummarizationState, ContextT,
         cutoff_index = self._determine_cutoff_index(effective_messages)
 
         if cutoff_index <= 0:
-            # Nothing to summarize — messages fit within budget
             response = handler(request.override(messages=effective_messages))
             return ExtendedModelResponse(model_response=response)
 
@@ -1297,17 +1397,8 @@ class MamboSummarizationMiddleware(AgentMiddleware[SummarizationState, ContextT,
             effective_messages, cutoff_index
         )
 
-        # Determine if the preserved zone already contains a user message.
-        # If not, inject LATEST USER INTENT into the summary prompt so the
-        # LLM extracts the current sub-task from the summarized region.
-        has_user_in_preserved = any(
-            isinstance(msg, HumanMessage)
-            and msg.additional_kwargs.get("lc_source") != "summarization"
-            for msg in preserved_messages
-        )
-        intent_section = _LATEST_USER_INTENT_SECTION if not has_user_in_preserved else ""
+        intent_section = self._resolve_intent_section(preserved_messages)
 
-        # Offload evicted messages to backend before summarization (if enabled).
         if self._offload_to_backend_flag:
             file_path = self._offload_to_backend(messages_to_summarize, request.runtime)
             if file_path is None:
@@ -1325,43 +1416,18 @@ class MamboSummarizationMiddleware(AgentMiddleware[SummarizationState, ContextT,
             latest_user_intent_section=intent_section,
         )
 
-        # Collect supplementary content from hooks (e.g. plan list state)
-        hook_content = self._collect_hook_content(
+        new_messages, new_event = self._finalize_summarization(
+            summary=summary,
+            file_path=file_path,
             messages_to_summarize=messages_to_summarize,
             preserved_messages=preserved_messages,
             state=request.state,
+            previous_event=request.state.get("_summarization_event"),
+            cutoff_index=cutoff_index,
         )
-
-        new_messages = self._build_new_messages_with_path(summary, file_path)
-
-        if hook_content:
-            summary_msg = new_messages[0]
-            base = (
-                f"{summary_msg.content}"
-                f"\n\n{_SUMMARY_HOOK_SEPARATOR}\n{hook_content}"
-            )
-            new_messages = [
-                HumanMessage(
-                    content=base,
-                    additional_kwargs={"lc_source": "summarization"},
-                )
-            ]
 
         modified_messages = [*new_messages, *preserved_messages]
         response = handler(request.override(messages=modified_messages))
-
-        # Build state summarization event (absolute index in state["messages"])
-        previous_event = request.state.get("_summarization_event")
-        state_cutoff_index = self._compute_state_cutoff(previous_event, cutoff_index)
-
-        last_msg = self._extract_last_summarized_message(messages_to_summarize)
-
-        new_event: SummarizationEvent = {
-            "cutoff_index": state_cutoff_index,
-            "summary_message": new_messages[0],
-            "file_path": file_path,
-            "last_summarized_message": last_msg,
-        }
 
         return ExtendedModelResponse(
             model_response=response,
@@ -1385,13 +1451,7 @@ class MamboSummarizationMiddleware(AgentMiddleware[SummarizationState, ContextT,
             effective_messages, cutoff_index
         )
 
-        # Determine if the preserved zone already contains a user message.
-        has_user_in_preserved = any(
-            isinstance(msg, HumanMessage)
-            and msg.additional_kwargs.get("lc_source") != "summarization"
-            for msg in preserved_messages
-        )
-        intent_section = _LATEST_USER_INTENT_SECTION if not has_user_in_preserved else ""
+        intent_section = self._resolve_intent_section(preserved_messages)
 
         # Offload to backend and generate summary concurrently — they are
         # independent.  Both coroutines catch all exceptions internally and
@@ -1418,43 +1478,18 @@ class MamboSummarizationMiddleware(AgentMiddleware[SummarizationState, ContextT,
                 latest_user_intent_section=intent_section,
             )
 
-        # Collect supplementary content from hooks (e.g. plan list state)
-        hook_content = self._collect_hook_content(
+        new_messages, new_event = self._finalize_summarization(
+            summary=summary,
+            file_path=file_path,
             messages_to_summarize=messages_to_summarize,
             preserved_messages=preserved_messages,
             state=request.state,
+            previous_event=request.state.get("_summarization_event"),
+            cutoff_index=cutoff_index,
         )
-
-        new_messages = self._build_new_messages_with_path(summary, file_path)
-
-        if hook_content:
-            summary_msg = new_messages[0]
-            base = (
-                f"{summary_msg.content}"
-                f"\n\n{_SUMMARY_HOOK_SEPARATOR}\n{hook_content}"
-            )
-            new_messages = [
-                HumanMessage(
-                    content=base,
-                    additional_kwargs={"lc_source": "summarization"},
-                )
-            ]
 
         modified_messages = [*new_messages, *preserved_messages]
         response = await handler(request.override(messages=modified_messages))
-
-        # Build state summarization event (absolute index in state["messages"])
-        previous_event = request.state.get("_summarization_event")
-        state_cutoff_index = self._compute_state_cutoff(previous_event, cutoff_index)
-
-        last_msg = self._extract_last_summarized_message(messages_to_summarize)
-
-        new_event: SummarizationEvent = {
-            "cutoff_index": state_cutoff_index,
-            "summary_message": new_messages[0],
-            "file_path": file_path,
-            "last_summarized_message": last_msg,
-        }
 
         return ExtendedModelResponse(
             model_response=response,

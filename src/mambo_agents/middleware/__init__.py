@@ -47,6 +47,7 @@ from mambo_agents.middleware.summarization import (
     DEFAULT_MAMBO_SUMMARY_PROMPT,
     MamboSummarizationMiddleware,
     SummarizationConfig,
+    SummarizationMode,
     SummaryHook,
     SummaryHookContext,
 )
@@ -89,6 +90,7 @@ __all__ = [
     "SubAgent",
     "SubAgentMiddleware",
     "SummarizationConfig",
+    "SummarizationMode",
     "SummaryHook",
     "SummaryHookContext",
     "VersionControlConfig",
