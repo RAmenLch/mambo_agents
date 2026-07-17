@@ -247,6 +247,16 @@ class LocalBackend(BackendProtocol):
         return tools
 
     @property
+    def path_mapping_info(self) -> dict[str, str]:
+        wr = self.workspace_root.value
+        return {
+            "workspace_root": wr,
+            "real_root": str(self._cwd),
+            "virtual_prefixes": "",
+            "path_mapping": f"\n- 虚拟路径 `{wr}/` → 真实路径 `{self._cwd}/`",
+        }
+
+    @property
     def description(self) -> str:
         wr = self.workspace_root.value
         os_label = {"win32": "Windows", "darwin": "macOS"}.get(sys.platform, "Unix")

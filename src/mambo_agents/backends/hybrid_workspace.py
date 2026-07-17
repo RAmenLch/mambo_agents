@@ -347,6 +347,17 @@ class HybridWorkspaceBackend(BackendProtocol):
     # ------------------------------------------------------------------
 
     @property
+    def path_mapping_info(self) -> dict[str, str]:
+        wr = self.workspace_root.value
+        real_info = self._real.path_mapping_info
+        return {
+            "workspace_root": wr,
+            "real_root": real_info["real_root"],
+            "virtual_prefixes": f"\n- 额外虚拟前缀：`{self._prefix.normalized}/`（虚拟临时区，不映射到真实文件系统）",
+            "path_mapping": real_info["path_mapping"],
+        }
+
+    @property
     def description(self) -> str:
         wr = self.workspace_root.value
         core_tools = "`ls`, `read`, `write`, `edit`, `grep`, `glob`, `copy`"

@@ -46,7 +46,7 @@ from langgraph.types import Command, Overwrite
 from pydantic import BaseModel, ConfigDict, Field
 
 from mambo_agents.backends.protocol import BackendProtocol
-from mambo_agents.middleware.subagents import CompiledSubAgent, SubAgent, _SubagentSpec
+from mambo_agents.middleware.subagents import CompiledSubAgent, SubAgent, _EXCLUDED_STATE_KEYS, _SubagentSpec
 
 # ---------------------------------------------------------------------------
 # Pydantic models
@@ -416,15 +416,7 @@ def _build_async_task_tool(
         subagent_state = {
             k: v
             for k, v in runtime.state.items()
-            if k
-            not in {
-                "messages",
-                "todos",
-                "structured_response",
-                "skills_metadata",
-                "skills_load_errors",
-                "memory_contents",
-            }
+            if k not in _EXCLUDED_STATE_KEYS
         }
         subagent_state["messages"] = [HumanMessage(content=description)]
 
@@ -739,6 +731,11 @@ def _build_async_cancel_tool(tracker: _AsyncTaskTracker) -> StructuredTool:
         if not cancelled:
             return f"无法取消任务 {task_id}。"
 
+        # Build state update preserving all existing fields
+        state_data = data.model_dump()
+        state_data["status"] = "cancelled"
+        state_data["cancelled_at"] = _utc_now()
+
         msg = (
             f"⚪ 任务取消请求已发送\n\n"
             f"task_id: {task_id}\n"
@@ -748,9 +745,7 @@ def _build_async_cancel_tool(tracker: _AsyncTaskTracker) -> StructuredTool:
         return Command(
             update={
                 "messages": [ToolMessage(msg, tool_call_id=runtime.tool_call_id)],
-                "async_tasks": {
-                    task_id: {"status": "cancelled", "cancelled_at": _utc_now()}
-                },
+                "async_tasks": {task_id: state_data},
             }
         )
 
@@ -874,15 +869,6 @@ ASYNC_TASK_SYSTEM_PROMPT = """## 异步子代理 (async_task / async_status / as
 # ---------------------------------------------------------------------------
 # Subagent construction (shared logic with SubAgentMiddleware)
 # ---------------------------------------------------------------------------
-
-_EXCLUDED_STATE_KEYS = {
-    "messages",
-    "todos",
-    "structured_response",
-    "skills_metadata",
-    "skills_load_errors",
-    "memory_contents",
-}
 
 
 def _build_subagent_specs(

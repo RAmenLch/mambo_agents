@@ -444,9 +444,7 @@ class StoreBackend(BackendProtocol):
                 file_type=file_type, mime_type=_get_mime_type(file_path.normalized),
             )
 
-        lines = content.split("\n")
-        if lines and lines[-1] == "":
-            lines = lines[:-1]
+        lines = content.splitlines(keepends=True)
         total = len(lines)
 
         if total > 0 and offset >= total:
@@ -454,9 +452,8 @@ class StoreBackend(BackendProtocol):
                 error=BackendError(code=ErrorCode.INVALID, path=file_path, message=f"偏移量 {offset} 超过文件长度 ({total} 行)"),
             )
 
-        end = offset + limit if limit is not None else None
-        sliced = lines[offset:end]
-        raw_slice = "\n".join(sliced)
+        sliced = lines[offset : offset + limit] if limit is not None else lines[offset:]
+        raw_slice = "".join(sliced)
         content = (
             format_with_line_numbers(raw_slice, start_line=offset + 1)
             if include_line_numbers else raw_slice

@@ -103,6 +103,23 @@ DEFAULT_REVIEW_AGENT_SYSTEM_PROMPT = """你是一名安全审核专家，负责�
 3. 可以输出文字进行分析推理，但**分析完毕后必须立即调用 `{final_tool_name}`** 提交结论。
 4. **尽量不调用文件系统工具** —— 仅在确实需要检查工作区文件才能判断安全性时才使用工具。
 
+## 路径体系
+
+本项目使用**虚拟路径**与**真实路径**双层体系，你需要理解二者的区别：
+
+### 你使用的工具全部操作在虚拟路径上
+- 你拥有的只读工具（ls、read、grep、glob）全部接受**虚拟路径**参数。
+- 你审查的 tool call 中，`file_path` / `path` 等参数也是**虚拟路径**。
+- 常见虚拟路径前缀：`{workspace_root}/`（项目工作区）{virtual_prefixes}
+
+### 虚拟路径 ↔ 真实路径映射
+- 虚拟路径 `{workspace_root}/` 映射到真实路径 `{real_root}/`。{path_mapping}
+
+### 审查涉及真实路径的 tool call 时的注意事项
+- 当你审查 `execute` 等使用真实路径的 tool call 时，如果需要检查其执行的脚本内容，应使用 **read 工具读取脚本的虚拟路径**（脚本在虚拟文件系统上可访问）。
+- **脚本内容中出现的路径是真实路径**（因为脚本最终在真实系统上运行）。你需要对照上述映射关系判断这些真实路径是否落在项目工作区范围内。
+- 对真实系统中的敏感路径（如 `/etc/`、`/root/`、`C:\\Windows\\`、`~/.ssh/` 等）保持高度警惕。
+
 ## 安全判断指南
 
 ### 通常 SAFE（is_safe=True）：
@@ -176,6 +193,10 @@ def create_review_agent(
         system_prompt = DEFAULT_REVIEW_AGENT_SYSTEM_PROMPT.format(
             max_steps=max_steps,
             final_tool_name=_FINAL_TOOL_NAME,
+            workspace_root="/workspace",
+            real_root="(未知)",
+            virtual_prefixes="",
+            path_mapping="",
         )
 
     return _langchain_create_agent(

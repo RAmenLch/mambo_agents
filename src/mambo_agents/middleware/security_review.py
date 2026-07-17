@@ -519,7 +519,22 @@ class AutoSecurityReviewMiddleware(
         )
 
         # ---------- which tools get AI-reviewed ----------
-        self._review_tools: frozenset[str] | Literal["all"] = review_tools
+        # Normalize: "all" → every tool in interrupt_on; otherwise validate
+        # that review_tools is a subset of interrupt_on.
+        interrupt_keys = frozenset(resolved.keys())
+        if review_tools == "all":
+            self._review_tools: frozenset[str] = interrupt_keys
+        elif isinstance(review_tools, frozenset):
+            unknown = review_tools - interrupt_keys
+            if unknown:
+                raise ValueError(
+                    f"review_tools contains tools not in interrupt_on: "
+                    f"{sorted(unknown)}. review_tools must be a subset of "
+                    f"interrupt_on keys."
+                )
+            self._review_tools: frozenset[str] = review_tools
+        else:
+            self._review_tools: frozenset[str] = frozenset()
 
         # ---------- notify-on-pass ----------
         self._notify_on_pass: bool = notify_on_pass
@@ -563,19 +578,26 @@ class AutoSecurityReviewMiddleware(
                 extra = list(self._agent_backend.tools)
             tools = core_tools + extra
 
-        # Inject backend description into prompt so the review agent
-        # understands path routing (e.g. HybridWorkspaceBackend's
-        # .mambo prefix, workspace_root, etc.).
-        # Use the agent-specific prompt by default, but let user-provided
-        # system_prompt override.
+        # Build system prompt with path-mapping info from the backend
         from mambo_agents.middleware.review_agent import DEFAULT_REVIEW_AGENT_SYSTEM_PROMPT
 
         if self._review_system_prompt != DEFAULT_SECURITY_REVIEW_SYSTEM_PROMPT:
             _prompt = self._review_system_prompt
         else:
+            path_info = (
+                self._agent_backend.path_mapping_info
+                if self._agent_backend is not None
+                else {
+                    "workspace_root": "/workspace",
+                    "real_root": "(未知)",
+                    "virtual_prefixes": "",
+                    "path_mapping": "",
+                }
+            )
             _prompt = DEFAULT_REVIEW_AGENT_SYSTEM_PROMPT.format(
                 max_steps=self._agent_max_steps,
                 final_tool_name="submit_review_verdict",
+                **path_info,
             )
         if self._agent_backend is not None:
             _prompt += (
@@ -976,8 +998,6 @@ class AutoSecurityReviewMiddleware(
 
     def _should_ai_review(self, tool_name: str) -> bool:
         """Return ``True`` if *tool_name* should get AI-reviewed."""
-        if self._review_tools == "all":
-            return tool_name in self._interrupt_on
         return tool_name in self._review_tools
 
     @staticmethod

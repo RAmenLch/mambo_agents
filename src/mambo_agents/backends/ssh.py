@@ -467,6 +467,16 @@ class SshBackend(BackendProtocol):
         return tools
 
     @property
+    def path_mapping_info(self) -> dict[str, str]:
+        wr = self.workspace_root.value
+        return {
+            "workspace_root": wr,
+            "real_root": str(self._remote_root),
+            "virtual_prefixes": "",
+            "path_mapping": f"\n- 虚拟路径 `{wr}/` → 远程真实路径 `{self._remote_root}/`",
+        }
+
+    @property
     def description(self) -> str:
         wr = self.workspace_root.value
         py3_note = (
@@ -903,14 +913,14 @@ class SshBackend(BackendProtocol):
         result = self._grep_remote(pattern_escaped, remote_escaped, regex)
         if result.error is None:
             if glob and result.matches:
-                result = GrepResult(matches=self._apply_glob_filter(result.matches, remote, glob))
+                result = GrepResult(matches=self._apply_glob_filter(result.matches, self.workspace_root.value, glob))
             return result
 
         # 3) python3 last resort — post-filter with POSIX glob
         if self._has_python3:
             result = self._grep_python(pattern, remote, regex)
             if glob and result.matches:
-                result = GrepResult(matches=self._apply_glob_filter(result.matches, remote, glob))
+                result = GrepResult(matches=self._apply_glob_filter(result.matches, self.workspace_root.value, glob))
             return result
 
         return result
@@ -1123,24 +1133,25 @@ class SshBackend(BackendProtocol):
     @staticmethod
     def _apply_glob_filter(
         matches: list[GrepMatch],
-        remote_root: str,
+        workspace_root: str,
         glob_pattern: str,
     ) -> list[GrepMatch]:
         """Filter grep matches by POSIX glob pattern on the relative path.
 
-        Each match's path is a physical remote path.  We strip *remote_root*
-        to get a relative path and then apply POSIX glob matching (``*``
-        does not cross ``/``, ``**`` matches any depth).
+        Each match's path is a **virtual** path (already converted from
+        physical remote path).  We strip *workspace_root* to get a relative
+        path and then apply POSIX glob matching (``*`` does not cross
+        ``/``, ``**`` matches any depth).
         """
         from mambo_agents.backends.utils import fnmatch_path
 
-        prefix = remote_root.rstrip("/") + "/"
+        prefix = workspace_root.rstrip("/") + "/"
         filtered: list[GrepMatch] = []
         for m in matches:
             path_str = str(m.path)
             if path_str.startswith(prefix):
                 rel = path_str[len(prefix):]
-            elif path_str == remote_root.rstrip("/"):
+            elif path_str == workspace_root.rstrip("/"):
                 rel = ""
             else:
                 continue

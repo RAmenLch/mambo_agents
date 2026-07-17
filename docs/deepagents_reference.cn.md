@@ -19,7 +19,7 @@
 | 对话摘要 | `deepagents.middleware.summarization.SummarizationMiddleware` | 上下文窗口压缩 |
 | 工具调用修复 | `deepagents.middleware.patch_tool_calls.PatchToolCallsMiddleware` | 悬空工具调用修补 |
 
-> **重要提示**：本项目并非 deepagents 的 fork 或分支，而是在其架构思想指导下独立实现的 Agent 框架。代码层面仅在早期原型阶段参考了部分实现，当前版本的所有代码均为独立编写。
+> **重要提示**：本项目并非 deepagents 的 fork 或分支，而是在其架构思想指导下实现的 Agent 框架。部分模块（如 `PatchToolCallsMiddleware`、`SkillsMiddleware`）在 deepagents 同名实现的基础上进行了重构和扩展，其余模块为独立编写。
 
 ---
 
@@ -107,4 +107,4 @@
 
 deepagents 是 Agent 框架领域的优秀开源项目，其**中间件管道 + 后端协议**的架构设计为 Mambo Agents 提供了清晰的蓝图。Mambo Agents 在此基础上进行了以下方向的重构与扩展：强化了安全审查、增加了远程 SSH 操作能力、引入了严格的类型系统，并针对大结果处理、多模型兼容性、计划-摘要协同等问题进行了专项优化。
 
-我们始终怀着感激之情，认可 deepagents 团队对 Agent 基础设施领域的贡献。本项目的所有独特扩展均为面向自身需求的有意选择，而非对 deepagents 设计的否定。
+我们始终怀着感激之情，认可 deepagents 团队对 Agent 基础设施领域的贡献。

@@ -19,7 +19,7 @@ Specifically, we drew architectural ideas from the following deepagents componen
 | Conversation Summarization | `deepagents.middleware.summarization.SummarizationMiddleware` | Context window compaction |
 | Tool Call Patching | `deepagents.middleware.patch_tool_calls.PatchToolCallsMiddleware` | Repairing dangling tool calls |
 
-> **Important:** This project is not a fork or branch of deepagents. It is an independently implemented agent framework guided by deepagents' architectural ideas. At the code level, only the early prototyping stage drew upon portions of the implementation; the current codebase is entirely independently written.
+> **Important:** This project is not a fork or branch of deepagents. It is an agent framework implemented under the guidance of deepagents' architectural ideas. Some modules (e.g. `PatchToolCallsMiddleware`, `SkillsMiddleware`) are refactored and extended from deepagents' implementations of the same name; the remaining modules are independently written.
 
 ---
 
@@ -57,7 +57,6 @@ The differences below do not imply that deepagents' design is "wrong." They refl
 |-----------|------------|--------------|-----------|
 | **Type Safety** | Partial use of TypedDict | ✅ End-to-end Pydantic types (no Dict/Any duck typing) | Strict type control is a core Mambo coding standard |
 | **Routing Backend** | `CompositeBackend` (default + routes dict, arbitrary prefix → arbitrary backend)<br>• Fully flexible routing: `/memories/` → StoreBackend, `/cache/` → StateBackend, any combination<br>• `ls("/")` transparently aggregates all routed backends<br>• `execute()` always delegates to the default backend, determined by `SandboxBackendProtocol` type check | `HybridWorkspaceBackend` (1 real + N virtual, unified `/.mambo/` prefix)<br><br>**Hard constraints:**<br>• Virtual workspace prefix is fixed at `/.mambo/`, cannot be customized to other routing paths<br>• Virtual workspaces only expose 6 core file tools<br>• System prompt explicitly informs the AI of the above constraints<br><br>**Relaxations:**<br>• Built-in `copy` tool supports cross-backend (virtual ↔ real) single-file transfer<br>• Real backend can flexibly provide tools, not limited to just `execute` | `CompositeBackend`'s arbitrary prefix routing provides maximum flexibility, but the AI may bypass the routing layer via `execute()` (e.g. `cat /memories/...`), leading to serious hallucinations; `HybridWorkspaceBackend` uses fixed prefixes + explicit tool whitelist prompts to constrain the AI, while relaxing restrictions on the real backend's tools |
-| **Plugin Discovery** | ✅ `importlib.metadata` entry points (Profile system) | ❌ Not implemented | Current phase focuses on core functionality; plugin system deferred |
 
 ---
 
@@ -108,4 +107,4 @@ A side-by-side mapping of equivalent capabilities:
 
 deepagents is an outstanding open-source project in the Agent framework space. Its **Middleware Pipeline + Backend Protocol** architecture provided a clear blueprint for Mambo Agents. Building on that foundation, Mambo Agents has pursued refactoring and extension in the following directions: strengthened security review, added remote SSH operation capability, introduced a strict type system, and addressed specific concerns around large result handling, multi-model compatibility, and plan-summarization coordination.
 
-We remain grateful for the deepagents team's contributions to Agent infrastructure. All unique extensions in this project are intentional choices made for our own needs, not dismissals of deepagents' design.
+We remain grateful for the deepagents team's contributions to Agent infrastructure.

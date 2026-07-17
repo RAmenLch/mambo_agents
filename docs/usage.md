@@ -7,12 +7,17 @@
 1. [Installation](#1-installation)
 2. [Core Concepts](#2-core-concepts)
 3. [Quick Start](#3-quick-start)
-4. [Agent Factory Functions](#4-agent-factory-functions)
-5. [Backend System](#5-backend-system)
-6. [Middleware Reference](#6-middleware-reference)
-7. [Sub-agent System](#7-sub-agent-system)
-8. [Advanced Usage](#8-advanced-usage)
-9. [API Reference](#9-api-reference)
+4. [Agent Factory Function](#4-agent-factory-function)
+5. [Let Your Agent Control the Environment](#5-let-your-agent-control-the-environment)
+6. [Long Conversation Management](#6-long-conversation-management)
+7. [Task Planning & Tracking](#7-task-planning--tracking)
+8. [Installing Skill Packs](#8-installing-skill-packs)
+9. [Let Your Agent Remember Your Preferences](#9-let-your-agent-remember-your-preferences)
+10. [Security & Human Approval](#10-security--human-approval)
+11. [File Change History & Rollback](#11-file-change-history--rollback)
+12. [Integrating External MCP Tools](#12-integrating-external-mcp-tools)
+13. [Multi-Agent Collaboration](#13-multi-agent-collaboration)
+14. [Advanced Usage](#14-advanced-usage)
 
 ---
 
@@ -21,12 +26,6 @@
 ```bash
 pip install mambo-agents
 ```
-
-Dependencies:
-- Python >= 3.11
-- langchain + langgraph
-- paramiko >= 3.0 (required for SshBackend)
-- wcmatch >= 8.0
 
 ---
 
@@ -38,8 +37,8 @@ Mambo Agents builds on LangGraph, assembling agents via the **factory function +
 
 | Layer | Component | Responsibility |
 |-------|-----------|----------------|
-| **Backend** | `BackendProtocol` | Filesystem abstraction: 6 core operations + extension tools |
-| **Middleware** | `AgentMiddleware` | Cross-cutting concerns: tool registration, summarization, planning, security review |
+| **Backend** | `BackendProtocol` | The agent's "hands": filesystem abstraction providing 6 core operations + extension tools |
+| **Middleware** | `AgentMiddleware` (from langchain) | Cross-cutting concerns: mambo provides 12+ built-in middleware including summarization, planning, skills, memory, security review, version control, MCP integration, etc. |
 | **Agent** | `create_mambo_agent()` | Assembles backend + middleware, returns a compiled LangGraph state graph |
 
 ---
@@ -49,7 +48,7 @@ Mambo Agents builds on LangGraph, assembling agents via the **factory function +
 ### 3.1 Simplest Usage
 
 ```python
-from mambo_agents import create_mambo_agent, StoreBackend
+from mambo_agents import create_mambo_agent
 from langchain_core.messages import HumanMessage
 
 agent = create_mambo_agent("gpt-4o")
@@ -57,9 +56,21 @@ agent = create_mambo_agent("gpt-4o")
 result = agent.invoke({
     "messages": [HumanMessage("Create a Python script that prints Hello World")]
 })
+
+# Check the agent's final response
+print(result["messages"][-1].content)
+# Example output:
+# Created /hello.py:
+# ```python
+# print("Hello World")
+# ```
 ```
 
-### 3.2 Working with a Local File System
+> **Default backend:** When `backend` is not specified, the agent uses `StoreBackend` + `InMemoryStore`.
+> Files are stored in session memory and disappear on process restart. For persistence (e.g. PostgreSQL)
+> or real disk operations, specify `backend=LocalBackend(...)` (see next section).
+
+### 3.2 Working with a Local Filesystem
 
 ```python
 from mambo_agents.backends.local import LocalBackend
@@ -72,58 +83,103 @@ agent = create_mambo_agent(
 result = agent.invoke({
     "messages": [HumanMessage("List all files in the current directory")]
 })
+print(result["messages"][-1].content)
 ```
 
-### 3.3 Human-in-the-Loop Approvals
+### 3.3 Adding Custom Tools
+
+Beyond built-in filesystem tools, the agent can mount any custom tools:
 
 ```python
+from langchain_core.tools import tool
+
+@tool
+def get_weather(city: str) -> str:
+    """Get weather for a specified city"""
+    return f"{city}: Sunny, 25°C"
+
 agent = create_mambo_agent(
     "gpt-4o",
-    interrupt_on={
-        "write": True,   # require approval before writing files
-        "edit": True,    # require approval before editing files
-        "delete": True,  # require approval before deleting files
-    },
+    tools=[get_weather],
 )
+
+result = agent.invoke({
+    "messages": [HumanMessage("Check the weather in Beijing")]
+})
 ```
 
 ### 3.4 Streaming Output
+
+**By node (fires once per completed step):**
 
 ```python
 agent = create_mambo_agent("gpt-4o")
 
 async for event in agent.astream(
     {"messages": [HumanMessage("Analyze the project code structure")]},
-    stream_mode=["updates", "custom"],
+    stream_mode="updates",
 ):
     print(event)
+    # Example output (fires once per completed step):
+    # {'agent': {'messages': [AIMessage(content='Let me first ls the directory structure...')]}}
+    # {'tools': {'messages': [ToolMessage(content='...', name='ls')]}}
+    # {'agent': {'messages': [AIMessage(content='The project contains the following files...')]}}
 ```
 
-When sub-agents are enabled, `stream_mode="custom"` receives real-time progress events from within those sub-agents.
+**Token-by-token streaming (real-time LLM output):**
+
+```python
+async for event in agent.astream(
+    {"messages": [HumanMessage("Explain what a decorator is")]},
+    stream_mode="messages",
+):
+    # event is a tuple of (message_chunk, metadata)
+    msg_chunk, metadata = event
+    if msg_chunk.content:
+        print(msg_chunk.content, end="", flush=True)
+```
+
+> For more streaming modes (e.g. `custom` for receiving sub-agent progress events), see
+> [13.1](#131-synchronous-sub-agents).
 
 ### 3.5 Multi-turn Conversations
+
+The agent uses `thread_id` to distinguish different conversation sessions. Multiple calls under
+the same `thread_id` share filesystem and conversation history:
 
 ```python
 config = {"configurable": {"thread_id": "session-1"}}
 
 # Turn 1
 result1 = agent.invoke(
-    {"messages": [HumanMessage("Create a config.json")]},
+    {"messages": [HumanMessage("Create a config.json with port 8080")]},
     config=config,
 )
 
-# Turn 2 — the agent remembers the file it created
+# Turn 2 — the agent remembers the previously created file and conversation
 result2 = agent.invoke(
-    {"messages": [HumanMessage("Add a port field to config.json")]},
+    {"messages": [HumanMessage("Change the port to 9090")]},
     config=config,
 )
+
+# A different thread_id is a brand-new session
+result3 = agent.invoke(
+    {"messages": [HumanMessage("List all files")]},
+    config={"configurable": {"thread_id": "session-2"}},
+)
+# Result is empty — session-2 is a fresh session, cannot see session-1's files
 ```
+
+> **What `thread_id` does:**
+> - **Conversation history isolation:** conversations with different `thread_id` are invisible to each other
+> - **Filesystem isolation:** `StoreBackend` creates an independent virtual filesystem for each `thread_id`
+> - **If you don't pass `config`:** each call is an independent new session, the agent won't remember previous content
 
 ---
 
-## 4. Agent Factory Functions
+## 4. Agent Factory Function
 
-### 4.1 `create_mambo_agent()` — Fine-grained Mode
+### 4.1 `create_mambo_agent()`
 
 Full parameter signature:
 
@@ -137,14 +193,15 @@ def create_mambo_agent(
     include_general_purpose: bool = False,
     async_subagents: Sequence[SubAgent | CompiledSubAgent] | None = None,
     async_subagent_timeout: float = 3600.0,
-    event_granularity: EventGranularity = "updates",
+    subagent_event_granularity: EventGranularity = "updates",
     middleware: Sequence[AgentMiddleware] | None = None,
-    summarization: SummarizationConfig | None = None,
+    summarization: SummarizationConfig | dict | None = None,
     skills: Sequence[SkillSource] | None = None,
-    memory_sources: list[str] | None = None,
+    memory_sources: list[VirtualPath] | None = None,
     tools: Sequence[BaseTool] | None = None,
     interrupt_on: dict[str, bool | InterruptOnConfig] | None = None,
     security_review: SecurityReviewConfig | None = None,
+    version_control: VersionControlConfig | VersionStore | bool | None = None,
     checkpointer: BaseCheckpointSaver | None = None,
     store: BaseStore | None = None,
     name: str | None = None,
@@ -163,17 +220,21 @@ def create_mambo_agent(
 | Parameter | Type | Default | Description |
 |-----------|------|---------|-------------|
 | `backend` | `BackendProtocol` | `StoreBackend()` | Filesystem backend |
-| `system_prompt` | `str` | built-in default | System prompt |
-| `summarization` | `SummarizationConfig` | `None` | Conversation summarization config |
-| `subagents` | `list` | `None` | Synchronous sub-agent specs |
-| `include_general_purpose` | `bool` | `False` | Add a general-purpose sub-agent |
-| `async_subagents` | `list` | `None` | Async sub-agent specs |
+| `system_prompt` | `str` | built-in default | Custom system prompt |
+| `summarization` | `SummarizationConfig` or `dict` | `None` | Conversation summarization config |
+| `subagents` | `list` | `None` | Synchronous sub-agent list |
+| `include_general_purpose` | `bool` | `False` | Whether to add a general-purpose sub-agent |
+| `async_subagents` | `list` | `None` | Async sub-agent list |
 | `async_subagent_timeout` | `float` | `3600.0` | Timeout for async sub-agents (seconds) |
+| `subagent_event_granularity` | `EventGranularity` | `"updates"` | Streaming granularity for sub-agent custom events |
 | `skills` | `list` | `None` | Skill source paths |
-| `memory_sources` | `list` | `None` | Memory file paths (AGENTS.md list) |
+| `memory_sources` | `list[VirtualPath]` | `None` | Memory file paths |
 | `tools` | `list` | `None` | Extra tools |
-| `interrupt_on` | `dict` | `None` | Tool approval config |
+| `interrupt_on` | `dict` | `None` | Tool approval config. `{"write": True}` for simple enable, or `{"write": {"allowed_decisions": ["approve", "reject"]}}` to limit approval options |
 | `security_review` | `SecurityReviewConfig` | `None` | AI security pre-review config |
+| `version_control` | `VersionControlConfig` / `VersionStore` / `bool` | `None` | Version control config |
+| `checkpointer` | `BaseCheckpointSaver` | `InMemorySaver()` | Checkpoint persistence |
+| `store` | `BaseStore` | `None` | LangGraph Store (for backend persistence) |
 
 **Example:**
 
@@ -193,55 +254,80 @@ agent = create_mambo_agent(
 )
 ```
 
-
-
 ---
 
-## 5. Backend System
+## 5. Let Your Agent Control the Environment
 
-### 5.1 BackendProtocol — Abstract Protocol
+The agent's "hands" — the `backend` parameter determines where the agent can read/write files and execute commands.
 
-Every backend must implement 6 core operations:
+### 5.1 Core Operations
 
-| Method | Description |
-|--------|-------------|
+All backends must implement 6 core operations:
+
+| Operation | Description |
+|-----------|-------------|
 | `ls(path)` | List directory contents (non-recursive) |
 | `read(file_path, offset, limit, include_line_numbers)` | Read file content |
 | `write(file_path, content, overwrite)` | Create / overwrite a file |
 | `edit(file_path, old_str, new_str, replace_all)` | Replace text in a file |
-| `grep(pattern, path, glob)` | Search text content |
+| `grep(pattern, path, glob, regex, offset, limit)` | Search text content |
 | `glob(pattern, path)` | Find files and directories by wildcard pattern |
 
 Each backend can also expose extra tools via its `tools` property (e.g. `tree`, `delete`, `execute`).
 
-### 5.2 StoreBackend — In-memory Filesystem
+> **Path conventions:** All backends use absolute paths starting with `/` (e.g. `/workspace/src/main.py`).
+> Some config parameters (e.g. `memory_sources`) accept `VirtualPath` or plain `str` — the framework
+> auto-converts. `VirtualPath` validates and rejects illegal patterns like `..`, `//`.
+> Import: `from mambo_agents.backends.schemas import VirtualPath`.
 
-Files are stored in LangGraph's `BaseStore` with per-session namespace isolation.
+### 5.2 Virtual Filesystem (StoreBackend)
+
+`StoreBackend` is a virtual filesystem backed by `BaseStore`, LangGraph's key-value store interface.
 
 ```python
 from mambo_agents import StoreBackend
 
+# Default in-memory storage (disappears on process restart)
 backend = StoreBackend(
     initial_files={
         "/config.json": '{"port": 8080}',
         "/README.md": "# My Project",
     }
 )
+
+# Persistent storage (e.g. PostgreSQL)
+from langgraph.store.postgres import PostgresStore
+
+backend = StoreBackend(
+    store=PostgresStore.from_conn_string("postgresql://..."),
+    initial_files={"/config.json": '{"port": 8080}'},
+)
 ```
+
+Common `BaseStore` implementations:
+
+| Implementation | Source | Persistent | Use Case |
+|---------------|--------|:---:|----------|
+| `InMemoryStore` | `langgraph.store.memory` | ❌ | Dev / Testing (default) |
+| `PostgresStore` | `langgraph.store.postgres` | ✅ | Production |
+| Custom `BaseStore` | Implement `BaseStore` interface | Customizable | Integrate existing storage |
+
+> The `store` parameter of `create_mambo_agent()` is `BaseStore`. If not specified, defaults to
+> `InMemoryStore`. For persistence, specify `create_mambo_agent(store=PostgresStore(...))`
+> and the framework automatically passes it to `StoreBackend`.
 
 **Extra tools:** `tree`
 
 **Characteristics:**
-- Session isolation via `(thread_id, "mambo_fs")` namespace
+- Session isolation: different `thread_id` filesystems are independent (like each session having its own virtual disk)
 - Works inside and outside graph context
-- Lightweight, no disk access
 - `thread_id` locked at construction for easy graph-outside usage:
   ```python
   be = StoreBackend(thread_id="my-session")
-  be.upload_files([(path, data)])  # targets "my-session" automatically
+  be.upload_files([(path, data)])  # auto-writes to "my-session"
   ```
 
-### 5.3 LocalBackend — Local Filesystem
+### 5.3 Local Disk (LocalBackend)
 
 Direct access to real disk files, with optional shell command execution.
 
@@ -250,10 +336,10 @@ from mambo_agents.backends.local import LocalBackend
 
 backend = LocalBackend(
     root_dir="/home/user/project",
-    timeout=120,              # shell command timeout (seconds)
-    max_output_bytes=100000,  # max output bytes
-    enable_execute=True,      # enable shell execution (default False)
-    inherit_env=True,         # inherit system environment variables
+    timeout=120,           # Shell command timeout (seconds)
+    max_output_bytes=100000,  # Max output bytes
+    enable_execute=True,   # Enable shell execution (default False)
+    inherit_env=True,      # Inherit system environment variables
 )
 ```
 
@@ -263,9 +349,14 @@ backend = LocalBackend(
 1. Prefer system `rg` (ripgrep) — orders of magnitude faster than Python traversal
 2. Fall back to Python traversal (with file size guard)
 
+> **💡 Install ripgrep for best performance:**
+> - **macOS:** `brew install ripgrep`
+> - **Linux:** `apt install ripgrep` / `dnf install ripgrep`
+> - **Windows:** `winget install BurntSushi.ripgrep.MSVC` or `scoop install ripgrep`
+
 > **⚠️ Security Warning:** `LocalBackend` provides direct filesystem access and shell execution. Consider using `interrupt_on` + `security_review` alongside it.
 
-### 5.4 SshBackend — Remote SSH Filesystem
+### 5.4 Remote Server (SshBackend)
 
 Operate on remote server files via SSH/SFTP.
 
@@ -275,22 +366,26 @@ from mambo_agents.backends.ssh import SshBackend
 backend = SshBackend(
     host="192.168.1.100",
     username="deploy",
-    password="secret123",          # or key_filename="/path/to/key"
+    password="secret123",         # or key_filename="/path/to/key"
     port=22,
     remote_root="/home/deploy/app",
     connect_timeout=30,
     execute_timeout=120,
+    enable_execute=False,         # Enable shell execution (default False)
 )
 ```
 
-**Extra tools:** `tree`, `delete`, `execute`
+**Extra tools:** `tree`, `delete`, `execute` (requires enabling)
 
-**Performance strategy:** Batch operations (`grep`, `glob`, `edit`, `tree`) execute remotely to avoid per-file SFTP round-trips. `edit` completes find-and-replace in a single `python3 -c` invocation on the remote side.
+**Performance strategy:** Batch operations (`grep`, `glob`, `edit`, `tree`) execute remotely to avoid per-file SFTP round-trips. `edit` completes find-and-replace in a single remote `python3 -c` invocation.
 
-### 5.5 HybridWorkspaceBackend — Multi-backend Routing
+> **💡 Install ripgrep on the remote server for best grep performance:**
+> - `apt install ripgrep` / `dnf install ripgrep` / `brew install ripgrep`
+
+### 5.5 Hybrid Workspace (HybridWorkspaceBackend)
 
 One real backend + N virtual workspaces, all routed under `/.mambo/`.
-Each virtual workspace is backed by an independent `StoreBackend` and only supports core protocol tools.
+Each virtual workspace is backed by any `BackendProtocol` implementation (typically `StoreBackend`).
 
 ```python
 from mambo_agents.backends.hybrid_workspace import HybridWorkspaceBackend
@@ -323,27 +418,27 @@ backend = HybridWorkspaceBackend(
 **Path routing rules:**
 - `/.mambo/skills/xxx` → "skills" virtual workspace (prefix stripped, passes `/xxx`)
 - `/.mambo/xxx` → default StoreBackend (prefix stripped, passes `/xxx`)
-- Everything else → real backend
+- `/{workspace_root}/...` → real backend (path rewritten: strip workspace_root, prepend real backend's workspace_root)
+- Other paths (e.g. `/`, `/etc`) are rejected
 
 **Use cases:**
-- Middleware internal storage (large result eviction, conversation history dumps)
+- Internal storage (large result eviction, conversation history dumps)
 - Agent scratch files
 - Sub-agent communication files
 - Independent isolated spaces for multiple skills/modules
 
-### 5.6 Backend Comparison
+### 5.6 Read-only Mode (ReadOnlyBackend)
 
-| Feature | StoreBackend | LocalBackend | SshBackend | HybridWorkspaceBackend |
-|---------|:---:|:---:|:---:|:---:|
-| Storage Location | Memory (Store) | Local Disk | Remote Server | Hybrid |
-| Session Isolation | Automatic (namespace) | Manual | Manual | Automatic (/.mambo/) |
-| Shell Execution | ❌ | Optional | ✅ | ❌ |
-| Delete Operation | ❌ | ✅ | ✅ | ❌ |
-| grep Acceleration | N/A | ripgrep | Remote rg/grep | Inherits delegate |
-| Network Dependency | ❌ | ❌ | ✅ | Optional |
-| Best For | Testing / Prototyping | Local Development | Remote Deployment | Production |
+Wraps any `BackendProtocol`, exposing only safe read-only operations (`ls`, `read`, `grep`, `glob`).
+Used internally by `AutoSecurityReviewMiddleware` in agent review mode.
 
-### 5.7 ReadSummarizer — Large File Read Summaries
+```python
+from mambo_agents import ReadOnlyBackend
+
+safe = ReadOnlyBackend(backend, allowed_extra_tools=frozenset(["tree"]))
+```
+
+### 5.7 Large File Read Summaries (ReadSummarizer)
 
 `BackendProtocol` enforces a `max_read_chars` (default 100,000 chars) upper limit.
 When exceeded, content is replaced with a summary rather than simply being truncated.
@@ -377,51 +472,47 @@ backend = LocalBackend(summarizer=python_summarizer())
 Summarizers are **never injected by default** — users opt in per use case. Files with
 unmatched suffixes fall back to the default behaviour (prompting to re-read with offset + limit).
 
+Multiple summarizers can be combined via `composite_summarizer()`:
+
+```python
+from mambo_agents.read_summarizers import (
+    composite_summarizer,
+    python_summarizer,
+    java_summarizer,
+)
+
+backend = LocalBackend(summarizer=composite_summarizer([
+    python_summarizer(),
+    java_summarizer(),
+]))
+```
+
+### 5.8 Backend Comparison
+
+| Feature | StoreBackend | LocalBackend | SshBackend | HybridWorkspaceBackend |
+|---------|:---:|:---:|:---:|:---:|
+| Storage Location | LangGraph Store (configurable) | Local Disk | Remote Server | Hybrid |
+| Session Isolation | Automatic | Manual | Manual | Automatic (/.mambo/) |
+| Shell Execution | ❌ | Optional | Optional | Depends on real backend |
+| Delete Operation | ❌ | ✅ | ✅ | Depends on real backend |
+| grep Acceleration | N/A | ripgrep | Remote rg/grep | Inherits delegate |
+| Network Dependency | ❌ | ❌ | ✅ | Optional |
+| Best For | Testing / Prototyping | Local Development | Remote Deployment | Production |
+
 ---
 
-## 6. Middleware Reference
+## 6. Long Conversation Management
 
-### 6.1 Middleware Stack Order
-
-`create_mambo_agent()` assembles middleware in a fixed order:
-
-```
-1. BackendToolsMiddleware           ← registers filesystem tools (always enabled)
-2. [SkillsMiddleware]               ← skill loading (when skills is not None)
-3. [MamboMemoryMiddleware]          ← memory loading (when memory_sources is not None)
-4. [MamboSummarizationMiddleware]   ← conversation summarization (when summarization is not None)
-5. [user-defined middleware]        ← passed via middleware parameter
-   ├─ VersionControlMiddleware  ← file versioning
-   ├─ MamboPlanMiddleware       ← task planning
-   └─ ...
-6. [SubAgentMiddleware]             ← synchronous sub-agents
-7. [AsyncSubAgentMiddleware]        ← async sub-agents
-8. [AutoSecurityReviewMiddleware | HumanInTheLoopMiddleware]  ← security review
-9. PatchToolCallsMiddleware         ← fix dangling tool calls (always enabled)
-10. ReorderToolMessagesMiddleware    ← reorder tool messages (always enabled)
-```
-
-### 6.2 BackendToolsMiddleware
-
-**Capabilities:**
-- Registers 6 core filesystem tools (`ls`, `read`, `write`, `edit`, `grep`, `glob`)
-- Merges backend extension tools
-- Auto-evicts oversized tool results to `/.mambo/large_tool_results/`
-
-**Large Result Eviction:** When a tool result exceeds 20,000 tokens, the full content is written to the filesystem and the inline message is replaced with a preview + file path.
-
-### 6.3 MamboSummarizationMiddleware
-
-**Purpose:** Automatically compact long conversation histories to prevent LLM context window overflow.
+Automatically compact long conversation histories to prevent LLM context window overflow.
 
 ```python
 # Configure via create_mambo_agent
 agent = create_mambo_agent(
     "gpt-4o",
     summarization={
-        "trigger": ("tokens", 200000),   # trigger when total exceeds 200k tokens
-        "keep": ("messages", 20),         # keep the last 20 messages uncompacted
-        "offload_to_backend": True,       # persist evicted messages to backend
+        "trigger": ("tokens", 200000),  # trigger when total exceeds 200k tokens
+        "keep": ("messages", 20),        # keep the last 20 messages uncompacted
+        "offload_to_backend": True,      # persist evicted messages to backend
     },
 )
 ```
@@ -433,24 +524,86 @@ agent = create_mambo_agent(
 | tokens | `("tokens", 200000)` | Cumulative token count exceeds threshold |
 | messages | `("messages", 50)` | Message count exceeds threshold |
 
-**Chained Summaries:** When compaction fires multiple times, prior summaries are injected as non-negotiable historical context into the summarization prompt, preventing information loss across rounds.
+**Summarization Modes (`SummarizationMode`):**
 
-**Summary Hooks:** Allow other middleware to inject additional context during summarization. `MamboPlanMiddleware` uses this mechanism to preserve the current plan state during compaction.
+| Mode | Description |
+|------|-------------|
+| `per_astream` | (Default) Summarize once before execution starts. No further checks during the run. |
+| `per_model_call` | Check summarization on every model call, even mid-run. |
 
-### 6.4 MamboPlanMiddleware
+```python
+from mambo_agents import SummarizationMode
 
-**Purpose:** Provides a `write_plans` tool for the agent to maintain a structured TODO list.
+agent = create_mambo_agent(
+    "gpt-4o",
+    summarization={
+        "mode": SummarizationMode.per_model_call,
+        "trigger": ("tokens", 200000),
+        "keep": ("messages", 20),
+    },
+)
+```
+
+**Chained Summaries:** When compaction fires multiple times, prior summaries are injected as
+non-negotiable historical context into the summarization prompt, preventing information loss across rounds.
+
+**Summary Hooks (`SummaryHook`):** Allow other middleware to inject additional context during
+summarization. `MamboPlanMiddleware` uses this mechanism to preserve the current plan state during compaction.
+
+**`SummarizationConfig` full fields:**
+
+```python
+from mambo_agents import SummarizationConfig, SummarizationMode
+
+SummarizationConfig(
+    mode: SummarizationMode = SummarizationMode.per_astream,
+    # SummarizationMode.per_astream (default): summarize once before execution starts
+    # SummarizationMode.per_model_call: check summarization on every model call
+
+    trigger: ("tokens", 200000) | ("messages", 50) | None = None,
+    # Trigger condition — compact when cumulative exceeds threshold. None = never trigger
+
+    keep: ("messages", 20) | ("tokens", 5000) = ("messages", 20),
+    # Keep the most recent messages uncompacted
+
+    model: str | BaseChatModel | None = None,
+    # None = reuse the agent's model
+
+    trim_tokens_to_summarize: int = 4000,
+    # Tokens to review when summarizing
+
+    token_counter: Callable | None = None,
+    # Custom token counter
+
+    chars_per_token: float | None = None,
+    # Custom chars/token ratio
+
+    offload_to_backend: bool = False,
+    # When True, compacted messages are persisted to backend
+
+    backend: BackendProtocol | None = None,
+    # Backend used for offload_to_backend
+
+    summary_prompt: str | None = None,
+    # Custom summarization prompt
+
+    chained_summary_prompt: str | None = None,
+    # Chained summary prompt (used when prior summaries exist)
+
+    summary_hooks: list[SummaryHook] | None = None,
+    # Hooks to inject additional context during summarization
+)
+```
+
+---
+
+## 7. Task Planning & Tracking
+
+Let the agent maintain a structured TODO list and automatically track task progress.
 
 ```python
 from mambo_agents.middleware.planning import MamboPlanMiddleware
 
-# Via create_mambo_agent's middleware parameter
-agent = create_mambo_agent(
-    "gpt-4o",
-    middleware=[MamboPlanMiddleware()],
-)
-
-# Or enable it via create_mambo_agent
 agent = create_mambo_agent(
     "gpt-4o",
     middleware=[MamboPlanMiddleware()],
@@ -467,17 +620,23 @@ from mambo_agents import Plan
 # - status: "pending" | "in_progress" | "completed"
 ```
 
-### 6.5 SkillsMiddleware
+When enabled, the agent gains a `write_plans` tool and will automatically break down complex
+tasks into steps with tracked completion status.
 
-**Purpose:** Progressive disclosure of skills — loaded into the prompt only when the agent needs them.
+---
+
+## 8. Installing Skill Packs
+
+A progressive-disclosure skill system — skills are only loaded into the prompt when the agent needs them,
+avoiding bloated context.
 
 ```python
 agent = create_mambo_agent(
     "gpt-4o",
     skills=[
-        "/skills/user/",                              # user-level skills
-        "/skills/project/",                           # project-level skills
-        ("/repo/.claude/skills", "Project Claude"),   # with custom label
+        "/skills/user/",                           # user-level skills
+        "/skills/project/",                        # project-level skills
+        ("/repo/.claude/skills", "Project Claude"),  # with custom label
     ],
 )
 ```
@@ -515,14 +674,83 @@ license: MIT
 
 Multi-source loading: later-loaded skills override earlier ones with the same name (last wins).
 
-### 6.6 AutoSecurityReviewMiddleware
+---
 
-**Purpose:** Review tool calls for safety before actual execution (or before pausing for human approval), using a cheaper model.
+## 9. Let Your Agent Remember Your Preferences
+
+Loads persistent context from AGENTS.md files and instructs the AI to **write back** new learnings
+during interactions. Unlike skills (on-demand), memory is always loaded and provides persistent,
+evolving context across turns.
+
+```python
+from mambo_agents.backends.schemas import VirtualPath
+
+agent = create_mambo_agent(
+    "gpt-4o",
+    memory_sources=[VirtualPath("/.mambo/memory/AGENTS.md")],
+)
+```
+
+**Workflow:**
+
+```
+Session start → load AGENTS.md → inject into system prompt
+    ↓
+During interaction → AI discovers worth-remembering info → writes back with edit/write
+```
+
+**Memory content format (AGENTS.md):**
+
+AGENTS.md files are standard Markdown with no required structure. Common content:
+- Project overview & architecture notes
+- Build/test commands
+- Code style guidelines
+- User preferences & conventions
+
+**AI self-learning:**
+
+The memory prompt instructs the AI to write back to AGENTS.md when:
+- User explicitly asks to remember something
+- User provides reusable context (coding style, conventions, workflows)
+- User gives feedback and corrections on AI's work
+- **Do NOT** record: temporary info, one-off tasks, casual chat, credentials
+
+**Custom formatting:**
+
+```python
+from mambo_agents.middleware.memory import MamboMemoryMiddleware
+
+def my_formatter(contents: dict[str, str]) -> str:
+    parts = []
+    for path, text in contents.items():
+        parts.append(f"## Source: {path}\n{text}")
+    return "\n---\n".join(parts)
+
+agent = create_mambo_agent(
+    "gpt-4o",
+    middleware=[
+        MamboMemoryMiddleware(
+            backend=StoreBackend(),
+            sources=[VirtualPath("/.mambo/memory/AGENTS.md")],
+            format_prompt=my_formatter,
+        ),
+    ],
+)
+```
+
+---
+
+## 10. Security & Human Approval
+
+Review tool calls for safety before actual execution (or before pausing for human approval),
+using a cheaper model.
 
 Two review modes:
 
 - **llm** (default): single structured-output LLM call per tool call — fast and cheap.
-- **agent**: a dedicated review agent with read-only backend tools that can inspect the workspace before delivering a verdict via ``最终审核结果``. Backend tools (core 6 + ``backend.tools``) get agent review; non-backend user tools fall back to llm review.
+- **agent**: a dedicated review agent with read-only backend tools that can inspect the workspace
+  before delivering a verdict. Backend tools (core 6 + `backend.tools`) get agent review;
+  non-backend user tools fall back to llm review.
 
 ```python
 # Classic HITL (no AI pre-review)
@@ -540,7 +768,7 @@ agent = create_mambo_agent(
     security_review=SecurityReviewConfig(),
 )
 
-# Agent-mode — backend tools reviewed by agent with read-only workspace
+# Agent mode — backend tools reviewed by agent with read-only workspace
 agent = create_mambo_agent(
     "gpt-4o",
     interrupt_on={"write": True, "edit": True, "delete": True},
@@ -555,8 +783,8 @@ agent = create_mambo_agent(
     "gpt-4o",
     interrupt_on={"write": True, "edit": True},
     security_review=SecurityReviewConfig(
-        model="gpt-4o-mini",                     # review model
-        review_tools=frozenset(["write"]),       # only review write
+        model="gpt-4o-mini",                    # review model
+        review_tools=frozenset(["write"]),      # only review write
         system_prompt="You are a security audit expert...",
     ),
 )
@@ -569,21 +797,136 @@ Tool Call → AI Security Review → Safe: pass through
                                → High Risk: pause → Human Approval
 ```
 
-### 6.8 VersionControlMiddleware
+**`SecurityReviewConfig` full fields:**
 
-**Purpose:** Automatically snapshots file changes at checkpoint granularity, with **manual rollback** support. No tools are exposed to the LLM — version data is purely for caller-side consumption (e.g. a web UI). Rollback is triggered explicitly by the user via `restore_files()` — there is no automatic rollback.
+```python
+from mambo_agents.middleware.security_review import SecurityReviewConfig
+
+SecurityReviewConfig(
+    model: str | BaseChatModel | None = None,
+    # None = reuse the agent's model
+    # "gpt-4o-mini" = use a cheap model for review
+
+    system_prompt: str | None = None,
+    # None = use built-in security review prompt
+    # custom = override the review prompt
+
+    review_tools: Literal["all"] | frozenset[str] = "all",
+    # "all" = review all interrupt_on tools
+    # frozenset({"write", "edit"}) = only review specified tools
+
+    notify_on_pass: bool = True,
+    # When True (default), emits custom stream events for every tool call that passes AI review
+
+    review_mode: Literal["llm", "agent"] = "llm",
+    # "llm" = single LLM call per tool call (fast, default)
+    # "agent" = dedicated review agent with read-only backend tools
+    #           Backend tools → agent review; user tools → llm review
+
+    agent_max_steps: int = 5,
+    # Max steps for the review agent (only used in agent mode)
+
+    agent_tools: frozenset[str] | None = None,
+    # Backend tool names to expose to the review agent in agent mode
+    # None = all registered backend tools are available
+)
+```
+
+**Human approval resume protocol:**
+
+When the security review determines a tool call requires human approval, the agent pauses execution.
+You must pass the approval decision via `Command(resume=...)` to resume:
+
+```python
+from langgraph.types import Command
+
+# Resume with approval decisions
+agent.invoke(
+    Command(resume={
+        "source": "mambo_security_review",
+        "decisions": [
+            {"tool_call_id": "call_abc123", "type": "approve"}
+        ]
+    }),
+    config={"configurable": {"thread_id": "session-1"}},
+)
+```
+
+**Decision types:**
+
+| type | Description |
+|------|-------------|
+| `"approve"` | Approve, execute with original parameters |
+| `"edit"` | Execute with modified parameters, must include `"edited_action": {"name": "...", "args": {...}}` |
+| `"reject"` | Reject, do not execute, optionally include `"message"` with reason |
+| `"respond"` | Reject but give feedback to agent, include `"message"` telling agent how to adjust |
+
+> **The `source` field is required** — it lets the system identify this as a security review reply
+> (rather than an interrupt from another component). If omitted, the approval decision is ignored
+> and the tool executes with its original parameters.
+
+---
+
+## 11. File Change History & Rollback
+
+Automatically snapshots file changes at checkpoint granularity, with **manual rollback** support.
+No tools are exposed to the LLM — version data is purely for caller-side consumption (e.g. a web UI).
+Rollback is triggered explicitly by the user via `restore_files()` — there is no automatic rollback.
 
 **Design principles:**
-- Storage via LangGraph `BaseStore` — blobs and indices are persisted through `BaseStore`, using namespaces `(thread_id, "mambo_vc_blobs")` and `(thread_id, "mambo_vc_index")`. Works with `InMemoryStore`, Postgres, or any `BaseStore` implementation
-- Write-time persistence — each `wrap_tool_call` backup writes its blob AND updates the index atomically via `store.put()`. Survives `astream` interruption
+- Storage via LangGraph `BaseStore` — blobs and indices are persisted through `BaseStore`, compatible
+  with `InMemoryStore`, Postgres, or any `BaseStore` implementation
+- Write-time persistence — each mutation backup writes its blob and updates the index atomically.
+  Survives `astream` interruption
 - Incremental — only files actually mutated by the LLM are backed up
 - Content-addressed — SHA256 blobs; identical content stored once
-- **Manual rollback only** — users call `restore_files()` explicitly. No automatic rollback via config
+- **Manual rollback only** — users call `restore_files()` explicitly. No automatic rollback
 
-**Configuration:**
+**Simplest usage:**
+
+```python
+agent = create_mambo_agent(
+    "gpt-4o",
+    backend=LocalBackend(),
+    version_control=True,  # auto-enables version control
+)
+```
+
+**With a custom `VersionStore`:**
 
 ```python
 from langgraph.store.memory import InMemoryStore
+from mambo_agents.middleware.version_control import VersionStore
+
+store = VersionStore(store=InMemoryStore())
+
+agent = create_mambo_agent(
+    "gpt-4o",
+    backend=LocalBackend(),
+    version_control=store,
+)
+```
+
+**With full `VersionControlConfig`:**
+
+```python
+from langgraph.store.memory import InMemoryStore
+from mambo_agents.middleware.version_control import VersionControlConfig
+
+agent = create_mambo_agent(
+    "gpt-4o",
+    backend=LocalBackend(),
+    version_control=VersionControlConfig(
+        store=InMemoryStore(),
+        whitelist_folders=["/workspace/src", "/workspace/tests"],
+        mutating_tool_names=["write", "edit", "delete", "patch"],
+    ),
+)
+```
+
+**Or pass the middleware directly:**
+
+```python
 from mambo_agents.middleware.version_control import (
     BackupEvent,
     VersionStore,
@@ -591,18 +934,16 @@ from mambo_agents.middleware.version_control import (
 )
 
 store = VersionStore(store=InMemoryStore())
+vc_middleware = VersionControlMiddleware(
+    store=store,
+    backend=local_backend,
+    whitelist_folders=["/workspace/src"],
+)
 
 agent = create_mambo_agent(
     "gpt-4o",
-    backend=LocalBackend(),
-    middleware=[
-        VersionControlMiddleware(
-            store=store,
-            backend=...,
-            whitelist_folders=["/workspace/src", "/workspace/tests"],
-            mutating_tool_names=["write", "edit", "delete", "patch"],
-        ),
-    ],
+    backend=local_backend,
+    middleware=[vc_middleware],
 )
 ```
 
@@ -617,113 +958,131 @@ async for mode, chunk in agent.astream(
         print(f"[backup] ckpt={event.checkpoint_id} file={event.file_path}")
 ```
 
-**Parameters:**
-
-| Parameter | Type | Default | Description |
-|-----------|------|---------|-------------|
-| `store` | `VersionStore` | (required) | Version data storage engine (backed by LangGraph `BaseStore`) |
-| `backend` | `BackendProtocol` | (required) | Filesystem backend (for reading/writing file content) |
-| `whitelist_folders` | `list[str]` | `[]` | **Whitelist mode** — only backup and rollback files within these folders. Empty list = no files processed |
-| `mutating_tool_names` | `list[str]` | `["write", "edit", "delete"]` | Declares which tools are "write/change" tools to trigger pre-mutation backups |
-
-**Whitelist mode:**
-
-`whitelist_folders` are absolute virtual paths (e.g. `/workspace/src`). Only files located under whitelisted folders are backed up and available for rollback. An empty list means strict whitelist mode — no files will be processed.
-
-```python
-# Only version-control src/ and tests/ directories
-VersionControlMiddleware(
-    store=store,
-    backend=backend,
-    whitelist_folders=["/workspace/src", "/workspace/tests"],
-)
-
-# Empty whitelist = no files processed
-VersionControlMiddleware(store=store, backend=backend)
-```
-
-**Custom mutating tools:**
-
-Different backends may expose different mutating tool names (e.g. `patch`, `rename`). Declare them via `mutating_tool_names`:
-
-```python
-VersionControlMiddleware(
-    store=store,
-    backend=backend,
-    whitelist_folders=["/workspace"],
-    mutating_tool_names=["write", "edit", "delete", "patch", "rename"],
-)
-```
-
 **Manual rollback via `restore_files()`:**
-
-Rollback is triggered explicitly by the user — call `restore_files()` on the middleware instance outside the graph:
 
 ```python
 # Restore specific files to a previous checkpoint
-middleware.restore_files("thread-1", "cp_abc123", files=["/workspace/src/main.py"])
+vc_middleware.restore_files("thread-1", "cp_abc123", files=["/workspace/src/main.py"])
 
 # Or restore all changed files at that checkpoint
-middleware.restore_files("thread-1", "cp_abc123", all=True)
+vc_middleware.restore_files("thread-1", "cp_abc123", all=True)
 ```
-
-Note: rollback respects whitelist — files outside the whitelist will not be restored.
 
 **Caller-side query API (`VersionStore`):**
 
-Web apps and other callers can query version history via `VersionStore`:
-
 ```python
-from langgraph.store.memory import InMemoryStore
-
 store = VersionStore(store=InMemoryStore())
 
 # All unique files changed across the entire session
 all_files = store.get_all_changed_files("thread-123")
-# → frozenset({"/workspace/src/main.py", "/workspace/tests/test.py"})
 
 # Files changed in the latest turn
 latest_files = store.get_latest_changed_files("thread-123")
-# → ["/workspace/src/main.py"]
 
-# Full snapshot for the latest turn (checkpoint_id, timestamp, file→SHA map)
+# Full snapshot for the latest turn
 snapshot = store.get_latest_snapshot("thread-123")
 print(snapshot.checkpoint_id, snapshot.timestamp, snapshot.file_blobs)
 
 # Per-checkpoint queries
-store.list_snapshots("thread-123")             # all snapshots (chronological)
-store.get_changed_files("thread-123", "cp_x")  # files changed at a checkpoint
-store.get_file("thread-123", "cp_x", "/path")  # file content at a checkpoint
+store.list_snapshots("thread-123")
+store.get_changed_files("thread-123", "cp_x")
+store.get_file("thread-123", "cp_x", "/path")
 ```
 
-**Config model (`VersionControlConfig`):**
+**`VersionControlConfig` full fields:**
 
 ```python
 from mambo_agents.middleware.version_control import VersionControlConfig
-from langgraph.store.memory import InMemoryStore
 
 VersionControlConfig(
-    store=InMemoryStore(),                        # LangGraph BaseStore instance
-    auto_snapshot=True,                           # auto-trigger backups on mutation tool calls
-    whitelist_folders=["/workspace/src"],         # whitelisted directories
-    mutating_tool_names=["write", "edit", "delete"],  # mutating tool names
+    store: BaseStore | None = None,
+    # LangGraph BaseStore for version data persistence.
+    # None = auto-resolved from graph execution context.
+
+    auto_snapshot: bool = True,
+    # When True (default), mutate-tool calls automatically trigger backups.
+
+    whitelist_folders: list[VirtualPath] = [],
+    # Absolute virtual paths to monitor. Empty = no files processed.
+
+    mutating_tool_names: list[str] = ["write", "edit", "delete"],
+    # Tool names that trigger pre-mutation backups.
 )
 ```
 
-### 6.9 PatchToolCallsMiddleware & ReorderToolMessagesMiddleware
+---
 
-These two are always enabled (no configuration needed):
+## 12. Integrating External MCP Tools
 
-- **PatchToolCallsMiddleware:** Fixes dangling tool calls in the message history (e.g. when a human interruption leaves an `AIMessage.tool_calls` without a matching `ToolMessage`)
-- **ReorderToolMessagesMiddleware:** Reorders `ToolMessage` instances to match `AIMessage.tool_calls` order, preventing misinterpretation by multi-modal models
+Integrate MCP (Model Context Protocol) tools into the agent.
+
+**Design:** Uses a disclosure-based approach — only two meta-tools are exposed
+(`mcp_get_tool_description` and `mcp_call_tool`) instead of registering all MCP tools directly.
+This keeps the system prompt compact even when MCP servers expose hundreds of tools;
+the agent looks up descriptions and calls tools on demand.
+
+```python
+from mambo_agents.middleware.mcp import MCPMiddleware, MCPServerConfig
+
+# stdio mode — spawn a local MCP server process
+middleware = MCPMiddleware(
+    servers=[
+        MCPServerConfig(
+            name="filesystem",
+            transport="stdio",
+            command="npx",
+            args=["-y", "@modelcontextprotocol/server-filesystem", "/tmp"],
+        ),
+        MCPServerConfig(
+            name="weather",
+            transport="stdio",
+            command="python",
+            args=["weather_server.py"],
+            env={"API_KEY": "xxx"},
+        ),
+    ],
+)
+
+# HTTP mode — connect to a remote MCP server
+middleware = MCPMiddleware(
+    servers=[
+        MCPServerConfig(
+            name="remote-tools",
+            transport="sse",
+            url="https://example.com/mcp/sse",
+            headers={"Authorization": "Bearer xxx"},
+        ),
+    ],
+)
+
+agent = create_mambo_agent(
+    "gpt-4o",
+    middleware=[middleware],
+)
+```
+
+**`MCPServerConfig` parameters:**
+
+| Parameter | Type | Required | Description |
+|-----------|------|:---:|-------------|
+| `name` | `str` | ✅ | Unique MCP server name |
+| `transport` | `"stdio" \| "sse" \| "streamable_http" \| "websocket"` | ❌ | Transport type, default `"stdio"` |
+| `command` | `str` | for stdio | Executable command (stdio mode) |
+| `args` | `list[str]` | ❌ | Command-line arguments (stdio mode) |
+| `env` | `dict[str, str]` | ❌ | Environment variables (stdio mode) |
+| `cwd` | `str` | ❌ | Working directory (stdio mode) |
+| `url` | `str` | for HTTP | Server URL (sse / streamable_http / websocket) |
+| `headers` | `dict` | ❌ | HTTP headers (HTTP mode) |
+| `timeout` | `float` | ❌ | HTTP timeout (seconds) |
 
 ---
 
-## 7. Sub-agent System
+## 13. Multi-Agent Collaboration
 
-### 7.1 Synchronous Sub-agents
+### 13.1 Synchronous Sub-agents
 
-Sub-agents are **short-lived, isolated agents** invoked via the `task` tool, returning a single result to the main agent.
+Sub-agents are **short-lived, isolated agents** invoked via the `task` tool, returning a single
+result to the main agent.
 
 ```python
 from mambo_agents.middleware.subagents import SubAgent
@@ -756,25 +1115,39 @@ agent = create_mambo_agent(
 | `name` | ✅ | Unique identifier |
 | `description` | ✅ | What it does (the agent uses this to decide when to delegate) |
 | `system_prompt` | ✅ | Instructions for the sub-agent |
-| `model` | ✅ | LLM model to use |
-| `tools` | ✅ | Available tools |
+| `model` | ✅ | LLM model (must be explicitly provided except for general-purpose sub-agents) |
+| `tools` | ❌ | Available tools (default empty) |
 | `middleware` | ❌ | Extra middleware |
-| `interrupt_on` | ❌ | Sub-agent level human-in-the-loop |
+| `interrupt_on` | ❌ | Sub-agent level human approval |
 
 **Pre-compiled sub-agents:**
 
 ```python
-from mambo_agents.middleware.subagents import CompiledSubAgent
+from mambo_agents import create_mambo_agent, CompiledSubAgent
 
-# Any runnable works (must have a 'messages' state key)
-compiled = CompiledSubAgent(
-    name="custom-processor",
-    description="Custom processing pipeline",
-    runnable=my_custom_graph,
+# Build a sub-agent graph with create_mambo_agent
+my_custom_graph = create_mambo_agent(
+    "gpt-4o-mini",
+    system_prompt="You are a code review expert...",
+    tools=[lint_tool],
+)
+
+agent = create_mambo_agent(
+    "gpt-4o",
+    subagents=[
+        CompiledSubAgent(
+            name="code-reviewer",
+            description="Review code for bugs and style issues",
+            runnable=my_custom_graph,  # pre-compiled agent graph
+        ),
+    ],
 )
 ```
 
 **Event Granularity (`EventGranularity`):**
+
+Controls the granularity of sub-agent internal events flowing through `stream_mode="custom"`,
+set via the `subagent_event_granularity` parameter:
 
 | Value | Description |
 |-------|-------------|
@@ -783,32 +1156,43 @@ compiled = CompiledSubAgent(
 | `"values"` | Coarsest — full snapshot at each graph step |
 
 ```python
-# Consuming sub-agent streaming events
+# Receiving sub-agent streaming events
 async for event in agent.astream(
     {"messages": [HumanMessage("Research Python async patterns")]},
-    stream_mode=["updates", "custom"],
+    stream_mode=["updates", "custom"],  # "custom" channel for sub-agent events
 ):
     if event[0] == "custom":
-        custom_data = event[1]
-        # custom_data includes: tool_call_id, subagent_type, chunk, timestamp
+        data = event[1]
+        # data["type"]: "subagent_event"
+        # data["tool_call_id"]: associated task call
+        # data["subagent_type"]: sub-agent name
+        # data["granularity"]: event granularity
+        # data["chunk"]: sub-agent's streaming data
 ```
 
-### 7.2 General-purpose Sub-agent
+### 13.2 General-purpose Sub-agent
 
-Setting `include_general_purpose=True` automatically creates a `general-purpose` sub-agent that shares the main agent's model, backend tools, and system prompt.
+Setting `include_general_purpose=True` automatically creates a `general-purpose` sub-agent that
+shares the main agent's model and backend tools, suitable for isolating complex multi-step subtasks:
 
 ```python
 agent = create_mambo_agent(
     "gpt-4o",
     include_general_purpose=True,
 )
-
-# The agent will auto-delegate complex multi-step tasks to this sub-agent
 ```
 
-### 7.3 Async Sub-agents
+Once created, the agent's system prompt includes `task` tool usage guidance, instructing it to
+**auto-decide** when to delegate complex tasks to the sub-agent (e.g. parallel research,
+large-scale search, etc.).
 
-Unlike sync sub-agents, async sub-agents run in a background thread. `async_task()` returns a `task_id` immediately.
+> **Note:** If you've already manually defined a sub-agent named `general-purpose` in `subagents`,
+> `include_general_purpose=True` will not create a duplicate — your manual definition takes precedence.
+
+### 13.3 Async Sub-agents
+
+Unlike synchronous sub-agents, async sub-agents run in a background thread.
+`async_task()` returns a `task_id` immediately.
 
 ```python
 from mambo_agents.middleware.subagents import SubAgent
@@ -846,15 +1230,20 @@ result = agent.invoke(
 | `async_task()` | Launch a background sub-agent, returns `task_id` immediately |
 | `async_status(task_id)` | Query status: `running` (with progress), `success`, `error`, `cancelled`, `crashed` |
 | `async_list(status_filter)` | List all async tasks (useful when the LLM forgets a task_id) |
+| `async_cancel(task_id)` | Cancel a running task |
 | `report_progress(message, percentage)` | Sub-agent self-reports progress from within |
 
-**Crash recovery:** On restart, tasks that were in `running` state are detected and marked as `crashed`.
+**Crash recovery:** If a persistent checkpointer (e.g. `SqliteSaver`) is used, after a system restart,
+calling `async_status()` or `async_list()` will auto-detect tasks that were in `running` state but
+whose threads have been lost, marking them as `crashed`. The agent can then decide whether to restart.
+
+> With the default `InMemorySaver`, state is not persisted, and all task records are lost on restart.
 
 ---
 
-## 8. Advanced Usage
+## 14. Advanced Usage
 
-### 8.1 Custom System Prompt
+### 14.1 Custom System Prompt
 
 ```python
 agent = create_mambo_agent(
@@ -869,7 +1258,7 @@ agent = create_mambo_agent(
 )
 ```
 
-### 8.2 Adding Custom Tools
+### 14.2 Adding Custom Tools
 
 ```python
 from langchain_core.tools import tool
@@ -885,7 +1274,7 @@ agent = create_mambo_agent(
 )
 ```
 
-### 8.3 Pre-populated Files
+### 14.3 Pre-populated Files
 
 ```python
 agent = create_mambo_agent(
@@ -898,23 +1287,23 @@ agent = create_mambo_agent(
 )
 ```
 
-### 8.4 Custom Summarization Config
+### 14.4 Custom Summarization Config
 
 ```python
 agent = create_mambo_agent(
     "gpt-4o",
     summarization={
-        "trigger": ("tokens", 50000),         # lower threshold, compact more often
-        "keep": ("messages", 10),              # keep fewer messages
-        "model": "gpt-4o-mini",                # use a cheap model for summarization
-        "trim_tokens_to_summarize": 2000,      # review 2000 tokens when summarizing
-        "offload_to_backend": True,            # persist compacted messages
-        "summary_prompt": "Please concisely summarize the key information from the following conversation...",
+        "trigger": ("tokens", 50000),        # lower threshold, compact more often
+        "keep": ("messages", 10),             # keep fewer messages
+        "model": "gpt-4o-mini",               # use a cheap model for summarization
+        "trim_tokens_to_summarize": 2000,     # review 2000 tokens when summarizing
+        "offload_to_backend": True,           # persist compacted messages
+        "summary_prompt": "Please concisely summarize the key information...",
     },
 )
 ```
 
-### 8.5 Checkpoint Persistence
+### 14.5 Checkpoint Persistence
 
 ```python
 from langgraph.checkpoint.sqlite import SqliteSaver
@@ -925,10 +1314,11 @@ agent = create_mambo_agent(
 )
 ```
 
-### 8.6 Skills + Sub-agents Combined
+### 14.6 Skills + Sub-agents Combined
 
 ```python
 from mambo_agents.middleware.subagents import SubAgent
+from mambo_agents.middleware.planning import MamboPlanMiddleware
 
 agent = create_mambo_agent(
     "gpt-4o",
@@ -950,168 +1340,18 @@ agent = create_mambo_agent(
 )
 ```
 
----
-
-## 9. API Reference
-
-### 9.1 Public API Exports
+### 14.7 Version Control + Memory + HITL Combined
 
 ```python
-from mambo_agents import (
-    # Factory functions
-    create_mambo_agent,
-
-    # Backend
-    BackendProtocol,
-    StoreBackend,
-    HybridWorkspaceBackend,
-
-    # Synchronous sub-agents
-    SubAgent,
-    CompiledSubAgent,
-    SubAgentMiddleware,
-    EventGranularity,
-
-    # Async sub-agents
-    AsyncSubAgentMiddleware,
-    AsyncTaskData,
-
-    # Task planning
-    MamboPlanMiddleware,
-    Plan,
-    WritePlansInput,
-
-    # Conversation summarization
-    MamboSummarizationMiddleware,
-    SummarizationConfig,
-    SummaryHook,
-    SummaryHookContext,
-
-    # Skills
-    SkillsMiddleware,
-    SkillMetadata,
-    SkillSource,
-
-    # Memory
-    MamboMemoryMiddleware,
-    MemoryFormatHook,
-
-    # Version Control
-    VersionControlMiddleware,
-    VersionStore,
-    VersionControlConfig,
-)
-```
-
-### 9.2 Backend Protocol Result Types
-
-| Type | Purpose |
-|------|---------|
-| `LsResult` | Directory listing result |
-| `ReadResult` | File read result (text or multimodal) |
-| `WriteResult` | File write result |
-| `EditResult` | File edit result |
-| `GrepResult` | Text search matches |
-| `GlobResult` | File and directory glob matches |
-| `FileInfo` | Single file / directory metadata |
-| `GrepMatch` | Single grep match |
-
-### 9.3 Security Review Config
-
-```python
+from mambo_agents.backends.schemas import VirtualPath
 from mambo_agents.middleware.security_review import SecurityReviewConfig
 
-SecurityReviewConfig(
-    model: str | BaseChatModel | None = None,
-    # None = reuse the agent's model
-    # "gpt-4o-mini" = use a cheap model for review
-
-    review_tools: Literal["all"] | frozenset[str] = "all",
-    # "all" = review all interrupt_on tools
-    # frozenset({"write", "edit"}) = only review specified tools
-
-    system_prompt: str | None = None,
-    # None = use built-in security review prompt
-    # custom = override the review prompt
-
-    review_mode: Literal["llm", "agent"] = "llm",
-    # "llm" = single LLM call per tool call (fast, default)
-    # "agent" = dedicated review agent with read-only backend tools
-    #           Backend tools → agent review; user tools → llm review
-
-    agent_max_steps: int = 5,
-    # Max steps for the review agent (only used in agent mode)
-
-    agent_tools: frozenset[str] | None = None,
-    # Backend tool names to expose to the review agent in agent mode
-    # None = all registered backend tools are available
+agent = create_mambo_agent(
+    "gpt-4o",
+    backend=LocalBackend(root_dir="/tmp/project"),
+    memory_sources=[VirtualPath("/.mambo/memory/AGENTS.md")],
+    version_control=True,
+    interrupt_on={"write": True, "edit": True},
+    security_review=SecurityReviewConfig(model="gpt-4o-mini"),
 )
-```
-
-### 9.4 HITL Interrupt / Resume Protocol
-
-When ``AutoSecurityReviewMiddleware`` escalates tool calls for human review, it
-issues a LangGraph ``interrupt()`` with the following payload structure:
-
-```json
-{
-    "source": "mambo_security_review",
-    "action_requests": [
-        {
-            "name": "write",
-            "args": {"file_path": "/etc/hosts", "content": "..."},
-            "tool_call_id": "call_abc123",
-            "description": null
-        }
-    ],
-    "review_configs": [
-        {
-            "action_name": "write",
-            "tool_call_id": "call_abc123",
-            "allowed_decisions": ["approve", "edit", "reject", "respond"]
-        }
-    ]
-}
-```
-
-Your HITL infrastructure **must** include the ``"source"`` field in the resume
-value when resuming the graph via ``Command(resume=...)``:
-
-```json
-{
-    "source": "mambo_security_review",
-    "decisions": [
-        {"tool_call_id": "call_abc123", "decision": "approve"}
-    ]
-}
-```
-
-The ``source`` field serves two purposes:
-
-1. **Consumer routing:** your UI can distinguish security review interrupts from
-   other interrupt types (e.g. custom ``interrupt()`` calls inside tools).
-2. **Replay detection:** on resume, the middleware inspects the resume value
-   (non-consumingly) to decide whether it should enter the replay branch.
-   Only values carrying ``"source": "mambo_security_review"`` are recognized.
-
-> **Important:** omitting ``"source"`` causes the middleware to treat the resume
-> as "not ours" and transparently pass through.  Human decisions will not be
-> applied and tool calls will execute with their original arguments.
-
-### 9.5 Summarization Config
-
-```python
-SummarizationConfig = {
-    "trigger": ("tokens", 200000) | ("messages", 50) | None,
-    "keep": ("messages", 20) | ("tokens", 5000),
-    "model": str | BaseChatModel | None,
-    "trim_tokens_to_summarize": int,        # default 4000
-    "token_counter": Callable | None,
-    "chars_per_token": float | None,
-    "offload_to_backend": bool,             # default False
-    "backend": BackendProtocol | None,
-    "summary_prompt": str | None,
-    "chained_summary_prompt": str | None,
-    "summary_hooks": list[SummaryHook] | None,
-}
 ```

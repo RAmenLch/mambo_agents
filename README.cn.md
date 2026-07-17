@@ -12,13 +12,15 @@
 
 ## 核心特性
 
-- **多后端文件系统** — `StateBackend`(内存)、`LocalBackend`(本地磁盘)、`SshBackend`(远程SSH)、`HybridWorkspaceBackend`(混合路由)，统一通过 `BackendProtocol` 抽象
-- **子代理系统** — 同步/异步子代理，支持并行调度、流式事件、隔离上下文窗口
-- **对话摘要** — 自动压缩长对话历史，防止上下文窗口溢出，支持链式摘要与后端持久化
-- **任务规划** — `MamboPlanMiddleware` 提供结构化 TODO 列表，与摘要系统深度集成
-- **AI 安全审查** — 工具调用前用廉价模型预审，高风险操作才升级到人工审核
-- **技能系统** — 渐进式披露的技能加载，支持多层来源覆盖
-- **记忆系统** — 从 `AGENTS.md` 加载持久上下文，支持 AI 自主学习和回写
+- **[让 Agent 操控环境](docs/usage.cn.md#5-让-agent-操控环境)** — 多后端文件系统（虚拟/本地/SSH/混合），支持 Shell 命令执行
+- **[超长对话管理](docs/usage.cn.md#6-超长对话管理)** — 自动压缩对话历史，链式摘要防止信息丢失
+- **[任务规划与追踪](docs/usage.cn.md#7-任务规划与追踪)** — 结构化 TODO 列表，自动追踪完成进度
+- **[给 Agent 装技能包](docs/usage.cn.md#8-给-agent-装技能包)** — 渐进式披露，按需加载，多来源覆盖
+- **[让 Agent 记住你的偏好](docs/usage.cn.md#9-让-agent-记住你的偏好)** — AGENTS.md 持久上下文，AI 自主学习回写
+- **[安全与人工审批](docs/usage.cn.md#10-安全与人工审批)** — 廉价模型预审 + 高风险人工审批，灵活的中断恢复协议
+- **[文件修改历史与回滚](docs/usage.cn.md#11-文件修改历史与回滚)** — checkpoint 级增量快照，手动回滚任意版本
+- **[接入外部 MCP 工具](docs/usage.cn.md#12-接入外部-mcp-工具)** — 披露式设计，按需查询，不膨胀上下文
+- **[多 Agent 协作](docs/usage.cn.md#13-多-agent-协作)** — 同步/异步子代理，并行调度，隔离上下文窗口
 ## 快速开始
 
 ```bash
@@ -26,12 +28,12 @@ pip install mambo-agents
 ```
 
 ```python
-from mambo_agents import create_mambo_agent, StateBackend
+from mambo_agents import create_mambo_agent, StoreBackend
 from langchain_core.messages import HumanMessage
 
 agent = create_mambo_agent(
     "gpt-4o",
-    backend=StateBackend(),
+    backend=StoreBackend(),
     include_general_purpose=True,
 )
 result = agent.invoke({"messages": [HumanMessage("创建一个 hello.py 文件")]})

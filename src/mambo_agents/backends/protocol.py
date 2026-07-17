@@ -257,6 +257,25 @@ class BackendProtocol(abc.ABC):
             "(e.g. for edits or patching)."
         )
 
+    @property
+    def path_mapping_info(self) -> dict[str, str]:
+        """Virtual ↔ real path mapping info for the review agent's system prompt.
+
+        Subclasses SHOULD override this to provide accurate mapping data.
+
+        Returns a dict with keys:
+        - ``workspace_root``: virtual root (e.g. ``"/workspace"``)
+        - ``real_root``: real filesystem root (e.g. ``"/home/user/project"``)
+        - ``virtual_prefixes``: extra virtual prefixes description, or ``""``
+        - ``path_mapping``: mapping example, or ``""``
+        """
+        return {
+            "workspace_root": self.workspace_root.value,
+            "real_root": "(未知)",
+            "virtual_prefixes": "",
+            "path_mapping": "",
+        }
+
     # ------------------------------------------------------------------
     # Construction & read-limit configuration
     # ------------------------------------------------------------------

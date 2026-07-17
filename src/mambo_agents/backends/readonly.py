@@ -163,6 +163,10 @@ class ReadOnlyBackend(BackendProtocol):
         ]
 
     @property
+    def path_mapping_info(self) -> dict[str, str]:
+        return self._backend.path_mapping_info
+
+    @property
     def description(self) -> str:
         base = self._backend.description
         return (

@@ -35,6 +35,7 @@ Usage::
 
     from mambo_agents.middleware.version_control import (
         BackupEvent,
+        RestoreFileResult,
         VersionStore,
         VersionControlMiddleware,
     )
@@ -61,7 +62,12 @@ Usage::
             print(f"[backup] ckpt={event.checkpoint_id} file={event.file_path}")
 
     # Restore files manually (outside the graph)
-    middleware.restore_files("t1", "cp_abc123", files=["/workspace/file1.py"])
+    results = middleware.restore_files("t1", "cp_abc123", files=["/workspace/file1.py"])
+    for r in results:
+        if r.success:
+            print(f"[restored] {r.path}")
+        else:
+            print(f"[failed] {r.path}: {r.message}")
 """
 
 from __future__ import annotations
@@ -167,6 +173,26 @@ class BackupEvent(BaseModel):
 
     timestamp: str = Field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
     """ISO-8601 time the backup was created."""
+
+
+class RestoreFileResult(BaseModel):
+    """Per-file result from :meth:`VersionControlMiddleware.restore_files`.
+
+    Each file in the restore operation gets one of these, regardless of
+    whether the restore succeeded or failed.  Failures carry a
+    human-readable ``message`` so the caller can display per-file errors.
+    """
+
+    model_config = ConfigDict(frozen=True)
+
+    path: str
+    """Normalised absolute virtual path that was targeted for restore."""
+
+    success: bool
+    """``True`` if the file content was written to disk successfully."""
+
+    message: str = ""
+    """Human-readable status or error description.  Empty on success."""
 
 
 class VersionControlConfig(BaseModel):
@@ -695,7 +721,7 @@ class VersionControlMiddleware(AgentMiddleware[_AgentState, ContextT, Any]):
         *,
         files: list[str] | None = None,
         all: bool = False,
-    ) -> list[str]:
+    ) -> list[RestoreFileResult]:
         """Restore files to their state as of *checkpoint_id*.
 
         Can be called at any time — inside or outside the graph —
@@ -710,8 +736,9 @@ class VersionControlMiddleware(AgentMiddleware[_AgentState, ContextT, Any]):
                  for *checkpoint_id*.
 
         Returns:
-            List of file paths that were actually restored
-            (whitelist passed + content found + write succeeded).
+            Per-file :class:`RestoreFileResult` entries — one for every
+            file that passed the whitelist.  Check ``result.success``
+            and ``result.message`` for per-file error details.
         """
         if all and files:
             raise ValueError("'all' and 'files' are mutually exclusive")
@@ -724,17 +751,40 @@ class VersionControlMiddleware(AgentMiddleware[_AgentState, ContextT, Any]):
         else:
             paths = files  # type: ignore[assignment]
 
-        restored: list[str] = []
+        results: list[RestoreFileResult] = []
         for path_str in paths:
             vp = VirtualPath(path_str)
             if not self._is_in_whitelist(vp):
+                results.append(RestoreFileResult(
+                    path=vp.normalized,
+                    success=False,
+                    message="Path is outside the whitelist",
+                ))
                 continue
-            content = self._store.get_file(thread_id, checkpoint_id, path_str)
-            if content is not None:
-                self._backend.write(vp, content, overwrite=True)
-                restored.append(path_str)
 
-        return restored
+            content = self._store.get_file(thread_id, checkpoint_id, path_str)
+            if content is None:
+                results.append(RestoreFileResult(
+                    path=vp.normalized,
+                    success=False,
+                    message=f"Backup content not found for checkpoint '{checkpoint_id}'",
+                ))
+                continue
+
+            write_result = self._backend.write(vp, content, overwrite=True)
+            if write_result.error is not None:
+                results.append(RestoreFileResult(
+                    path=vp.normalized,
+                    success=False,
+                    message=str(write_result.error),
+                ))
+            else:
+                results.append(RestoreFileResult(
+                    path=vp.normalized,
+                    success=True,
+                ))
+
+        return results
 
     # ------------------------------------------------------------------
     # Config helpers

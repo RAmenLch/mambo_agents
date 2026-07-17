@@ -99,7 +99,7 @@ def create_mambo_agent(
     tools: Sequence[BaseTool] | None = None,
     interrupt_on: dict[str, bool | InterruptOnConfig] | None = None,
     security_review: SecurityReviewConfig | None = None,
-    version_control: VersionControlConfig | VersionStore | str | bool | None = None,
+    version_control: VersionControlConfig | VersionStore | bool | None = None,
     checkpointer: BaseCheckpointSaver | None = None,
     store: BaseStore | None = None,
     name: str | None = None,
