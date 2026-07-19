@@ -34,7 +34,7 @@ agent = create_mambo_agent(
     backend=StoreBackend(),
     include_general_purpose=True,
 )
-result = agent.invoke({"messages": [HumanMessage("Create a hello.py file")]})
+result = agent.invoke({"messages": [HumanMessage("Create a hello.py file")]}, config={"configurable": {"thread_id": "session-1"}})
 ```
 
 ## Architecture

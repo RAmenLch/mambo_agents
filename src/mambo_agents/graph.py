@@ -21,6 +21,7 @@ from langgraph.checkpoint.base import BaseCheckpointSaver
 from langgraph.checkpoint.memory import InMemorySaver
 from langgraph.graph.state import CompiledStateGraph
 from langgraph.store.base import BaseStore
+from langgraph.store.memory import InMemoryStore
 
 from mambo_agents._version import __version__
 from mambo_agents.backends.protocol import BackendProtocol
@@ -389,14 +390,27 @@ def create_mambo_agent(
     if middleware:
         mw.extend(middleware)
 
+    # ---- Default checkpointer (always on) ----------------------------------
+    # Without a checkpointer, LangGraph state (files, plans, messages, etc.)
+    # is lost between separate ``invoke()`` calls — even with the same
+    # ``thread_id``.  This breaks multi-turn conversations and any scenario
+    # where state must persist across invocations (e.g. sequential agent
+    # calls that share file state).
+    #
+    # We default to ``InMemorySaver`` so that state persists for the
+    # lifetime of the ``CompiledStateGraph`` object.  Users who need
+    # durable persistence should pass their own ``checkpointer``
+    # (e.g. ``SqliteSaver``, ``PostgresSaver``).
+    #
+    # Must be resolved BEFORE the security-review block so that
+    # ``interrupt_on`` (which requires a checkpointer for pause/resume)
+    # can use the default when none is explicitly passed.
+    if checkpointer is None:
+        checkpointer = InMemorySaver()
+
     # ---- Pre-calculate security review parameters (needed for subagents) ---
     _security_review_middleware: AutoSecurityReviewMiddleware | None = None
     if interrupt_on is not None:
-        if checkpointer is None:
-            raise ValueError(
-                "interrupt_on requires a checkpointer (e.g. MemorySaver()). "
-                "Pass `checkpointer=MemorySaver()` to create_mambo_agent."
-            )
         if security_review is not None:
             # ---- AI-assisted security pre-screening ----
             _review_model: str | BaseChatModel = security_review.model or model
@@ -497,19 +511,16 @@ def create_mambo_agent(
     mw.append(PatchToolCallsMiddleware())
     mw.append(ReorderToolMessagesMiddleware())
 
-    # ---- Default checkpointer (always on) ----------------------------------
-    # Without a checkpointer, LangGraph state (files, plans, messages, etc.)
-    # is lost between separate ``invoke()`` calls — even with the same
-    # ``thread_id``.  This breaks multi-turn conversations and any scenario
-    # where state must persist across invocations (e.g. sequential agent
-    # calls that share file state).
-    #
-    # We default to ``InMemorySaver`` so that state persists for the
+    # ---- Default store (always on) -----------------------------------------
+    # StoreBackend needs a LangGraph store to persist files across
+    # invocations.  Without a store, ``get_store()`` returns ``None``
+    # inside tool execution and the backend raises a RuntimeError.
+    # We default to ``InMemoryStore`` so that files persist for the
     # lifetime of the ``CompiledStateGraph`` object.  Users who need
-    # durable persistence should pass their own ``checkpointer``
-    # (e.g. ``SqliteSaver``, ``PostgresSaver``).
-    if checkpointer is None:
-        checkpointer = InMemorySaver()
+    # durable persistence should pass their own ``store``
+    # (e.g. ``AsyncPostgresStore``).
+    if store is None:
+        store = InMemoryStore()
 
     return _langchain_create_agent(
         model=model,

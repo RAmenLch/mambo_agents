@@ -276,7 +276,7 @@ class HybridWorkspaceBackend(BackendProtocol):
 
         Paths that route to a virtual backend or fail validation are left
         unchanged — the real backend's own ``_resolve()`` will raise a
-        :class:`WorkspacePathError` with a descriptive message.
+        :class:`~mambo_agents.backends.schemas.BackendError` with a descriptive message.
         """
         if "path" not in kwargs:
             return None

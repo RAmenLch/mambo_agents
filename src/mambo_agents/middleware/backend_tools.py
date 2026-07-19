@@ -5,6 +5,12 @@
 the backend's corresponding methods, then merges in any extra tools
 from ``backend.tools``.
 
+The ``write`` tool automatically creates any missing parent directories
+— equivalent to ``mkdir -p`` — so you can write to
+``file_path="/workspace/new_dir/sub/file.py"`` even when
+``/workspace/new_dir/`` does not yet exist.  This holds across all
+backends (local, SSH, store, hybrid).
+
 It also intercepts tool results and evicts oversized content to the
 filesystem (``/.mambo/large_tool_results/<tool_call_id>``), replacing
 it with a truncated preview to prevent context-window saturation.
@@ -184,7 +190,10 @@ _CORE_TOOLS = [
         "name": "read",
         "description": (
             "Read the contents of a file. "
-            "For text files, returns content with line numbers. "
+            "For text files, returns plain content by default (no line numbers). "
+            "Set include_line_numbers=True to get cat -n style output with "
+            "each line prefixed by its 1-indexed line number — recommended "
+            "when you need to reference specific lines for editing or patching. "
             "For image, audio, video, and PDF files, returns multimodal "
             "content blocks that the model can understand directly. "
             "Supports offset and limit for pagination (text only)."
@@ -200,12 +209,14 @@ _CORE_TOOLS = [
         "name": "write",
         "description": (
             "Create a new file with the given content. "
+            "Missing parent directories are automatically created (mkdir -p behavior), "
+            "so you can write to a path even if the directory does not exist yet. "
             "By default, fails if the file already exists — read the existing file first, "
             "then use edit to modify it. Set overwrite=True to replace the file content entirely."
         ),
         "method": "write",
         "fields": {
-            "file_path": (VirtualPath, Field(description="Absolute file path")),
+            "file_path": (VirtualPath, Field(description="Absolute file path. Parent directories will be created if they do not exist.")),
             "content": (str, Field(description="Content to write")),
             "overwrite": (bool, Field(default=False, description="If True, replace the file content entirely even if it already exists")),
         },

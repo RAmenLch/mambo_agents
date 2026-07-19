@@ -55,7 +55,7 @@ agent = create_mambo_agent("gpt-4o")
 
 result = agent.invoke({
     "messages": [HumanMessage("创建一个 Python 脚本，打印 Hello World")]
-})
+}, config={"configurable": {"thread_id": "session-1"}})
 
 # 查看 Agent 的最终回复
 print(result["messages"][-1].content)
@@ -82,7 +82,7 @@ agent = create_mambo_agent(
 
 result = agent.invoke({
     "messages": [HumanMessage("列出当前目录的所有文件")]
-})
+}, config={"configurable": {"thread_id": "session-1"}})
 print(result["messages"][-1].content)
 ```
 
@@ -105,7 +105,7 @@ agent = create_mambo_agent(
 
 result = agent.invoke({
     "messages": [HumanMessage("查一下北京的天气")]
-})
+}, config={"configurable": {"thread_id": "session-1"}})
 ```
 
 ### 3.4 流式输出
@@ -118,6 +118,7 @@ agent = create_mambo_agent("gpt-4o")
 async for event in agent.astream(
     {"messages": [HumanMessage("分析项目的代码结构")]},
     stream_mode="updates",
+    config={"configurable": {"thread_id": "session-1"}},
 ):
     print(event)
     # 输出示例（每个节点完成后触发一次）：
@@ -132,6 +133,7 @@ async for event in agent.astream(
 async for event in agent.astream(
     {"messages": [HumanMessage("解释什么是装饰器")]},
     stream_mode="messages",
+    config={"configurable": {"thread_id": "session-1"}},
 ):
     # event 是 (message_chunk, metadata) 的元组
     msg_chunk, metadata = event
@@ -173,7 +175,7 @@ result3 = agent.invoke(
 > **`thread_id` 的作用：**
 > - **对话历史隔离：** 不同 `thread_id` 的对话互不可见
 > - **文件系统隔离：** `StoreBackend` 会为每个 `thread_id` 创建独立的虚拟文件系统
-> - **如果不传 `config`：** 每次调用都是独立的新会话，Agent 不记得之前的内容
+> - **`config` 是必需的：** 每次调用必须传入 `config={"configurable": {"thread_id": "..."}}`
 
 ---
 
@@ -590,6 +592,60 @@ SummarizationConfig(
 )
 ```
 
+### 6.1 获取摘要事件（SummarizationEvent）
+
+当摘要被触发时，中间件会将摘要事件存储在 Agent 的私有状态 `_summarization_event` 中。你可以通过 `stream_mode="values"` 获取完整状态并检查该字段。
+
+**`SummarizationEvent` 结构：**
+
+| 字段 | 类型 | 含义 |
+|------|------|------|
+| `cutoff_index` | `int` | `state["messages"]` 中的绝对索引。此索引**之前**的所有消息已被摘要替换为一条 `summary_message`。 |
+| `summary_message` | `HumanMessage` | LLM 生成的摘要消息，包含三个标准部分：`SESSION INTENT`（会话目标）、`SUMMARY`（关键决策与结论）、`ARTIFACTS`（创建/修改的文件及变更描述）。消息标记有 `additional_kwargs={"lc_source": "summarization"}` 用于链式摘要识别。 |
+| `file_path` | `str \| None` | 当 `offload_to_backend=True` 时，被驱逐的消息会持久化到后端的 `/conversation_history/{thread_id}.md` 路径。`None` 表示未开启 offload 或 offload 失败。 |
+| `last_summarized_message` | `AnyMessage \| None` | 被摘要区域中最后一条真实消息（不含摘要标记消息）。用于了解压缩窗口的精确边界。 |
+
+**检测摘要事件的方式：**
+
+```python
+from mambo_agents.middleware.summarization import SummarizationEvent
+
+# 方式 1：通过 stream_mode="values" 获取 state，检查 _summarization_event
+last_state = None
+for state in agent.stream(
+    {"messages": [HumanMessage("...")]},
+    config=config,
+    stream_mode="values",
+):
+    last_state = state
+
+# 检查是否有摘要事件
+sum_event: SummarizationEvent | None = last_state.get("_summarization_event")
+if sum_event:
+    print(f"摘要已触发！前 {sum_event['cutoff_index']} 条消息已被压缩")
+    print(f"摘要内容：{sum_event['summary_message'].content[:500]}...")
+    print(f"持久化路径：{sum_event.get('file_path')}")
+```
+
+**实时监听摘要事件（检测新触发的摘要）：**
+
+```python
+last_cutoff = -1
+
+for state in agent.stream(
+    {"messages": [HumanMessage("...")]},
+    config=config,
+    stream_mode="values",
+):
+    sum_event = state.get("_summarization_event")
+    if sum_event and sum_event.get("cutoff_index", -1) != last_cutoff:
+        last_cutoff = sum_event["cutoff_index"]
+        print(f"⚡ 新的摘要事件：已压缩 {sum_event['cutoff_index']} 条消息")
+        print(f"   摘要长度：{len(sum_event['summary_message'].content)} 字符")
+```
+
+> **注意：** `_summarization_event` 是私有状态字段（以 `_` 开头），仅供调用方观测使用，不会暴露给 LLM。链式摘要时，之前的摘要会自动注入到新的摘要提示词中，确保信息不丢失。
+
 ---
 
 ## 7. 任务规划与追踪
@@ -608,7 +664,7 @@ agent = create_mambo_agent(
 **计划数据模型：**
 
 ```python
-from mambo_agents import Plan
+from mambo_agents.middleware.planning import Plan
 
 # 每个计划项包含两个字段：
 # - content: 任务描述
@@ -616,6 +672,53 @@ from mambo_agents import Plan
 ```
 
 启用后，Agent 会获得一个 `write_plans` 工具，在执行复杂任务时自动拆分步骤并追踪完成状态。
+
+**获取计划状态的方式：**
+
+```python
+from mambo_agents.middleware.planning import Plan
+
+# 方式 1：invoke 后从返回值中读取 plans
+result = agent.invoke(
+    {"messages": [HumanMessage("帮我创建项目骨架...")]},
+    config=config,
+)
+plans: list[Plan] | None = result.get("plans")
+if plans:
+    for p in plans:
+        print(f"[{p.status}] {p.content}")
+
+# 方式 2：stream_mode="updates" 时，观察 write_plans 工具调用
+for event in agent.stream(
+    {"messages": [HumanMessage("...")]},
+    config=config,
+    stream_mode="updates",
+):
+    for node_name, node_output in event.items():
+        if node_name == "agent":
+            # AIMessage.tool_calls 中可看到 write_plans 被调用及参数
+            for msg in node_output.get("messages", []):
+                if msg.tool_calls:
+                    for tc in msg.tool_calls:
+                        if tc["name"] == "write_plans":
+                            print(f"计划：{tc['args']['plans']}")
+        elif node_name == "tools":
+            # ToolMessage 中可看到 write_plans 的返回值
+            for msg in node_output.get("messages", []):
+                if msg.name == "write_plans":
+                    print(f"计划更新结果：{msg.content}")
+
+# 方式 3：stream_mode="values" 时，实时观察 plans 变化
+for state in agent.stream(
+    {"messages": [HumanMessage("...")]},
+    config=config,
+    stream_mode="values",
+):
+    current_plans = state.get("plans")
+    if current_plans:
+        for p in current_plans:
+            print(f"[{p.status}] {p.content}")
+```
 
 ---
 
@@ -674,6 +777,20 @@ license: MIT
 从 AGENTS.md 文件加载持久上下文，并指导 AI 在交互中**学习回写**新知识。
 与技能（按需加载）不同，记忆始终加载到系统提示词中，提供跨轮次的持久上下文。
 
+**核心机制：** `MamboMemoryMiddleware` 在 `wrap_model_call` 阶段将 AGENTS.md 文件内容通过 `MAMBO_MEMORY_SYSTEM_PROMPT` 模板注入到 System Prompt 末尾。注入后的 System Prompt 结构为：
+
+```
+原始 system_prompt（来自 BackendToolsMiddleware）
+    ↓
+<agent_memory>
+AGENTS.md 文件内容（文件路径 + 正文）
+</agent_memory>
+    ↓
+<memory_guidelines>
+指导 Agent 何时回写、如何学习的规则
+</memory_guidelines>
+```
+
 ```python
 from mambo_agents.backends.schemas import VirtualPath
 
@@ -686,7 +803,7 @@ agent = create_mambo_agent(
 **工作流程：**
 
 ```
-启动会话 → 加载 AGENTS.md → 注入系统提示词
+启动会话 → before_agent 加载 AGENTS.md → wrap_model_call 注入 system prompt
     ↓
 交互中 → AI 发现值得记住的信息 → 用 edit/write 回写 AGENTS.md
 ```
@@ -707,12 +824,43 @@ AGENTS.md 是标准 Markdown 文件，无必须结构。常见内容：
 - 用户对 AI 工作提出了反馈和纠正
 - **不**记录：临时信息、一次性任务、闲聊、凭据
 
+**查看注入效果（截取真实 System Prompt）：**
+
+`MamboMemoryMiddleware` 在 `wrap_model_call` 阶段通过 `modify_request` 将 memory 注入到 `request.system_message`。可以写一个拦截 middleware 排在 memory 之后，从 Agent 运行时截取真实的注入结果：
+
+```python
+from langchain.agents.middleware.types import AgentMiddleware, ModelRequest, ModelResponse
+from langchain_core.messages import SystemMessage
+
+class SystemPromptInterceptor(AgentMiddleware):
+    """排在 memory middleware 之后，截取注入后的 system prompt。"""
+    captured: str | None = None
+
+    def wrap_model_call(self, request: ModelRequest, handler) -> ModelResponse:
+        sm = request.system_message
+        if isinstance(sm, SystemMessage) and isinstance(sm.content, str):
+            self.captured = sm.content  # 这就是 Agent 实际收到的完整 system prompt
+        return handler(request)
+
+# 使用
+interceptor = SystemPromptInterceptor()
+agent = create_mambo_agent(
+    "gpt-4o",
+    memory_sources=[VirtualPath("/.mambo/memory/AGENTS.md")],
+    middleware=[interceptor],  # 排在 memory 后面
+)
+
+agent.invoke({"messages": [...]}, config=config)
+# 调用后 interceptor.captured 中即包含 memory 注入后的完整 system prompt
+```
+
 **自定义格式化：**
 
 ```python
 from mambo_agents.middleware.memory import MamboMemoryMiddleware
 
 def my_formatter(contents: dict[str, str]) -> str:
+    """自定义 memory 在 system prompt 中的展示方式。"""
     parts = []
     for path, text in contents.items():
         parts.append(f"## Source: {path}\n{text}")
@@ -1189,13 +1337,15 @@ agent = create_mambo_agent(
 )
 
 result = agent.invoke(
-    {"messages": [HumanMessage("部署 v2.3 到生产环境")]}
+    {"messages": [HumanMessage("部署 v2.3 到生产环境")]},
+    config={"configurable": {"thread_id": "session-1"}},
 )
 # Agent: "已启动任务 a3f4b2c1，在后台运行中..."
 
 # 稍后查询
 result = agent.invoke(
-    {"messages": [HumanMessage("检查 a3f4b2c1 的状态")]}
+    {"messages": [HumanMessage("检查 a3f4b2c1 的状态")]},
+    config={"configurable": {"thread_id": "session-1"}},
 )
 # Agent 通过 async_status 读取进度和结果
 ```

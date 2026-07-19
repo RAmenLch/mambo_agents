@@ -1,7 +1,7 @@
 """Planning and task management middleware (mambo version).
 
 Provides ``MamboPlanMiddleware`` — a Pydantic-typed re-implementation of
-|langchain's ``TodoListMiddleware`` that:
+langchain's ``TodoListMiddleware`` that:
 
 - Uses frozen ``Plan`` Pydantic models instead of ``TypedDict``
 - Exposes ``build_summary_hook()`` so ``MamboSummarizationMiddleware`` can

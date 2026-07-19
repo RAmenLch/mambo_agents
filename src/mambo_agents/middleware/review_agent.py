@@ -3,10 +3,10 @@
 Unlike the simple LLM call in :meth:`AutoSecurityReviewMiddleware._ai_review`,
 this module creates a full LangChain agent that can optionally use read-only
 tools (``ls``, ``read``, ``grep``, ``glob``) to inspect the workspace before
-delivering a structured verdict via the **最终审核结果** tool.
+delivering a structured verdict via the ``submit_review_verdict`` tool.
 
 The agent is constrained:
-- MUST call ``最终审核结果`` within a limited number of steps.
+- MUST call ``submit_review_verdict`` within a limited number of steps.
 - SHOULD avoid unnecessary tool calls to save time / tokens.
 """
 
@@ -51,17 +51,17 @@ class FinalReviewResult(BaseModel):
 
 
 # ---------------------------------------------------------------------------
-# 最终审核结果 tool
+# submit_review_verdict tool
 # ---------------------------------------------------------------------------
 
 _FINAL_TOOL_NAME = "submit_review_verdict"
 """Internal function name (must match ``^[a-zA-Z0-9_-]+$`` for OpenAI API).
 
-The tool is presented to the review agent as the **最终审核结果** tool."""
+The tool is presented to the review agent as ``submit_review_verdict``."""
 
 
 def _build_final_result_tool() -> StructuredTool:
-    """Build the ``submit_review_verdict`` (最终审核结果) tool."""
+    """Build the ``submit_review_verdict`` tool."""
 
     def finalize(
         is_safe: bool,
@@ -162,7 +162,7 @@ def create_review_agent(
 ) -> CompiledStateGraph:
     """Create a mini agent whose sole purpose is security review.
 
-    The agent is given a ``最终审核结果`` tool that it **must** call to
+    The agent is given a ``submit_review_verdict`` tool that it **must** call to
     deliver its structured verdict.  Optionally it receives read-only
     file-system tools so it can inspect the workspace before deciding.
 
@@ -214,7 +214,7 @@ def create_review_agent(
 # ---------------------------------------------------------------------------
 
 class _ReviewIncompleteError(Exception):
-    """Raised when the review agent finishes without calling 最终审核结果."""
+    """Raised when the review agent finishes without calling ``submit_review_verdict``."""
 
 
 def run_review_sync(
@@ -243,7 +243,7 @@ def run_review_sync(
     Raises
     ------
     _ReviewIncompleteError
-        If the agent finishes without ever calling ``最终审核结果``.
+        If the agent finishes without ever calling ``submit_review_verdict``.
     """
     # Isolate from parent graph's config (checkpointer, thread_id,
     # callbacks) so review agent messages don't leak into the main

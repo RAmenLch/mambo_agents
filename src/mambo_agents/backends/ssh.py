@@ -274,7 +274,7 @@ class SshBackend(BackendProtocol):
 
         Validates that *path* is under :attr:`workspace_root` and strips
         the prefix before resolving against *remote_root*.  Raises
-        :class:`WorkspacePathError` for paths outside the workspace.
+        :class:`~mambo_agents.backends.schemas.BackendError` for paths outside the workspace.
 
         VirtualPath already validates on construction (no ``..``, no
         ``//``, absolute, non-empty), so no additional traversal checks

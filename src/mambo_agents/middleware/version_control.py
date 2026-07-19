@@ -126,7 +126,8 @@ class Snapshot(BaseModel):
 class VersionIndex(BaseModel):
     """Per-thread index of all snapshots.
 
-    Serialised to ``index.json`` under ``<storage_dir>/<thread_id>/``.
+    Persisted via :class:`VersionStore` using LangGraph ``BaseStore``
+    under namespace ``(thread_id, "mambo_vc_index")`` with key ``"index"``.
     """
 
     model_config = ConfigDict(frozen=False)

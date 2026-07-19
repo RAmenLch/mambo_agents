@@ -55,7 +55,7 @@ agent = create_mambo_agent("gpt-4o")
 
 result = agent.invoke({
     "messages": [HumanMessage("Create a Python script that prints Hello World")]
-})
+}, config={"configurable": {"thread_id": "session-1"}})
 
 # Check the agent's final response
 print(result["messages"][-1].content)
@@ -82,7 +82,7 @@ agent = create_mambo_agent(
 
 result = agent.invoke({
     "messages": [HumanMessage("List all files in the current directory")]
-})
+}, config={"configurable": {"thread_id": "session-1"}})
 print(result["messages"][-1].content)
 ```
 
@@ -105,7 +105,7 @@ agent = create_mambo_agent(
 
 result = agent.invoke({
     "messages": [HumanMessage("Check the weather in Beijing")]
-})
+}, config={"configurable": {"thread_id": "session-1"}})
 ```
 
 ### 3.4 Streaming Output
@@ -118,6 +118,7 @@ agent = create_mambo_agent("gpt-4o")
 async for event in agent.astream(
     {"messages": [HumanMessage("Analyze the project code structure")]},
     stream_mode="updates",
+    config={"configurable": {"thread_id": "session-1"}},
 ):
     print(event)
     # Example output (fires once per completed step):
@@ -132,6 +133,7 @@ async for event in agent.astream(
 async for event in agent.astream(
     {"messages": [HumanMessage("Explain what a decorator is")]},
     stream_mode="messages",
+    config={"configurable": {"thread_id": "session-1"}},
 ):
     # event is a tuple of (message_chunk, metadata)
     msg_chunk, metadata = event
@@ -173,7 +175,7 @@ result3 = agent.invoke(
 > **What `thread_id` does:**
 > - **Conversation history isolation:** conversations with different `thread_id` are invisible to each other
 > - **Filesystem isolation:** `StoreBackend` creates an independent virtual filesystem for each `thread_id`
-> - **If you don't pass `config`:** each call is an independent new session, the agent won't remember previous content
+> - **`config` is required:** every call must pass `config={"configurable": {"thread_id": "..."}}`
 
 ---
 
@@ -595,6 +597,60 @@ SummarizationConfig(
 )
 ```
 
+### 6.1 Retrieving Summarization Events
+
+When summarization is triggered, the middleware stores the summary event in the agent's private state `_summarization_event`. You can inspect this field by using `stream_mode="values"` to access the full state.
+
+**`SummarizationEvent` structure:**
+
+| Field | Type | Description |
+|------|------|-------------|
+| `cutoff_index` | `int` | Absolute index in `state["messages"]`. All messages **before** this index have been replaced by a single `summary_message`. |
+| `summary_message` | `HumanMessage` | LLM-generated summary message with three standard sections: `SESSION INTENT` (session goal), `SUMMARY` (key decisions & conclusions), `ARTIFACTS` (created/modified files and changes). Tagged with `additional_kwargs={"lc_source": "summarization"}` for chained summarization. |
+| `file_path` | `str \| None` | When `offload_to_backend=True`, evicted messages are persisted to `/conversation_history/{thread_id}.md` on the backend. `None` means offload is disabled or failed. |
+| `last_summarized_message` | `AnyMessage \| None` | The last real message in the summarized zone (excluding summary markers). Useful for understanding the exact compaction boundary. |
+
+**Detecting summarization events:**
+
+```python
+from mambo_agents.middleware.summarization import SummarizationEvent
+
+# Method 1: Use stream_mode="values" to get state and check _summarization_event
+last_state = None
+for state in agent.stream(
+    {"messages": [HumanMessage("...")]},
+    config=config,
+    stream_mode="values",
+):
+    last_state = state
+
+# Check for summarization event
+sum_event: SummarizationEvent | None = last_state.get("_summarization_event")
+if sum_event:
+    print(f"Summarization triggered! First {sum_event['cutoff_index']} messages compacted")
+    print(f"Summary content: {sum_event['summary_message'].content[:500]}...")
+    print(f"Offload path: {sum_event.get('file_path')}")
+```
+
+**Real-time monitoring of new summarization events:**
+
+```python
+last_cutoff = -1
+
+for state in agent.stream(
+    {"messages": [HumanMessage("...")]},
+    config=config,
+    stream_mode="values",
+):
+    sum_event = state.get("_summarization_event")
+    if sum_event and sum_event.get("cutoff_index", -1) != last_cutoff:
+        last_cutoff = sum_event["cutoff_index"]
+        print(f"⚡ New summarization: {sum_event['cutoff_index']} messages compacted")
+        print(f"   Summary length: {len(sum_event['summary_message'].content)} chars")
+```
+
+> **Note:** `_summarization_event` is a private state field (prefixed with `_`), meant for caller observation only — it is never exposed to the LLM. During chained summarization, prior summaries are automatically injected into the new summarization prompt to prevent information loss.
+
 ---
 
 ## 7. Task Planning & Tracking
@@ -613,7 +669,7 @@ agent = create_mambo_agent(
 **Plan data model:**
 
 ```python
-from mambo_agents import Plan
+from mambo_agents.middleware.planning import Plan
 
 # Each plan item has two fields:
 # - content: task description
@@ -622,6 +678,53 @@ from mambo_agents import Plan
 
 When enabled, the agent gains a `write_plans` tool and will automatically break down complex
 tasks into steps with tracked completion status.
+
+**Retrieving plan state:**
+
+```python
+from mambo_agents.middleware.planning import Plan
+
+# Method 1: Read plans from invoke result
+result = agent.invoke(
+    {"messages": [HumanMessage("Help me create a project skeleton...")]},
+    config=config,
+)
+plans: list[Plan] | None = result.get("plans")
+if plans:
+    for p in plans:
+        print(f"[{p.status}] {p.content}")
+
+# Method 2: Observe write_plans tool calls via stream_mode="updates"
+for event in agent.stream(
+    {"messages": [HumanMessage("...")]},
+    config=config,
+    stream_mode="updates",
+):
+    for node_name, node_output in event.items():
+        if node_name == "agent":
+            # AIMessage.tool_calls shows write_plans invocation and args
+            for msg in node_output.get("messages", []):
+                if msg.tool_calls:
+                    for tc in msg.tool_calls:
+                        if tc["name"] == "write_plans":
+                            print(f"Plan: {tc['args']['plans']}")
+        elif node_name == "tools":
+            # ToolMessage contains write_plans return value
+            for msg in node_output.get("messages", []):
+                if msg.name == "write_plans":
+                    print(f"Plan update result: {msg.content}")
+
+# Method 3: Observe plans changes in real-time via stream_mode="values"
+for state in agent.stream(
+    {"messages": [HumanMessage("...")]},
+    config=config,
+    stream_mode="values",
+):
+    current_plans = state.get("plans")
+    if current_plans:
+        for p in current_plans:
+            print(f"[{p.status}] {p.content}")
+```
 
 ---
 
@@ -682,6 +785,22 @@ Loads persistent context from AGENTS.md files and instructs the AI to **write ba
 during interactions. Unlike skills (on-demand), memory is always loaded and provides persistent,
 evolving context across turns.
 
+**Core mechanism:** `MamboMemoryMiddleware` injects AGENTS.md file content into the System Prompt
+via the `MAMBO_MEMORY_SYSTEM_PROMPT` template during the `wrap_model_call` phase.
+The final System Prompt structure is:
+
+```
+Original system_prompt (from BackendToolsMiddleware)
+    ↓
+<agent_memory>
+AGENTS.md file content (path + body)
+</agent_memory>
+    ↓
+<memory_guidelines>
+Rules guiding the Agent on when and how to write back memories
+</memory_guidelines>
+```
+
 ```python
 from mambo_agents.backends.schemas import VirtualPath
 
@@ -694,7 +813,7 @@ agent = create_mambo_agent(
 **Workflow:**
 
 ```
-Session start → load AGENTS.md → inject into system prompt
+Session start → before_agent loads AGENTS.md → wrap_model_call injects into system prompt
     ↓
 During interaction → AI discovers worth-remembering info → writes back with edit/write
 ```
@@ -715,12 +834,45 @@ The memory prompt instructs the AI to write back to AGENTS.md when:
 - User gives feedback and corrections on AI's work
 - **Do NOT** record: temporary info, one-off tasks, casual chat, credentials
 
+**Viewing injection effect (intercepting the real System Prompt):**
+
+`MamboMemoryMiddleware` injects memory into `request.system_message` via `modify_request`
+during `wrap_model_call`. You can intercept the actual result by placing a lightweight
+middleware **after** memory in the stack:
+
+```python
+from langchain.agents.middleware.types import AgentMiddleware, ModelRequest, ModelResponse
+from langchain_core.messages import SystemMessage
+
+class SystemPromptInterceptor(AgentMiddleware):
+    """Placed after memory middleware to capture the injected system prompt."""
+    captured: str | None = None
+
+    def wrap_model_call(self, request: ModelRequest, handler) -> ModelResponse:
+        sm = request.system_message
+        if isinstance(sm, SystemMessage) and isinstance(sm.content, str):
+            self.captured = sm.content  # the complete system prompt the Agent actually receives
+        return handler(request)
+
+# Usage
+interceptor = SystemPromptInterceptor()
+agent = create_mambo_agent(
+    "gpt-4o",
+    memory_sources=[VirtualPath("/.mambo/memory/AGENTS.md")],
+    middleware=[interceptor],  # placed after memory
+)
+
+agent.invoke({"messages": [...]}, config=config)
+# After the call, interceptor.captured contains the full system prompt with memory injected
+```
+
 **Custom formatting:**
 
 ```python
 from mambo_agents.middleware.memory import MamboMemoryMiddleware
 
 def my_formatter(contents: dict[str, str]) -> str:
+    """Customize how memory appears in the system prompt."""
     parts = []
     for path, text in contents.items():
         parts.append(f"## Source: {path}\n{text}")
@@ -1212,13 +1364,15 @@ agent = create_mambo_agent(
 )
 
 result = agent.invoke(
-    {"messages": [HumanMessage("Deploy v2.3 to production")]}
+    {"messages": [HumanMessage("Deploy v2.3 to production")]},
+    config={"configurable": {"thread_id": "session-1"}},
 )
 # Agent: "Launched task a3f4b2c1, running in background..."
 
 # Query later
 result = agent.invoke(
-    {"messages": [HumanMessage("Check status of a3f4b2c1")]}
+    {"messages": [HumanMessage("Check status of a3f4b2c1")]},
+    config={"configurable": {"thread_id": "session-1"}},
 )
 # Agent reads progress and results via async_status
 ```

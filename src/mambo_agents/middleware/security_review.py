@@ -12,7 +12,7 @@ Two review modes are available:
 - **llm** (default): single structured-output LLM call per tool call.
 - **agent**: a dedicated review agent with optional read-only backend
   tools.  The agent can inspect the workspace before delivering a
-  structured verdict via the ``最终审核结果`` tool.  Backend tools
+  structured verdict via the ``submit_review_verdict`` tool.  Backend tools
   (core 6 + ``backend.tools``) use agent review; non-backend user tools
   fall back to llm review.
 
@@ -161,7 +161,7 @@ class SecurityReviewConfig(BaseModel):
             "- ``'llm'`` (default): single LLM call with structured output.\n"
             "- ``'agent'``: full review agent with optional read-only tools "
             "that can inspect the workspace before delivering a verdict. "
-            "The agent MUST call ``最终审核结果`` within a limited number of steps."
+            "The agent MUST call ``submit_review_verdict`` within a limited number of steps."
         ),
     )
     agent_max_steps: int = Field(
@@ -623,7 +623,7 @@ class AutoSecurityReviewMiddleware(
         - **llm** (default): single structured-output LLM call, no tools.
         - **agent**: full review agent with optional read-only tools that
           can inspect the workspace.  The agent MUST call
-          ``最终审核结果`` within the configured step limit.
+          ``submit_review_verdict`` within the configured step limit.
 
         .. important::
             In llm mode, the review model is invoked with an **isolated
@@ -720,7 +720,7 @@ class AutoSecurityReviewMiddleware(
             f"**Arguments:**\n```json\n{tool_args}\n```"
             f"{tool_desc}\n\n"
             f"You may use read-only tools (ls, read, grep, glob) to inspect "
-            f"the workspace if needed.  When done, call `最终审核结果`."
+            f"the workspace if needed.  When done, call `submit_review_verdict`."
         )
 
         try:
@@ -812,7 +812,7 @@ class AutoSecurityReviewMiddleware(
             f"**Arguments:**\n```json\n{tool_args}\n```"
             f"{tool_desc}\n\n"
             f"You may use read-only tools (ls, read, grep, glob) to inspect "
-            f"the workspace if needed.  When done, call `最终审核结果`."
+            f"the workspace if needed.  When done, call `submit_review_verdict`."
         )
 
         try:

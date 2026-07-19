@@ -774,6 +774,7 @@ dev = [
     { name = "pytest" },
     { name = "pytest-asyncio" },
     { name = "pytest-xdist" },
+    { name = "python-dotenv" },
 ]
 
 [package.metadata]
@@ -802,6 +803,7 @@ dev = [
     { name = "pytest", specifier = ">=8.0,<9" },
     { name = "pytest-asyncio", specifier = ">=0.24,<1" },
     { name = "pytest-xdist", specifier = ">=3.8,<4" },
+    { name = "python-dotenv", specifier = ">=1.0,<2" },
 ]
 
 [[package]]
