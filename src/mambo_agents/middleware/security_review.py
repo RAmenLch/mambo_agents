@@ -1015,7 +1015,7 @@ class AutoSecurityReviewMiddleware(
         return last
 
     @staticmethod
-    def _detect_replay() -> bool:
+    def _detect_replay(last_ai_msg: AIMessage) -> bool:
         """Return True if this middleware's own interrupt is being replayed.
 
         Uses **non-consuming** read of the global resume value via
@@ -1025,6 +1025,12 @@ class AutoSecurityReviewMiddleware(
 
         Only resume values carrying ``"source": "mambo_security_review"``
         are recognized as belonging to this middleware.
+
+        Additionally cross-checks that the resume decisions actually
+        belong to the current batch of tool calls by matching
+        ``tool_call_id``.  This prevents a stale resume value on the
+        parent scratchpad chain from being mistaken for a replay of a
+        *different* tool call (e.g. a retry after rejection).
         """
         try:
             conf = get_config()["configurable"]
@@ -1036,7 +1042,15 @@ class AutoSecurityReviewMiddleware(
         resume_value = scratchpad.get_null_resume(False)
         if not isinstance(resume_value, dict):
             return False
-        return resume_value.get("source") == INTERRUPT_SOURCE
+        if resume_value.get("source") != INTERRUPT_SOURCE:
+            return False
+        # Verify the decisions in the resume actually match the current
+        # tool calls.  Without this check a consumed-but-still-readable
+        # resume value on the parent scratchpad chain would cause every
+        # subsequent tool call to be silently treated as a replay.
+        decision_ids = {d.get("tool_call_id") for d in resume_value.get("decisions", [])}
+        current_ids = {tc["id"] for tc in last_ai_msg.tool_calls}
+        return bool(decision_ids & current_ids)
 
     def _rebuild_tool_calls(
         self,
@@ -1196,7 +1210,7 @@ class AutoSecurityReviewMiddleware(
         if last_ai_msg is None:
             return None
 
-        if self._detect_replay():
+        if self._detect_replay(last_ai_msg):
             revised_calls, tool_msgs = self._handle_replay(last_ai_msg)
         else:
             result = self._handle_first_run(last_ai_msg)
@@ -1227,7 +1241,7 @@ class AutoSecurityReviewMiddleware(
         if last_ai_msg is None:
             return None
 
-        if self._detect_replay():
+        if self._detect_replay(last_ai_msg):
             revised_calls, tool_msgs = self._handle_replay(last_ai_msg)
         else:
             result = await self._ahandle_first_run(last_ai_msg)
