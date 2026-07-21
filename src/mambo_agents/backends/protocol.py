@@ -469,14 +469,21 @@ class BackendProtocol(abc.ABC):
         """
         total = len(matches)
         if offset < 0:
-            offset = 0
+            return GrepResult(error=BackendError(
+                code=ErrorCode.INVALID,
+                message=f"offset 不得为负数，当前为 {offset}",
+            ))
+        if limit is not None and limit < 1:
+            return GrepResult(error=BackendError(
+                code=ErrorCode.INVALID,
+                message=f"limit 必须为正数，当前为 {limit}",
+            ))
         if total > 0 and offset >= total:
             return GrepResult(error=BackendError(
                 code=ErrorCode.INVALID,
                 message=f"偏移量 {offset} 超过匹配总数 ({total} 条)",
             ))
         effective_limit = limit if limit is not None else self._max_grep_matches
-        effective_limit = max(effective_limit, 1)
         effective_limit = min(effective_limit, self._max_grep_matches)
         sliced = matches[offset : offset + effective_limit]
         truncated = (offset + effective_limit) < total

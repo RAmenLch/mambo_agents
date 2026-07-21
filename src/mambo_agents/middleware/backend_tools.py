@@ -249,7 +249,7 @@ _CORE_TOOLS = [
         "method": "grep",
         "fields": {
             "pattern": (str, Field(description="Regex pattern (default) or text substring to find")),
-            "path": (VirtualPath, Field(description="Base directory to search")),
+            "path": (VirtualPath, Field(description="Directory or file to search in. Can be a single file path or a directory to search recursively.")),
             "glob": (str | None, Field(default=None, description="Optional POSIX glob to filter file paths (e.g., '*.py' for top-level, '**/*.py' for recursive)")),
             "regex": (bool, Field(default=True, description="If True (default), interpret pattern as regex. Set False for literal match.")),
             "offset": (int, Field(default=0, description="0-based index to start from (for pagination)")),

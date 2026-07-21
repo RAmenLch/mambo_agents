@@ -1036,10 +1036,15 @@ class AutoSecurityReviewMiddleware(
             conf = get_config()["configurable"]
         except RuntimeError:
             return False
-        scratchpad = conf.get(CONFIG_KEY_SCRATCHPAD)
+        scratchpad = conf.get(CONFIG_KEY_SCRATCHPAD) # PregelScratchpad
         if scratchpad is None:
             return False
         resume_value = scratchpad.get_null_resume(False)
+        if not isinstance(resume_value, dict) and scratchpad.resume:
+            for r in reversed(scratchpad.resume):
+                if isinstance(r, dict) and r.get("source") == INTERRUPT_SOURCE:
+                    resume_value = r
+                    break
         if not isinstance(resume_value, dict):
             return False
         if resume_value.get("source") != INTERRUPT_SOURCE:

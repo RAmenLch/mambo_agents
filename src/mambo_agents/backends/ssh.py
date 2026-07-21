@@ -105,7 +105,7 @@ class SshBackend(BackendProtocol):
     """
 
     # Default per-tool timeout values specific to this backend (overridable via __init__).
-    _BACKEND_DEFAULT_TIMEOUTS = ToolTimeouts(tree=60.0, delete=30.0, execute=180.0)
+    _BACKEND_DEFAULT_TIMEOUTS = ToolTimeouts(tree=60.0, delete=30.0, execute=500.0)
 
     def __init__(
         self,
@@ -457,7 +457,6 @@ class SshBackend(BackendProtocol):
                     args_schema=create_model(
                         "ExecuteSchema",
                         command=(str, Field(description="Shell command to execute")),
-                        timeout=(int | None, Field(default=None, description="Optional timeout in seconds")),
                     ),
                     func=self._safe_tool_func("execute", self.execute),
                     coroutine=self._safe_tool_coroutine("execute", self.aexecute),
@@ -979,11 +978,13 @@ class SshBackend(BackendProtocol):
         remote: str,
         regex: bool = True,
     ) -> GrepResult:
-        """Portable grep via remote ``python3`` using :func:`os.walk`.
+        """Portable grep via remote ``python3``.
 
-        Respects :attr:`_ignore_dirs` — directories listed there are
-        skipped entirely.  Files > 1 MB and known binary extensions
-        are also skipped to keep traversal fast.
+        For a single file, searches directly.  For a directory,
+        uses :func:`os.walk`.  Respects :attr:`_ignore_dirs` —
+        directories listed there are skipped entirely.  Files > 1 MB
+        and known binary extensions are also skipped to keep traversal
+        fast.
         """
         pattern_b64 = base64.b64encode(pattern.encode()).decode()
         regex_b64 = base64.b64encode(str(regex).encode()).decode()
@@ -1013,27 +1014,34 @@ class SshBackend(BackendProtocol):
             f"    _regex = re.compile(pat)\n"
             f"else:\n"
             f"    _regex = re.compile(re.escape(pat))\n"
-            f"d = {remote_repr}\n"
-            f"res = []\n"
-            f"for root, dirs, files in os.walk(d):\n"
-            f"    dirs[:] = [x for x in dirs\n"
-            f"               if not x.startswith('.') and x not in SKIP_DIRS]\n"
-            f"    for fname in files:\n"
-            f"        if fname.startswith('.'):\n"
-            f"            continue\n"
-            f"        if os.path.splitext(fname)[1].lower() in BINARY_EXTS:\n"
-            f"            continue\n"
-            f"        fp = os.path.join(root, fname)\n"
-            f"        try:\n"
-            f"            if os.path.getsize(fp) > MAX_SIZE:\n"
-            f"                continue\n"
-            f"            with open(fp, 'r', encoding='utf-8', errors='ignore') as f:\n"
-            f"                for li, line in enumerate(f, 1):\n"
-            f"                    if _regex.search(line):\n"
-            f"                        res.append({{'p': fp, 'l': li,"
+            f"def _search_file(fp):\n"
+            f"    r = []\n"
+            f"    try:\n"
+            f"        if os.path.getsize(fp) > MAX_SIZE:\n"
+            f"            return r\n"
+            f"        with open(fp, 'r', encoding='utf-8', errors='ignore') as f:\n"
+            f"            for li, line in enumerate(f, 1):\n"
+            f"                if _regex.search(line):\n"
+            f"                    r.append({{'p': fp, 'l': li,"
             f" 't': line.rstrip(chr(10))}})\n"
-            f"        except Exception:\n"
-            f"            pass\n"
+            f"    except Exception:\n"
+            f"        pass\n"
+            f"    return r\n"
+            f"d = {remote_repr}\n"
+            f"if os.path.isfile(d):\n"
+            f"    res = _search_file(d)\n"
+            f"else:\n"
+            f"    res = []\n"
+            f"    for root, dirs, files in os.walk(d):\n"
+            f"        dirs[:] = [x for x in dirs\n"
+            f"                   if not x.startswith('.') and x not in SKIP_DIRS]\n"
+            f"        for fname in files:\n"
+            f"            if fname.startswith('.'):\n"
+            f"                continue\n"
+            f"            if os.path.splitext(fname)[1].lower() in BINARY_EXTS:\n"
+            f"                continue\n"
+            f"            fp = os.path.join(root, fname)\n"
+            f"            res.extend(_search_file(fp))\n"
             f"print(json.dumps(res))\n"
         )
 

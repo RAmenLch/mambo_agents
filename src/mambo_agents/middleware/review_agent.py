@@ -130,7 +130,8 @@ DEFAULT_REVIEW_AGENT_SYSTEM_PROMPT = """你是一名安全审核专家，负责�
 - 信息查询类系统操作
 
 ### 通常 UNSAFE（is_safe=False）：
-- 删除文件或目录（尤其是工作区外的）
+- 删除文件（尤其是工作区外的）
+- 递归删除目录（高风险）
 - 修改系统配置文件（/etc/*、Windows Registry 等）
 - 执行安装/卸载软件的 shell 命令
 - 修改系统服务或定时任务的命令

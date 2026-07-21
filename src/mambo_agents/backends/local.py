@@ -111,7 +111,7 @@ class LocalBackend(BackendProtocol):
     """
 
     # Default per-tool timeout values specific to this backend (overridable via __init__).
-    _BACKEND_DEFAULT_TIMEOUTS = ToolTimeouts(tree=60.0, delete=30.0, execute=180.0)
+    _BACKEND_DEFAULT_TIMEOUTS = ToolTimeouts(tree=60.0, delete=30.0, execute=500.0)
 
     def __init__(
         self,
@@ -237,7 +237,6 @@ class LocalBackend(BackendProtocol):
                     args_schema=create_model(
                         "ExecuteSchema",
                         command=(str, Field(description="Shell command to execute")),
-                        timeout=(int | None, Field(default=None, description="Optional timeout in seconds")),
                     ),
                     func=self._safe_tool_func("execute", self.execute),
                     coroutine=self._safe_tool_coroutine("execute", self.aexecute),
