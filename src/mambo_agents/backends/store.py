@@ -129,22 +129,24 @@ class StoreBackend(BackendProtocol):
         """
         if self._store is not None:
             return self._store
-        try:
-            store_result = get_store()
-        except RuntimeError:
-            # Not inside a graph runnable context — use InMemoryStore as fallback
-            from langgraph.store.memory import InMemoryStore
-            self._store = InMemoryStore()
-            return self._store
+        with self._lock:
+            if self._store is not None:
+                return self._store
+            try:
+                store_result = get_store()
+            except RuntimeError:
+                from langgraph.store.memory import InMemoryStore
+                self._store = InMemoryStore()
+                return self._store
 
-        if store_result is None:
-            raise RuntimeError(
-                "StoreBackend requires a LangGraph store, but get_store() returned None. "
-                "The graph was likely compiled without a store= parameter. "
-                "Fix: pass store= when constructing StoreBackend, "
-                "or pass store= to graph.compile()."
-            )
-        return store_result
+            if store_result is None:
+                raise RuntimeError(
+                    "StoreBackend requires a LangGraph store, but get_store() returned None. "
+                    "The graph was likely compiled without a store= parameter. "
+                    "Fix: pass store= when constructing StoreBackend, "
+                    "or pass store= to graph.compile()."
+                )
+            return store_result
 
     @staticmethod
     def _get_namespace(thread_id: str) -> tuple[str, str]:
@@ -254,11 +256,11 @@ class StoreBackend(BackendProtocol):
                 self._inject_initial_files(store, namespace)
                 self._initialized_threads.add(thread_id)
 
-            items = await self._asearch_store_paginated(store, namespace)
-            files: dict[str, dict[str, str]] = {}
-            for item in items:
-                files[item.key] = {"content": item.value.get("content", ""),
-                                   "encoding": item.value.get("encoding", "utf-8")}
+        items = await self._asearch_store_paginated(store, namespace)
+        files: dict[str, dict[str, str]] = {}
+        for item in items:
+            files[item.key] = {"content": item.value.get("content", ""),
+                               "encoding": item.value.get("encoding", "utf-8")}
         return files
 
     async def _aget_file(self, thread_id: str, file_path: str) -> dict[str, str] | None:
@@ -271,7 +273,7 @@ class StoreBackend(BackendProtocol):
                 self._inject_initial_files(store, namespace)
                 self._initialized_threads.add(thread_id)
 
-            item = await store.aget(namespace, file_path)
+        item = await store.aget(namespace, file_path)
         if item is None:
             return None
         return {"content": item.value.get("content", ""),
@@ -281,8 +283,7 @@ class StoreBackend(BackendProtocol):
         """Async: store a single file."""
         store = self._get_store()
         namespace = self._get_namespace(thread_id)
-        with self._lock:
-            await store.aput(namespace, file_path, {"content": content, "encoding": encoding})
+        await store.aput(namespace, file_path, {"content": content, "encoding": encoding})
 
     async def _asearch_store_paginated(
         self,

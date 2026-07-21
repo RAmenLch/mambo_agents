@@ -169,6 +169,7 @@ class SshBackend(BackendProtocol):
         self._remote_root: str = ""  # resolved absolute path, set by _connect()
         self._has_python3: bool = False  # detected in _connect()
         self._async_lock: asyncio.Lock = asyncio.Lock()
+        self._sync_lock = threading.RLock()
 
         self._connect()
 
@@ -510,41 +511,42 @@ class SshBackend(BackendProtocol):
 
         Uses SFTP ``listdir_attr`` for structured, locale-independent output.
         """
-        try:
-            remote = self._resolve(path)
-        except BackendError as e:
-            return LsResult(error=e)
-        try:
-            st_mode = self._sftp.stat(remote).st_mode
-            if not self._attr_is_dir_maybe(st_mode):
-                return LsResult(error=BackendError(code=ErrorCode.NOT_DIR, path=path, message="目标是文件，不是目录"))
-            attrs = self._sftp.listdir_attr(remote)
-        except FileNotFoundError:
-            return LsResult(error=BackendError(code=ErrorCode.NOT_FOUND, path=path, message="路径不存在"))
-        except OSError as e:
-            return LsResult(error=BackendError(code=ErrorCode.OS_ERROR, path=path, message=str(e)))
+        with self._sync_lock:
+            try:
+                remote = self._resolve(path)
+            except BackendError as e:
+                return LsResult(error=e)
+            try:
+                st_mode = self._sftp.stat(remote).st_mode
+                if not self._attr_is_dir_maybe(st_mode):
+                    return LsResult(error=BackendError(code=ErrorCode.NOT_DIR, path=path, message="目标是文件，不是目录"))
+                attrs = self._sftp.listdir_attr(remote)
+            except FileNotFoundError:
+                return LsResult(error=BackendError(code=ErrorCode.NOT_FOUND, path=path, message="路径不存在"))
+            except OSError as e:
+                return LsResult(error=BackendError(code=ErrorCode.OS_ERROR, path=path, message=str(e)))
 
-        infos: list[FileInfo] = []
-        # Sort: directories first, then by name
-        sorted_attrs = sorted(attrs, key=lambda a: (not self._attr_is_dir(a), a.filename))
+            infos: list[FileInfo] = []
+            # Sort: directories first, then by name
+            sorted_attrs = sorted(attrs, key=lambda a: (not self._attr_is_dir(a), a.filename))
 
-        for attr in sorted_attrs:
-            is_dir = self._attr_is_dir(attr)
-            size = attr.st_size or 0
-            modified_at = ""
-            if attr.st_mtime is not None:
-                modified_at = datetime.fromtimestamp(attr.st_mtime, tz=timezone.utc).isoformat()
+            for attr in sorted_attrs:
+                is_dir = self._attr_is_dir(attr)
+                size = attr.st_size or 0
+                modified_at = ""
+                if attr.st_mtime is not None:
+                    modified_at = datetime.fromtimestamp(attr.st_mtime, tz=timezone.utc).isoformat()
 
-            vp = path.join(attr.filename)
+                vp = path.join(attr.filename)
 
-            infos.append(FileInfo(
-                path=vp,
-                is_dir=is_dir,
-                size=size,
-                modified_at=modified_at,
-            ))
+                infos.append(FileInfo(
+                    path=vp,
+                    is_dir=is_dir,
+                    size=size,
+                    modified_at=modified_at,
+                ))
 
-        return LsResult(entries=infos)
+            return LsResult(entries=infos)
 
     @staticmethod
     def _attr_is_dir(attr: paramiko.SFTPAttributes) -> bool:
@@ -562,81 +564,82 @@ class SshBackend(BackendProtocol):
         limit: int | None = 2000,
         include_line_numbers: bool = False,
     ) -> ReadResult:
-        if offset < 0:
-            return ReadResult(error=BackendError(
-                code=ErrorCode.INVALID, path=file_path,
-                message=f"offset must be non-negative, got {offset}",
-            ))
-        if limit is not None and limit < 1:
-            return ReadResult(error=BackendError(
-                code=ErrorCode.INVALID, path=file_path,
-                message=f"limit must be >= 1 (or None for unlimited), got {limit}",
-            ))
-        try:
-            remote = self._resolve(file_path)
-        except BackendError as e:
-            return ReadResult(error=e)
-        try:
-            is_dir = self._sftp.stat(remote).st_mode
-            if self._attr_is_dir_maybe(is_dir):
-                return ReadResult(error=BackendError(code=ErrorCode.IS_DIR, path=file_path, message="目标是目录"))
-        except FileNotFoundError:
-            return ReadResult(error=BackendError(code=ErrorCode.NOT_FOUND, path=file_path, message="文件不存在"))
-        except OSError as e:
-            return ReadResult(error=BackendError(code=ErrorCode.OS_ERROR, path=file_path, message=str(e)))
+        with self._sync_lock:
+            if offset < 0:
+                return ReadResult(error=BackendError(
+                    code=ErrorCode.INVALID, path=file_path,
+                    message=f"offset must be non-negative, got {offset}",
+                ))
+            if limit is not None and limit < 1:
+                return ReadResult(error=BackendError(
+                    code=ErrorCode.INVALID, path=file_path,
+                    message=f"limit must be >= 1 (or None for unlimited), got {limit}",
+                ))
+            try:
+                remote = self._resolve(file_path)
+            except BackendError as e:
+                return ReadResult(error=e)
+            try:
+                is_dir = self._sftp.stat(remote).st_mode
+                if self._attr_is_dir_maybe(is_dir):
+                    return ReadResult(error=BackendError(code=ErrorCode.IS_DIR, path=file_path, message="目标是目录"))
+            except FileNotFoundError:
+                return ReadResult(error=BackendError(code=ErrorCode.NOT_FOUND, path=file_path, message="文件不存在"))
+            except OSError as e:
+                return ReadResult(error=BackendError(code=ErrorCode.OS_ERROR, path=file_path, message=str(e)))
 
-        file_type = _get_file_type(file_path.value)
-        mime_type = _get_mime_type(file_path.value)
+            file_type = _get_file_type(file_path.value)
+            mime_type = _get_mime_type(file_path.value)
 
-        if file_type != "text":
+            if file_type != "text":
+                try:
+                    with self._sftp.open(remote, "rb") as f:
+                        raw = f.read()
+                except OSError as e:
+                    return ReadResult(error=BackendError(code=ErrorCode.IO_ERROR, path=file_path, message=str(e)))
+                encoded = base64.b64encode(raw).decode("ascii")
+                return ReadResult(
+                    content=encoded,
+                    total_lines=1,
+                    encoding="base64",
+                    file_type=file_type,
+                    mime_type=mime_type,
+                )
+
+            # Text file: attempt UTF-8 read.
+            # NOTE: Paramiko's SFTPClient.open(…, "r") may return bytes on
+            # some server implementations.  Always open in binary mode and
+            # decode explicitly to avoid TypeError downstream.
             try:
                 with self._sftp.open(remote, "rb") as f:
-                    raw = f.read()
+                    content = f.read().decode("utf-8")
+            except UnicodeDecodeError:
+                return ReadResult(
+                    error=BackendError(code=ErrorCode.INVALID, path=file_path, message="无法读取，不是可识别的文本或多媒体格式"),
+                )
             except OSError as e:
                 return ReadResult(error=BackendError(code=ErrorCode.IO_ERROR, path=file_path, message=str(e)))
-            encoded = base64.b64encode(raw).decode("ascii")
-            return ReadResult(
-                content=encoded,
-                total_lines=1,
-                encoding="base64",
-                file_type=file_type,
-                mime_type=mime_type,
+
+            lines = content.splitlines(keepends=True)
+            total = len(lines)
+
+            if total > 0 and offset >= total:
+                return ReadResult(
+                    error=BackendError(code=ErrorCode.INVALID, path=file_path, message=f"偏移量 {offset} 超过文件长度({total} 行)"),
+                )
+
+            sliced = lines[offset : offset + limit] if limit is not None else lines[offset:]
+            raw_slice = "".join(sliced)
+            content = (
+                format_with_line_numbers(raw_slice, start_line=offset + 1)
+                if include_line_numbers
+                else raw_slice
             )
-
-        # Text file: attempt UTF-8 read.
-        # NOTE: Paramiko's SFTPClient.open(…, "r") may return bytes on
-        # some server implementations.  Always open in binary mode and
-        # decode explicitly to avoid TypeError downstream.
-        try:
-            with self._sftp.open(remote, "rb") as f:
-                content = f.read().decode("utf-8")
-        except UnicodeDecodeError:
             return ReadResult(
-                error=BackendError(code=ErrorCode.INVALID, path=file_path, message="无法读取，不是可识别的文本或多媒体格式"),
+                content=content,
+                total_lines=total,
+                encoding="utf-8",
             )
-        except OSError as e:
-            return ReadResult(error=BackendError(code=ErrorCode.IO_ERROR, path=file_path, message=str(e)))
-
-        lines = content.splitlines(keepends=True)
-        total = len(lines)
-
-        if total > 0 and offset >= total:
-            return ReadResult(
-                error=BackendError(code=ErrorCode.INVALID, path=file_path, message=f"偏移量 {offset} 超过文件长度({total} 行)"),
-            )
-
-        sliced = lines[offset : offset + limit] if limit is not None else lines[offset:]
-        raw_slice = "".join(sliced)
-        content = (
-            format_with_line_numbers(raw_slice, start_line=offset + 1)
-            if include_line_numbers
-            else raw_slice
-        )
-        return ReadResult(
-            content=content,
-            total_lines=total,
-            encoding="utf-8",
-        )
 
     @staticmethod
     def _attr_is_dir_maybe(st_mode: int | None) -> bool:
@@ -650,47 +653,48 @@ class SshBackend(BackendProtocol):
     def write(
         self, file_path: VirtualPath, content: str, overwrite: bool = False,
     ) -> WriteResult:
-        if not self._check_edit_allowed(file_path):
-            return WriteResult(
-                error=BackendError(code=ErrorCode.EDIT_NOT_ALLOWED, path=file_path, message="路径不允许写入"),
-            )
-        try:
-            remote = self._resolve(file_path)
-        except BackendError as e:
-            return WriteResult(error=e)
-
-        # Check if it's a directory
-        try:
-            st_mode = self._sftp.stat(remote).st_mode
-            if self._attr_is_dir_maybe(st_mode):
+        with self._sync_lock:
+            if not self._check_edit_allowed(file_path):
                 return WriteResult(
-                    error=BackendError(code=ErrorCode.IS_DIR, path=file_path, message="目标是目录，无法写入"),
+                    error=BackendError(code=ErrorCode.EDIT_NOT_ALLOWED, path=file_path, message="路径不允许写入"),
                 )
-        except FileNotFoundError:
-            pass  # Doesn't exist yet – fine for write
+            try:
+                remote = self._resolve(file_path)
+            except BackendError as e:
+                return WriteResult(error=e)
 
-        # Check existence
-        try:
-            self._sftp.stat(remote)
-            exists = True
-        except FileNotFoundError:
-            exists = False
+            # Check if it's a directory
+            try:
+                st_mode = self._sftp.stat(remote).st_mode
+                if self._attr_is_dir_maybe(st_mode):
+                    return WriteResult(
+                        error=BackendError(code=ErrorCode.IS_DIR, path=file_path, message="目标是目录，无法写入"),
+                    )
+            except FileNotFoundError:
+                pass  # Doesn't exist yet – fine for write
 
-        if exists and not overwrite:
-            return WriteResult(
-                error=BackendError(code=ErrorCode.ALREADY_EXISTS, path=file_path, message="文件已存在，请用 edit() 修改或用 overwrite=True 覆盖"),
-            )
+            # Check existence
+            try:
+                self._sftp.stat(remote)
+                exists = True
+            except FileNotFoundError:
+                exists = False
 
-        # Ensure parent directories exist
-        self._ensure_remote_dir(str(PurePosixPath(remote).parent))
+            if exists and not overwrite:
+                return WriteResult(
+                    error=BackendError(code=ErrorCode.ALREADY_EXISTS, path=file_path, message="文件已存在，请用 edit() 修改或用 overwrite=True 覆盖"),
+                )
 
-        try:
-            with self._sftp.open(remote, "w") as f:
-                f.write(content)
-        except OSError as e:
-            return WriteResult(error=BackendError(code=ErrorCode.IO_ERROR, path=file_path, message=str(e)))
+            # Ensure parent directories exist
+            self._ensure_remote_dir(str(PurePosixPath(remote).parent))
 
-        return WriteResult(path=file_path)
+            try:
+                with self._sftp.open(remote, "w") as f:
+                    f.write(content)
+            except OSError as e:
+                return WriteResult(error=BackendError(code=ErrorCode.IO_ERROR, path=file_path, message=str(e)))
+
+            return WriteResult(path=file_path)
 
     def _ensure_remote_dir(self, remote_path: str) -> None:
         """Create remote directory tree, like ``mkdir -p``."""
@@ -722,41 +726,42 @@ class SshBackend(BackendProtocol):
         round-trips).  Otherwise falls back to SFTP: download → local
         replace → upload.
         """
-        if not old_str:
-            return EditResult(error=BackendError(code=ErrorCode.INVALID, message="old_str 不能为空"))
-        if not self._check_edit_allowed(file_path):
-            return EditResult(
-                error=BackendError(code=ErrorCode.EDIT_NOT_ALLOWED, path=file_path, message="路径不允许编辑"),
-            )
-        try:
-            remote = self._resolve(file_path)
-        except BackendError as e:
-            return EditResult(error=e)
-
-        # Check if path exists and is not a directory
-        try:
-            st_mode = self._sftp.stat(remote).st_mode
-            if self._attr_is_dir_maybe(st_mode):
+        with self._sync_lock:
+            if not old_str:
+                return EditResult(error=BackendError(code=ErrorCode.INVALID, message="old_str 不能为空"))
+            if not self._check_edit_allowed(file_path):
                 return EditResult(
-                    error=BackendError(code=ErrorCode.IS_DIR, path=file_path, message="目标是目录，无法编辑"),
+                    error=BackendError(code=ErrorCode.EDIT_NOT_ALLOWED, path=file_path, message="路径不允许编辑"),
                 )
-        except FileNotFoundError:
-            return EditResult(
-                error=BackendError(
-                    code=ErrorCode.NOT_FOUND,
-                    path=file_path,
-                    message=f"Cannot edit '{file_path}': file not found. To create a new file, use write().",
-                ),
-            )
+            try:
+                remote = self._resolve(file_path)
+            except BackendError as e:
+                return EditResult(error=e)
 
-        # Normalize line endings
-        old_str = old_str.replace("\r\n", "\n").replace("\r", "\n")
-        new_str = new_str.replace("\r\n", "\n").replace("\r", "\n")
+            # Check if path exists and is not a directory
+            try:
+                st_mode = self._sftp.stat(remote).st_mode
+                if self._attr_is_dir_maybe(st_mode):
+                    return EditResult(
+                        error=BackendError(code=ErrorCode.IS_DIR, path=file_path, message="目标是目录，无法编辑"),
+                    )
+            except FileNotFoundError:
+                return EditResult(
+                    error=BackendError(
+                        code=ErrorCode.NOT_FOUND,
+                        path=file_path,
+                        message=f"Cannot edit '{file_path}': file not found. To create a new file, use write().",
+                    ),
+                )
 
-        if self._has_python3:
-            return self._edit_remote(file_path, remote, old_str, new_str, replace_all)
-        else:
-            return self._edit_via_sftp(file_path, remote, old_str, new_str, replace_all)
+            # Normalize line endings
+            old_str = old_str.replace("\r\n", "\n").replace("\r", "\n")
+            new_str = new_str.replace("\r\n", "\n").replace("\r", "\n")
+
+            if self._has_python3:
+                return self._edit_remote(file_path, remote, old_str, new_str, replace_all)
+            else:
+                return self._edit_via_sftp(file_path, remote, old_str, new_str, replace_all)
 
     def _edit_remote(
         self,
@@ -873,12 +878,13 @@ class SshBackend(BackendProtocol):
         3. ``python3`` os.walk (portable last resort, used when
            GNU grep fails e.g. BSD/macOS with ``--include`` glob)
         """
-        # Delegate to the internal collector which returns raw full matches,
-        # then apply limit at this level.
-        raw = self._grep_raw(pattern, path, glob, regex)
-        if raw.error and not raw.matches:
-            return raw  # fatal error, no matches
-        return self._apply_grep_limit(raw.matches or [], offset, limit)
+        with self._sync_lock:
+            # Delegate to the internal collector which returns raw full matches,
+            # then apply limit at this level.
+            raw = self._grep_raw(pattern, path, glob, regex)
+            if raw.error and not raw.matches:
+                return raw  # fatal error, no matches
+            return self._apply_grep_limit(raw.matches or [], offset, limit)
 
     def _grep_raw(
         self,
@@ -1178,25 +1184,26 @@ class SshBackend(BackendProtocol):
         for full wildcard support (``*``, ``**``, ``?``, ``[...]``).
         Falls back to ``find`` when python3 is unavailable.
         """
-        if not pattern:
-            return GlobResult(error=BackendError(code=ErrorCode.INVALID, message="搜索模式不能为空"))
-        try:
-            remote = self._resolve(path)
-        except BackendError as e:
-            return GlobResult(error=e)
+        with self._sync_lock:
+            if not pattern:
+                return GlobResult(error=BackendError(code=ErrorCode.INVALID, message="搜索模式不能为空"))
+            try:
+                remote = self._resolve(path)
+            except BackendError as e:
+                return GlobResult(error=e)
 
-        # Check that path is a directory
-        try:
-            st_mode = self._sftp.stat(remote).st_mode
-            if not self._attr_is_dir_maybe(st_mode):
-                return GlobResult(error=BackendError(code=ErrorCode.NOT_DIR, path=path, message="目标是文件，不是目录"))
-        except FileNotFoundError:
-            return GlobResult(error=BackendError(code=ErrorCode.NOT_FOUND, path=path, message="路径不存在"))
+            # Check that path is a directory
+            try:
+                st_mode = self._sftp.stat(remote).st_mode
+                if not self._attr_is_dir_maybe(st_mode):
+                    return GlobResult(error=BackendError(code=ErrorCode.NOT_DIR, path=path, message="目标是文件，不是目录"))
+            except FileNotFoundError:
+                return GlobResult(error=BackendError(code=ErrorCode.NOT_FOUND, path=path, message="路径不存在"))
 
-        if self._has_python3:
-            return self._glob_python(pattern, remote)
-        else:
-            return self._glob_find(pattern, remote)
+            if self._has_python3:
+                return self._glob_python(pattern, remote)
+            else:
+                return self._glob_find(pattern, remote)
 
     # ------------------------------------------------------------------
     # Glob via remote Python (full ** / path-prefix support)
@@ -1362,164 +1369,165 @@ class SshBackend(BackendProtocol):
         Returns:
             Formatted tree string.
         """
-        if depth < 1:
-            return f"Invalid depth value: {depth}. Depth must be a positive integer (>= 1)."
+        with self._sync_lock:
+            if depth < 1:
+                return f"Invalid depth value: {depth}. Depth must be a positive integer (>= 1)."
 
-        try:
-            remote = self._resolve(path)
-        except BackendError as e:
-            return str(e)
+            try:
+                remote = self._resolve(path)
+            except BackendError as e:
+                return str(e)
 
-        # Check if path exists and is a directory (T1 & T2 fix)
-        try:
-            st_mode = self._sftp.stat(remote).st_mode
-            if not self._attr_is_dir_maybe(st_mode):
-                return f"'{path}' is a file, not a directory"
-        except FileNotFoundError:
-            return f"Path '{path}' not found"
-        except OSError as e:
-            return f"Cannot access '{path}': {e}"
+            # Check if path exists and is a directory (T1 & T2 fix)
+            try:
+                st_mode = self._sftp.stat(remote).st_mode
+                if not self._attr_is_dir_maybe(st_mode):
+                    return f"'{path}' is a file, not a directory"
+            except FileNotFoundError:
+                return f"Path '{path}' not found"
+            except OSError as e:
+                return f"Cannot access '{path}': {e}"
 
-        if self._has_python3:
-            out, err, exit_code = self._tree_python(remote, depth)
-        else:
-            out, err, exit_code = self._tree_find(remote, depth)
-
-        # Map virtual ignore_dirs → relative paths expected in output
-        wr = self.workspace_root.value
-        ignore_rel_paths: frozenset[str] = frozenset(
-            p[len(wr):].lstrip("/") for p in self._ignore_dirs
-        )
-
-        if exit_code > 1 or not out.strip():
-            return f"(empty or inaccessible)"
-
-        # Parse find output into tree entries
-        dirs: set[str] = set()
-        file_entries: list[tuple[str, str, int]] = []  # (parent, name, size)
-
-        for line in out.splitlines():
-            if not line.strip():
-                continue
-            parts = line.split(" ", 2)
-            if len(parts) < 2:
-                continue
-            entry_type = parts[0]
-            if entry_type == "d":
-                dirs.add(parts[1])
-            elif entry_type == "f" and len(parts) >= 3:
-                rel_path = parts[1]
-                try:
-                    size = int(parts[2])
-                except ValueError:
-                    size = 0
-                parent = str(PurePosixPath(rel_path).parent) if "/" in rel_path else "."
-                name = PurePosixPath(rel_path).name
-                file_entries.append((parent, name, size))
-
-        # Build depth from relative paths
-        def _path_depth(rel: str) -> int:
-            if rel == "." or not rel:
-                return 1
-            return rel.count("/") + 1
-
-        # Filter out children of ignored dirs AND the ignored dirs themselves
-        # (we'll add ignored dirs back later with the ignore marker)
-        filtered_dirs: set[str] = set()
-        for d in dirs:
-            if any(
-                d == ign or d.startswith(ign + "/")
-                for ign in ignore_rel_paths
-            ):
-                continue
-            filtered_dirs.add(d)
-
-        filtered_files: list[tuple[str, str, int]] = []
-        for parent, name, size in file_entries:
-            # Build full relative path for checking
-            full_rel = f"{parent}/{name}" if parent != "." else name
-            if any(
-                full_rel == ign or full_rel.startswith(ign + "/")
-                for ign in ignore_rel_paths
-            ):
-                continue
-            filtered_files.append((parent, name, size))
-
-        # Build (sort_path, TreeEntry) tuples — sort by full path so that
-        # files appear immediately after their parent directory instead of
-        # all being grouped at the bottom.
-        dir_file_entries: list[tuple[str, TreeEntry]] = []
-
-        # Directories
-        for d in filtered_dirs:
-            d_depth = _path_depth(d)
-            if d_depth > depth:
-                continue
-
-            # Determine marker
-            marker: Literal["", "empty", "ignore", "depth_exceeded"] = ""
-
-            if d_depth == depth:
-                # At depth limit — check via SFTP if this dir has children
-                dir_remote_path = f"{remote}/{d}"
-                try:
-                    dir_attrs = self._sftp.listdir_attr(dir_remote_path)
-                    has_children = len(dir_attrs) > 0
-                except (FileNotFoundError, OSError):
-                    has_children = False
-                marker = "depth_exceeded" if has_children else "empty"
+            if self._has_python3:
+                out, err, exit_code = self._tree_python(remote, depth)
             else:
-                # Check emptiness from parsed data
-                has_children = any(
-                    fp == d for fp, _n, _s in filtered_files
-                ) or any(
-                    sub != d and sub.startswith(d + "/")
-                    for sub in filtered_dirs
-                )
-                if not has_children:
-                    marker = "empty"
+                out, err, exit_code = self._tree_find(remote, depth)
 
-            # Sort path: directory paths get trailing "/" so they sort
-            # before files in the same directory (e.g. "0849fe09/" < "0849fe09/file.png")
-            sort_path = d + "/"
-            dir_file_entries.append((sort_path, TreeEntry(
-                name=PurePosixPath(d).name + "/",
-                depth=d_depth,
-                marker=marker,
-            )))
+            # Map virtual ignore_dirs → relative paths expected in output
+            wr = self.workspace_root.value
+            ignore_rel_paths: frozenset[str] = frozenset(
+                p[len(wr):].lstrip("/") for p in self._ignore_dirs
+            )
 
-        # Add ignored dirs (show but with ignore marker, no children)
-        for ign in sorted(ignore_rel_paths):
-            if ign in dirs:  # only if it actually exists
-                sort_path = ign + "/"
+            if exit_code > 1 or not out.strip():
+                return f"(empty or inaccessible)"
+
+            # Parse find output into tree entries
+            dirs: set[str] = set()
+            file_entries: list[tuple[str, str, int]] = []  # (parent, name, size)
+
+            for line in out.splitlines():
+                if not line.strip():
+                    continue
+                parts = line.split(" ", 2)
+                if len(parts) < 2:
+                    continue
+                entry_type = parts[0]
+                if entry_type == "d":
+                    dirs.add(parts[1])
+                elif entry_type == "f" and len(parts) >= 3:
+                    rel_path = parts[1]
+                    try:
+                        size = int(parts[2])
+                    except ValueError:
+                        size = 0
+                    parent = str(PurePosixPath(rel_path).parent) if "/" in rel_path else "."
+                    name = PurePosixPath(rel_path).name
+                    file_entries.append((parent, name, size))
+
+            # Build depth from relative paths
+            def _path_depth(rel: str) -> int:
+                if rel == "." or not rel:
+                    return 1
+                return rel.count("/") + 1
+
+            # Filter out children of ignored dirs AND the ignored dirs themselves
+            # (we'll add ignored dirs back later with the ignore marker)
+            filtered_dirs: set[str] = set()
+            for d in dirs:
+                if any(
+                    d == ign or d.startswith(ign + "/")
+                    for ign in ignore_rel_paths
+                ):
+                    continue
+                filtered_dirs.add(d)
+
+            filtered_files: list[tuple[str, str, int]] = []
+            for parent, name, size in file_entries:
+                # Build full relative path for checking
+                full_rel = f"{parent}/{name}" if parent != "." else name
+                if any(
+                    full_rel == ign or full_rel.startswith(ign + "/")
+                    for ign in ignore_rel_paths
+                ):
+                    continue
+                filtered_files.append((parent, name, size))
+
+            # Build (sort_path, TreeEntry) tuples — sort by full path so that
+            # files appear immediately after their parent directory instead of
+            # all being grouped at the bottom.
+            dir_file_entries: list[tuple[str, TreeEntry]] = []
+
+            # Directories
+            for d in filtered_dirs:
+                d_depth = _path_depth(d)
+                if d_depth > depth:
+                    continue
+
+                # Determine marker
+                marker: Literal["", "empty", "ignore", "depth_exceeded"] = ""
+
+                if d_depth == depth:
+                    # At depth limit — check via SFTP if this dir has children
+                    dir_remote_path = f"{remote}/{d}"
+                    try:
+                        dir_attrs = self._sftp.listdir_attr(dir_remote_path)
+                        has_children = len(dir_attrs) > 0
+                    except (FileNotFoundError, OSError):
+                        has_children = False
+                    marker = "depth_exceeded" if has_children else "empty"
+                else:
+                    # Check emptiness from parsed data
+                    has_children = any(
+                        fp == d for fp, _n, _s in filtered_files
+                    ) or any(
+                        sub != d and sub.startswith(d + "/")
+                        for sub in filtered_dirs
+                    )
+                    if not has_children:
+                        marker = "empty"
+
+                # Sort path: directory paths get trailing "/" so they sort
+                # before files in the same directory (e.g. "0849fe09/" < "0849fe09/file.png")
+                sort_path = d + "/"
                 dir_file_entries.append((sort_path, TreeEntry(
-                    name=ign.split("/")[-1] + "/",
-                    depth=ign.count("/") + 1,
-                    marker="ignore",
+                    name=PurePosixPath(d).name + "/",
+                    depth=d_depth,
+                    marker=marker,
                 )))
 
-        # Files
-        for parent, name, size in filtered_files:
-            d = (parent + "/" + name).count("/") + 1 if parent != "." else 1
-            if d > depth:
-                continue
-            sort_path = (parent + "/" + name) if parent != "." else name
-            dir_file_entries.append((sort_path, TreeEntry(
-                name=f"{name} ({human_size(size)})",
-                depth=d,
-            )))
+            # Add ignored dirs (show but with ignore marker, no children)
+            for ign in sorted(ignore_rel_paths):
+                if ign in dirs:  # only if it actually exists
+                    sort_path = ign + "/"
+                    dir_file_entries.append((sort_path, TreeEntry(
+                        name=ign.split("/")[-1] + "/",
+                        depth=ign.count("/") + 1,
+                        marker="ignore",
+                    )))
 
-        # Sort all entries by their full relative path so children
-        # appear right after their parent directory
-        dir_file_entries.sort(key=lambda x: x[0])
+            # Files
+            for parent, name, size in filtered_files:
+                d = (parent + "/" + name).count("/") + 1 if parent != "." else 1
+                if d > depth:
+                    continue
+                sort_path = (parent + "/" + name) if parent != "." else name
+                dir_file_entries.append((sort_path, TreeEntry(
+                    name=f"{name} ({human_size(size)})",
+                    depth=d,
+                )))
 
-        # Build final entries list
-        entries: list[TreeEntry] = []
-        root_name = path.name
-        entries.append(TreeEntry(name=root_name + "/", depth=0))
-        entries.extend(e[1] for e in dir_file_entries)
+            # Sort all entries by their full relative path so children
+            # appear right after their parent directory
+            dir_file_entries.sort(key=lambda x: x[0])
 
-        return format_tree_entries(entries)
+            # Build final entries list
+            entries: list[TreeEntry] = []
+            root_name = path.name
+            entries.append(TreeEntry(name=root_name + "/", depth=0))
+            entries.extend(e[1] for e in dir_file_entries)
+
+            return format_tree_entries(entries)
 
     # ------------------------------------------------------------------
     # Tree via remote Python (portable, no GNU find dependencies)
@@ -1591,38 +1599,39 @@ class SshBackend(BackendProtocol):
         Directories are rejected — the agent must remove files inside
         the directory individually before the directory can be deleted.
         """
-        if not self._check_edit_allowed(path):
-            return DeleteResult(
-                error=BackendError(code=ErrorCode.EDIT_NOT_ALLOWED, path=path, message="路径不允许删除"),
-                path=path,
-            )
-        try:
-            remote = self._resolve(path)
-        except BackendError as e:
-            return DeleteResult(error=e, path=path)
-
-        # Safety: refuse to delete the remote root
-        if remote.rstrip("/") == self._remote_root.rstrip("/"):
-            return DeleteResult(error=BackendError(code=ErrorCode.INVALID, path=path, message="不能删除根工作目录"), path=path)
-
-        # Reject directories
-        try:
-            st_mode = self._sftp.stat(remote).st_mode
-            if self._attr_is_dir_maybe(st_mode):
+        with self._sync_lock:
+            if not self._check_edit_allowed(path):
                 return DeleteResult(
-                    error=BackendError(code=ErrorCode.IS_DIR, path=path, message="目标是目录，delete 工具只能删除单个文件"),
+                    error=BackendError(code=ErrorCode.EDIT_NOT_ALLOWED, path=path, message="路径不允许删除"),
                     path=path,
                 )
-        except FileNotFoundError:
-            return DeleteResult(error=BackendError(code=ErrorCode.NOT_FOUND, path=path, message="路径不存在"), path=path)
+            try:
+                remote = self._resolve(path)
+            except BackendError as e:
+                return DeleteResult(error=e, path=path)
 
-        remote_escaped = shlex.quote(remote)
-        out, err, exit_code = self._exec(f"rm -f {remote_escaped}")
+            # Safety: refuse to delete the remote root
+            if remote.rstrip("/") == self._remote_root.rstrip("/"):
+                return DeleteResult(error=BackendError(code=ErrorCode.INVALID, path=path, message="不能删除根工作目录"), path=path)
 
-        if exit_code != 0:
-            return DeleteResult(error=BackendError(code=ErrorCode.IO_ERROR, path=path, message=err or out), path=path)
+            # Reject directories
+            try:
+                st_mode = self._sftp.stat(remote).st_mode
+                if self._attr_is_dir_maybe(st_mode):
+                    return DeleteResult(
+                        error=BackendError(code=ErrorCode.IS_DIR, path=path, message="目标是目录，delete 工具只能删除单个文件"),
+                        path=path,
+                    )
+            except FileNotFoundError:
+                return DeleteResult(error=BackendError(code=ErrorCode.NOT_FOUND, path=path, message="路径不存在"), path=path)
 
-        return DeleteResult(path=path)
+            remote_escaped = shlex.quote(remote)
+            out, err, exit_code = self._exec(f"rm -f {remote_escaped}")
+
+            if exit_code != 0:
+                return DeleteResult(error=BackendError(code=ErrorCode.IO_ERROR, path=path, message=err or out), path=path)
+
+            return DeleteResult(path=path)
 
     # ------------------------------------------------------------------
     # Extra: execute
@@ -1643,47 +1652,48 @@ class SshBackend(BackendProtocol):
         Returns:
             Formatted output with stdout, stderr, and exit code.
         """
-        if not command or not isinstance(command, str):
-            return "Error: Command must be a non-empty string."
+        with self._sync_lock:
+            if not command or not isinstance(command, str):
+                return "Error: Command must be a non-empty string."
 
-        effective_timeout = timeout if timeout is not None else self._execute_timeout
-        if effective_timeout <= 0:
-            msg = f"timeout must be positive, got {effective_timeout}"
-            raise ValueError(msg)
+            effective_timeout = timeout if timeout is not None else self._execute_timeout
+            if effective_timeout <= 0:
+                msg = f"timeout must be positive, got {effective_timeout}"
+                raise ValueError(msg)
 
-        # Prepend a cd to the remote root so the command runs in the
-        # expected working directory
-        full_cmd = f"cd {shlex.quote(self._remote_root)} && {command}"
+            # Prepend a cd to the remote root so the command runs in the
+            # expected working directory
+            full_cmd = f"cd {shlex.quote(self._remote_root)} && {command}"
 
-        try:
-            out, err, exit_code = self._exec(full_cmd, timeout=effective_timeout)
-        except Exception as e:
-            return f"Error executing command ({type(e).__name__}): {e}"
+            try:
+                out, err, exit_code = self._exec(full_cmd, timeout=effective_timeout)
+            except Exception as e:
+                return f"Error executing command ({type(e).__name__}): {e}"
 
-        output_parts: list[str] = []
-        if out:
-            output_parts.append(out.rstrip())
+            output_parts: list[str] = []
+            if out:
+                output_parts.append(out.rstrip())
 
-        # Timeout message: display prominently, not wrapped in [stderr]
-        is_timeout = exit_code == -1 and err.startswith("Timeout:")
-        if err:
-            for line in err.strip().split("\n"):
-                if is_timeout:
-                    output_parts.append(line)
-                else:
-                    output_parts.append(f"[stderr] {line}")
+            # Timeout message: display prominently, not wrapped in [stderr]
+            is_timeout = exit_code == -1 and err.startswith("Timeout:")
+            if err:
+                for line in err.strip().split("\n"):
+                    if is_timeout:
+                        output_parts.append(line)
+                    else:
+                        output_parts.append(f"[stderr] {line}")
 
-        output = "\n".join(output_parts) if output_parts else "<no output>"
+            output = "\n".join(output_parts) if output_parts else "<no output>"
 
-        # Truncation
-        if len(output) > self._max_output_bytes:
-            output = output[: self._max_output_bytes]
-            output += f"\n\n... Output truncated at {self._max_output_bytes} bytes."
+            # Truncation
+            if len(output) > self._max_output_bytes:
+                output = output[: self._max_output_bytes]
+                output += f"\n\n... Output truncated at {self._max_output_bytes} bytes."
 
-        if exit_code != 0:
-            output = f"{output.rstrip()}\n\nExit code: {exit_code}"
+            if exit_code != 0:
+                output = f"{output.rstrip()}\n\nExit code: {exit_code}"
 
-        return output
+            return output
 
     # ------------------------------------------------------------------
     # Async variants — all serialized via _async_lock to prevent
@@ -1785,27 +1795,28 @@ class SshBackend(BackendProtocol):
         Binary files are written directly via SFTP (not base64-encoded
         as text), mirroring ``LocalBackend.upload_files``.
         """
-        results: list[UploadFileResult] = []
-        for path, raw_content in files:
-            if not self._check_edit_allowed(path):
-                results.append(UploadFileResult(
-                    path=path,
-                    error=BackendError(code=ErrorCode.EDIT_NOT_ALLOWED, path=path, message="路径不允许写入"),
-                ))
-                continue
-            try:
-                remote = self._resolve(path)
-                self._ensure_remote_dir(str(PurePosixPath(remote).parent))
-                with self._sftp.open(remote, "wb") as f:
-                    f.write(raw_content)
-                results.append(UploadFileResult(path=path))
-            except OSError as e:
-                results.append(UploadFileResult(path=path, error=BackendError(code=ErrorCode.IO_ERROR, path=path, message=str(e))))
-            except Exception as e:
-                results.append(
-                    UploadFileResult(
-                        path=path, error=BackendError(code=ErrorCode.INVALID, path=path, message=f"{type(e).__name__}: {e}")
+        with self._sync_lock:
+            results: list[UploadFileResult] = []
+            for path, raw_content in files:
+                if not self._check_edit_allowed(path):
+                    results.append(UploadFileResult(
+                        path=path,
+                        error=BackendError(code=ErrorCode.EDIT_NOT_ALLOWED, path=path, message="路径不允许写入"),
+                    ))
+                    continue
+                try:
+                    remote = self._resolve(path)
+                    self._ensure_remote_dir(str(PurePosixPath(remote).parent))
+                    with self._sftp.open(remote, "wb") as f:
+                        f.write(raw_content)
+                    results.append(UploadFileResult(path=path))
+                except OSError as e:
+                    results.append(UploadFileResult(path=path, error=BackendError(code=ErrorCode.IO_ERROR, path=path, message=str(e))))
+                except Exception as e:
+                    results.append(
+                        UploadFileResult(
+                            path=path, error=BackendError(code=ErrorCode.INVALID, path=path, message=f"{type(e).__name__}: {e}")
+                        )
                     )
-                )
-        return results
+            return results
 
