@@ -38,6 +38,7 @@ from mambo_agents.backends.schemas import BackendError, ErrorCode, VirtualPath, 
 from mambo_agents.backends.utils import (
     TreeEntry,
     detect_trailing_newline_mismatch,
+    normalize_line_endings,
     fnmatch_path,
     format_tree_entries,
     format_with_line_numbers,
@@ -93,6 +94,7 @@ class StoreBackend(BackendProtocol):
         self._thread_id = thread_id
         self._store = store
         self._lock = threading.RLock()
+        self._async_lock = asyncio.Lock()
 
         # --- Immutable template — injected on first access per thread ---
         self._initial_files: dict[str, dict[str, str]] = {}
@@ -129,24 +131,22 @@ class StoreBackend(BackendProtocol):
         """
         if self._store is not None:
             return self._store
-        with self._lock:
-            if self._store is not None:
-                return self._store
-            try:
-                store_result = get_store()
-            except RuntimeError:
-                from langgraph.store.memory import InMemoryStore
-                self._store = InMemoryStore()
-                return self._store
+        try:
+            store_result = get_store()
+        except RuntimeError:
+            # Not inside a graph runnable context — use InMemoryStore as fallback
+            from langgraph.store.memory import InMemoryStore
+            self._store = InMemoryStore()
+            return self._store
 
-            if store_result is None:
-                raise RuntimeError(
-                    "StoreBackend requires a LangGraph store, but get_store() returned None. "
-                    "The graph was likely compiled without a store= parameter. "
-                    "Fix: pass store= when constructing StoreBackend, "
-                    "or pass store= to graph.compile()."
-                )
-            return store_result
+        if store_result is None:
+            raise RuntimeError(
+                "StoreBackend requires a LangGraph store, but get_store() returned None. "
+                "The graph was likely compiled without a store= parameter. "
+                "Fix: pass store= when constructing StoreBackend, "
+                "or pass store= to graph.compile()."
+            )
+        return store_result
 
     @staticmethod
     def _get_namespace(thread_id: str) -> tuple[str, str]:
@@ -182,6 +182,16 @@ class StoreBackend(BackendProtocol):
             return
         for path, value in self._initial_files.items():
             store.put(namespace, path, value)
+
+    async def _ainject_initial_files(self, store: BaseStore, namespace: tuple[str, str]) -> None:
+        """Async: inject ``_initial_files`` on first access for a thread."""
+        if not self._initial_files:
+            return
+        existing = await store.asearch(namespace, limit=1)
+        if existing:
+            return
+        for path, value in self._initial_files.items():
+            await store.aput(namespace, path, value)
 
     def _search_store_paginated(
         self,
@@ -247,14 +257,16 @@ class StoreBackend(BackendProtocol):
     # ------------------------------------------------------------------
 
     async def _aget_all_files(self, thread_id: str) -> dict[str, dict[str, str]]:
-        """Async: return ``{path: {content, encoding}}`` for all files in *thread_id*."""
+        """Async: return ``{path: {content, encoding}}`` for all files in *thread_id*.
+
+        Caller must hold ``self._async_lock``.
+        """
         store = self._get_store()
         namespace = self._get_namespace(thread_id)
 
-        with self._lock:
-            if thread_id not in self._initialized_threads:
-                self._inject_initial_files(store, namespace)
-                self._initialized_threads.add(thread_id)
+        if thread_id not in self._initialized_threads:
+            await self._ainject_initial_files(store, namespace)
+            self._initialized_threads.add(thread_id)
 
         items = await self._asearch_store_paginated(store, namespace)
         files: dict[str, dict[str, str]] = {}
@@ -264,14 +276,16 @@ class StoreBackend(BackendProtocol):
         return files
 
     async def _aget_file(self, thread_id: str, file_path: str) -> dict[str, str] | None:
-        """Async: return ``{content, encoding}`` for a single file, or ``None``."""
+        """Async: return ``{content, encoding}`` for a single file, or ``None``.
+
+        Caller must hold ``self._async_lock``.
+        """
         store = self._get_store()
         namespace = self._get_namespace(thread_id)
 
-        with self._lock:
-            if thread_id not in self._initialized_threads:
-                self._inject_initial_files(store, namespace)
-                self._initialized_threads.add(thread_id)
+        if thread_id not in self._initialized_threads:
+            await self._ainject_initial_files(store, namespace)
+            self._initialized_threads.add(thread_id)
 
         item = await store.aget(namespace, file_path)
         if item is None:
@@ -280,7 +294,10 @@ class StoreBackend(BackendProtocol):
                 "encoding": item.value.get("encoding", "utf-8")}
 
     async def _aput_file(self, thread_id: str, file_path: str, content: str, encoding: str) -> None:
-        """Async: store a single file."""
+        """Async: store a single file.
+
+        Caller must hold ``self._async_lock``.
+        """
         store = self._get_store()
         namespace = self._get_namespace(thread_id)
         await store.aput(namespace, file_path, {"content": content, "encoding": encoding})
@@ -414,16 +431,17 @@ class StoreBackend(BackendProtocol):
             ))
         if file_path.value.endswith("/"):
             return ReadResult(error=BackendError(code=ErrorCode.IS_DIR, path=file_path, message="目标是目录"))
-        tid = self._resolve_thread_id()
-        fd = await self._aget_file(tid, file_path.normalized)
-        if fd is None:
-            # 检查是否为目录（有子文件/目录以该路径为前缀）
-            files = await self._aget_all_files(tid)
-            prefix = file_path.normalized + "/"
-            for fpath in files:
-                if fpath.startswith(prefix):
-                    return ReadResult(error=BackendError(code=ErrorCode.IS_DIR, path=file_path, message="目标是目录"))
-            return ReadResult(error=BackendError(code=ErrorCode.NOT_FOUND, path=file_path, message="文件不存在"))
+        async with self._async_lock:
+            tid = self._resolve_thread_id()
+            fd = await self._aget_file(tid, file_path.normalized)
+            if fd is None:
+                # 检查是否为目录（有子文件/目录以该路径为前缀）
+                files = await self._aget_all_files(tid)
+                prefix = file_path.normalized + "/"
+                for fpath in files:
+                    if fpath.startswith(prefix):
+                        return ReadResult(error=BackendError(code=ErrorCode.IS_DIR, path=file_path, message="目标是目录"))
+                return ReadResult(error=BackendError(code=ErrorCode.NOT_FOUND, path=file_path, message="文件不存在"))
 
         return self._build_read_result(file_path, fd, offset, limit, include_line_numbers)
 
@@ -516,7 +534,9 @@ class StoreBackend(BackendProtocol):
                     error=BackendError(code=ErrorCode.INVALID, path=file_path, message="文件是二进制格式，请用 write() 覆盖"),
                 )
 
-            existing_content = existing_fd["content"]
+            old_str = normalize_line_endings(old_str)
+            new_str = normalize_line_endings(new_str)
+            existing_content = normalize_line_endings(existing_fd["content"])
             occurrences = existing_content.count(old_str)
 
             if occurrences == 0:
@@ -591,6 +611,197 @@ class StoreBackend(BackendProtocol):
         return _glob_in_memory(files, pattern, path.normalized)
 
     # ------------------------------------------------------------------
+    # Async core file operations — override BackendProtocol defaults
+    # to avoid asyncio.to_thread and thread-pool exhaustion.
+    # ------------------------------------------------------------------
+
+    async def als(self, path: VirtualPath) -> LsResult:
+        normalized = path.normalized + "/"
+        tid = self._resolve_thread_id()
+        async with self._async_lock:
+            files = await self._aget_all_files(tid)
+
+        if path.normalized in files:
+            return LsResult(
+                error=BackendError(code=ErrorCode.NOT_DIR, path=path, message="目标是文件，不是目录")
+            )
+
+        infos: list[FileInfo] = []
+        subdirs: set[str] = set()
+        for fpath, fd in files.items():
+            if not fpath.startswith(normalized):
+                continue
+            relative = fpath[len(normalized):]
+            if "/" in relative:
+                subdirs.add(normalized + relative.split("/")[0])
+            else:
+                infos.append(FileInfo(path=VirtualPath(fpath), is_dir=False, size=len(fd["content"])))
+
+        if not infos and not subdirs:
+            if path.normalized == self.workspace_root.normalized:
+                return LsResult(entries=[])
+            return LsResult(error=BackendError(code=ErrorCode.NOT_FOUND, path=path, message="路径不存在"))
+
+        for sd in sorted(subdirs):
+            infos.append(FileInfo(path=VirtualPath(sd), is_dir=True, size=0))
+
+        infos.sort(key=lambda fi: fi.path)
+        return LsResult(entries=infos)
+
+    async def aread(
+        self,
+        file_path: VirtualPath,
+        offset: int = 0,
+        limit: int = 2000,
+        include_line_numbers: bool = False,
+    ) -> ReadResult:
+        if offset < 0:
+            return ReadResult(error=BackendError(
+                code=ErrorCode.INVALID, path=file_path,
+                message=f"offset must be non-negative, got {offset}",
+            ))
+        if limit < 1:
+            return ReadResult(error=BackendError(
+                code=ErrorCode.INVALID, path=file_path,
+                message=f"limit must be positive, got {limit}",
+            ))
+        result = await self.aread_raw(file_path, offset, limit, include_line_numbers)
+        return self._apply_read_limit(result, file_path)
+
+    async def awrite(
+        self, file_path: VirtualPath, content: str, overwrite: bool = False,
+    ) -> WriteResult:
+        if file_path.value.endswith("/"):
+            return WriteResult(error=BackendError(code=ErrorCode.IS_DIR, path=file_path, message="目标是目录"))
+        async with self._async_lock:
+            tid = self._resolve_thread_id()
+            files = await self._aget_all_files(tid)
+
+            prefix = file_path.normalized + "/"
+            for fpath in files:
+                if fpath.startswith(prefix):
+                    return WriteResult(
+                        error=BackendError(code=ErrorCode.IS_DIR, path=file_path, message="目标是目录，无法写入"),
+                    )
+            if file_path.normalized in files and not overwrite:
+                return WriteResult(
+                    error=BackendError(code=ErrorCode.ALREADY_EXISTS, path=file_path, message="文件已存在，请用 edit() 修改或用 overwrite=True 覆盖"),
+                )
+            encoding = "base64" if _get_file_type(file_path.normalized) != "text" else "utf-8"
+            await self._aput_file(tid, file_path.normalized, content, encoding)
+            return WriteResult(path=file_path.normalized)
+
+    async def aedit(
+        self,
+        file_path: VirtualPath,
+        old_str: str,
+        new_str: str,
+        *,
+        replace_all: bool = False,
+    ) -> EditResult:
+        if file_path.value.endswith("/"):
+            return EditResult(error=BackendError(code=ErrorCode.IS_DIR, path=file_path, message="目标是目录"))
+        if not old_str:
+            return EditResult(error=BackendError(code=ErrorCode.INVALID, message="old_str 不能为空"))
+        async with self._async_lock:
+            tid = self._resolve_thread_id()
+            files = await self._aget_all_files(tid)
+
+            prefix = file_path.normalized + "/"
+            for fpath in files:
+                if fpath.startswith(prefix):
+                    return EditResult(
+                        error=BackendError(code=ErrorCode.IS_DIR, path=file_path, message="目标是目录，无法编辑"),
+                    )
+            existing_fd = files.get(file_path.normalized)
+            if existing_fd is None:
+                return EditResult(
+                    error=BackendError(code=ErrorCode.NOT_FOUND, path=file_path, message="文件不存在，请用 write() 创建新文件"),
+                )
+            if existing_fd["encoding"] == "base64":
+                return EditResult(
+                    error=BackendError(code=ErrorCode.INVALID, path=file_path, message="文件是二进制格式，请用 write() 覆盖"),
+                )
+
+            old_str = normalize_line_endings(old_str)
+            new_str = normalize_line_endings(new_str)
+            existing_content = normalize_line_endings(existing_fd["content"])
+            occurrences = existing_content.count(old_str)
+
+            if occurrences == 0:
+                mismatch = detect_trailing_newline_mismatch(old_str, existing_content)
+                if mismatch is not None:
+                    return mismatch
+                return EditResult(
+                    error=BackendError(code=ErrorCode.OLD_STR_NOT_FOUND, path=file_path, message="未找到要替换的文本"),
+                )
+
+            if occurrences > 1 and not replace_all:
+                return EditResult(
+                    error=BackendError(code=ErrorCode.MULTI_OCCURRENCES, path=file_path, message=f"匹配到 {occurrences} 处，请用 replace_all=True 或提供更精确的上下文"),
+                )
+
+            new_content = existing_content.replace(old_str, new_str)
+            await self._aput_file(tid, file_path.normalized, new_content, existing_fd["encoding"])
+            return EditResult(path=file_path.normalized, occurrences=occurrences)
+
+    async def agrep(
+        self,
+        pattern: str,
+        path: VirtualPath,
+        glob: str | None = None,
+        regex: bool = True,
+        offset: int = 0,
+        limit: int | None = None,
+    ) -> GrepResult:
+        if not pattern:
+            return GrepResult(error=BackendError(code=ErrorCode.INVALID, message="搜索模式不能为空"))
+        if regex:
+            import re as _re
+            try:
+                _re.compile(pattern)
+            except _re.error as e:
+                return GrepResult(error=BackendError(code=ErrorCode.INVALID, message=f"无效正则: {e}"))
+        tid = self._resolve_thread_id()
+        async with self._async_lock:
+            files = await self._aget_all_files(tid)
+        normalized = path.normalized
+
+        # 检查路径是否存在（文件或目录）
+        if normalized != self.workspace_root.normalized:
+            # 检查是否为文件
+            if normalized in files:
+                pass  # 文件存在，可以继续（grep 单文件）
+            else:
+                # 检查是否为目录（有子文件/目录以该路径为前缀）
+                prefix = normalized + "/"
+                if not any(fpath.startswith(prefix) for fpath in files):
+                    return GrepResult(error=BackendError(code=ErrorCode.NOT_FOUND, path=path, message="路径不存在"))
+
+        raw_matches = _grep_in_memory(files, pattern, path.normalized, glob, regex, self._max_grep_matches)
+        return self._apply_grep_limit(raw_matches, offset, limit)
+
+    async def aglob(self, pattern: str, path: VirtualPath) -> GlobResult:
+        if not pattern:
+            return GlobResult(error=BackendError(code=ErrorCode.INVALID, message="搜索模式不能为空"))
+        tid = self._resolve_thread_id()
+        async with self._async_lock:
+            files = await self._aget_all_files(tid)
+        normalized = path.normalized
+
+        # 验证路径存在且为目录
+        if normalized != self.workspace_root.normalized:
+            # 检查是否为文件
+            if normalized in files:
+                return GlobResult(error=BackendError(code=ErrorCode.NOT_DIR, path=path, message="目标是文件，不是目录"))
+            # 检查是否为目录（有子文件/目录以该路径为前缀）
+            prefix = normalized + "/"
+            if not any(fpath.startswith(prefix) for fpath in files):
+                return GlobResult(error=BackendError(code=ErrorCode.NOT_FOUND, path=path, message="路径不存在"))
+
+        return _glob_in_memory(files, pattern, path.normalized)
+
+    # ------------------------------------------------------------------
     # Extra operations
     # ------------------------------------------------------------------
 
@@ -624,7 +835,27 @@ class StoreBackend(BackendProtocol):
     async def atree(self, path: VirtualPath, depth: int = 3) -> str:
         if isinstance(path, str):
             path = VirtualPath(path)
-        return await asyncio.to_thread(self.tree, path, depth)
+        if depth < 1:
+            return f"Invalid depth value: {depth}. Depth must be a positive integer (>= 1)."
+
+        tid = self._resolve_thread_id()
+        async with self._async_lock:
+            files = await self._aget_all_files(tid)
+        normalized = path.normalized
+
+        if normalized in files:
+            return f"Path '{path}' is not a directory."
+
+        prefix = normalized + "/" if normalized != self.workspace_root.normalized else ""
+        has_children = any(
+            fpath.startswith(prefix)
+            for fpath in files
+        ) if prefix else bool(files)
+        if not has_children and normalized != self.workspace_root.normalized:
+            return f"Path '{path}' not found."
+
+        entries = await _acollect_tree_entries(self, path, depth)
+        return format_tree_entries(entries)
 
     # ------------------------------------------------------------------
     # Developer API — upload / download (no thread_id param — locked at init)
@@ -731,13 +962,13 @@ def _grep_in_memory(
     else:
         compiled = _re.compile(_re.escape(pattern))
 
-    path_prefix = path.rstrip("/") if path != "/" else "/"
+    path_prefix = path.rstrip("/") if path != "/" else ""
 
     matches: list[GrepMatch] = []
     for fpath, fd in sorted(files.items()):
         if len(matches) >= max_matches:
             break
-        if path_prefix != "/" and not fpath.startswith(path_prefix):
+        if path_prefix and fpath != path_prefix and not fpath.startswith(path_prefix + "/"):
             continue
         if file_glob is not None and not fnmatch_path(_relative_to(fpath, path_prefix), file_glob):
             continue
@@ -813,6 +1044,56 @@ def _collect_tree_entries(
             else:
                 # 递归展开子目录
                 sub_entries = _collect_tree_entries(
+                    backend, fi.path, depth, current_depth + 1,
+                )
+                if not sub_entries:
+                    entries.append(TreeEntry(
+                        name=display_name,
+                        depth=current_depth,
+                        marker="empty",
+                    ))
+                else:
+                    entries.append(TreeEntry(
+                        name=display_name,
+                        depth=current_depth,
+                    ))
+                    entries.extend(sub_entries)
+        else:
+            entries.append(TreeEntry(
+                name=f"{fi.path.name} ({human_size(fi.size)})",
+                depth=current_depth,
+            ))
+    return entries
+
+
+async def _acollect_tree_entries(
+    backend: StoreBackend,
+    path: VirtualPath,
+    depth: int,
+    current_depth: int = 0,
+) -> list[TreeEntry]:
+    result = await backend.als(path)
+    if result.error or not result.entries:
+        return []
+
+    entries: list[TreeEntry] = []
+    for fi in result.entries:
+        if fi.is_dir:
+            display_name = fi.path.name + "/"
+            if current_depth + 1 >= depth:
+                sub_prefix = fi.path.normalized + "/"
+                tid = backend._resolve_thread_id()
+                async with backend._async_lock:
+                    all_files = await backend._aget_all_files(tid)
+                has_children = any(f.startswith(sub_prefix) for f in all_files)
+                marker = "depth_exceeded" if has_children else "empty"
+                entries.append(TreeEntry(
+                    name=display_name,
+                    depth=current_depth,
+                    marker=marker,
+                ))
+            else:
+                sub_entries = await _acollect_tree_entries(
                     backend, fi.path, depth, current_depth + 1,
                 )
                 if not sub_entries:

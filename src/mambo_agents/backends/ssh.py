@@ -44,6 +44,7 @@ from mambo_agents.backends.protocol import (
 from mambo_agents.backends.utils import (
     TreeEntry,
     check_path_allowed,
+    normalize_line_endings,
     format_tree_entries,
     format_validation_error,
     format_with_line_numbers,
@@ -754,9 +755,8 @@ class SshBackend(BackendProtocol):
                     ),
                 )
 
-            # Normalize line endings
-            old_str = old_str.replace("\r\n", "\n").replace("\r", "\n")
-            new_str = new_str.replace("\r\n", "\n").replace("\r", "\n")
+            old_str = normalize_line_endings(old_str)
+            new_str = normalize_line_endings(new_str)
 
             if self._has_python3:
                 return self._edit_remote(file_path, remote, old_str, new_str, replace_all)
@@ -835,6 +835,7 @@ class SshBackend(BackendProtocol):
         except OSError as e:
             return EditResult(error=BackendError(code=ErrorCode.IO_ERROR, path=file_path, message=str(e)))
 
+        content = normalize_line_endings(content)
         occurrences = content.count(old_str)
 
         if occurrences == 0:

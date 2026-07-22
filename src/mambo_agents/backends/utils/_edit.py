@@ -1,8 +1,19 @@
-"""Edit helpers: path allowlist/blocklist, trailing-newline detection."""
+"""Edit helpers: path allowlist/blocklist, trailing-newline detection, line-ending normalization."""
 
 from __future__ import annotations
 
 from mambo_agents.backends.schemas import BackendError, EditResult, ErrorCode, VirtualPath
+
+
+def normalize_line_endings(s: str) -> str:
+    """Normalize CRLF / CR to LF for consistent matching.
+
+    Python text-mode reads convert ``\\r\\n`` → ``\\n`` via universal
+    newlines, but LLM-provided strings or bytes-mode reads may retain
+    CRLF.  This function ensures both sides use LF-only before
+    ``str.count()`` / ``str.replace()``.
+    """
+    return s.replace("\r\n", "\n").replace("\r", "\n")
 
 
 def check_path_allowed(

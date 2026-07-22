@@ -46,6 +46,7 @@ from mambo_agents.backends.utils import (
     TreeEntry,
     check_path_allowed,
     detect_trailing_newline_mismatch,
+    normalize_line_endings,
     fnmatch_path,
     format_tree_entries,
     format_validation_error,
@@ -556,10 +557,8 @@ class LocalBackend(BackendProtocol):
             except OSError as e:
                 return EditResult(error=BackendError(code=ErrorCode.IO_ERROR, path=file_path, message=str(e)))
 
-            # Normalize line endings in old_str / new_str so that LLM-provided
-            # CRLF strings match files that were read as LF by Python text mode.
-            old_str = old_str.replace("\r\n", "\n").replace("\r", "\n")
-            new_str = new_str.replace("\r\n", "\n").replace("\r", "\n")
+            old_str = normalize_line_endings(old_str)
+            new_str = normalize_line_endings(new_str)
 
             occurrences = content.count(old_str)
 
@@ -814,7 +813,7 @@ class LocalBackend(BackendProtocol):
         matches: list[FileInfo] = []
         errors: list[str] = []
         try:
-            for fp in resolved.rglob(pattern):
+            for fp in resolved.glob(pattern):
                 try:
                     is_dir = fp.is_dir()
                 except OSError:
