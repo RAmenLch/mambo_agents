@@ -104,7 +104,7 @@ from langchain.tools import ToolRuntime
 from langchain_core.messages import SystemMessage, ToolMessage
 from langchain_core.tools import BaseTool, StructuredTool
 from langchain_mcp_adapters.client import MultiServerMCPClient
-from langchain_mcp_adapters.sessions import Connection, create_session
+from langchain_mcp_adapters.sessions import Connection
 from langgraph.prebuilt.tool_node import ToolCallRequest
 from mcp import ClientSession
 from mcp.types import CallToolResult, Tool as MCPTool
@@ -210,20 +210,22 @@ class MCPServerConfig(BaseModel):
         """Convert to a ``Connection`` dict for ``MultiServerMCPClient``."""
         conn: dict[str, Any] = {"transport": self.transport}
 
-        if self.command is not None:
-            conn["command"] = self.command
-        if self.args:
-            conn["args"] = self.args
-        if self.env is not None:
-            conn["env"] = self.env
-        if self.cwd is not None:
-            conn["cwd"] = self.cwd
-        if self.url is not None:
-            conn["url"] = self.url
-        if self.headers is not None:
-            conn["headers"] = self.headers
-        if self.timeout is not None:
-            conn["timeout"] = self.timeout
+        if self.transport == "stdio":
+            if self.command is not None:
+                conn["command"] = self.command
+            if self.args:
+                conn["args"] = self.args
+            if self.env is not None:
+                conn["env"] = self.env
+            if self.cwd is not None:
+                conn["cwd"] = self.cwd
+        else:
+            if self.url is not None:
+                conn["url"] = self.url
+            if self.headers is not None:
+                conn["headers"] = self.headers
+            if self.timeout is not None:
+                conn["timeout"] = self.timeout
 
         return conn  # type: ignore[return-value]
 
@@ -326,7 +328,9 @@ def _format_tool_list(tools: list[_ToolIndexEntry]) -> str:
 def _collect_tool_index(
     servers: Sequence[MCPServerConfig],
     *,
+    client: MultiServerMCPClient,
     exclude_tools: dict[str, frozenset[str]] | None = None,
+    init_timeout: float = 30.0,
 ) -> list[_ServerMeta]:
     """Connect to each MCP server, list its tools, build the index.
 
@@ -342,13 +346,11 @@ def _collect_tool_index(
         Optional per-server exclusion list.  Tools whose names appear in
         ``exclude_tools[server_name]`` are omitted from the index and
         will never be visible to the LLM.
+    init_timeout:
+        Maximum seconds to wait for all servers to respond during init.
+        Default 30 s.
     """
     _exclude = exclude_tools or {}
-    connections: dict[str, Any] = {}
-    for s in servers:
-        connections[s.name] = s.to_connection()
-
-    client = MultiServerMCPClient(connections)
 
     async def _collect() -> list[_ServerMeta]:
         results: list[_ServerMeta] = []
@@ -390,13 +392,20 @@ def _collect_tool_index(
     def _run_in_thread() -> None:
         nonlocal exc, result
         try:
-            result = asyncio.run(_collect())
+            result = asyncio.run(asyncio.wait_for(_collect(), timeout=init_timeout))
+        except asyncio.TimeoutError:
+            exc = TimeoutError(
+                f"MCP init timed out after {init_timeout}s"
+            )
         except Exception as e:
             exc = e
 
     t = threading.Thread(target=_run_in_thread, daemon=True)
     t.start()
-    t.join()
+    t.join(timeout=init_timeout + 5)
+
+    if t.is_alive():
+        raise TimeoutError(f"MCP init thread did not finish within {init_timeout + 5}s")
 
     if exc is not None:
         raise exc
@@ -475,6 +484,8 @@ def _build_get_tool_description(
 def _build_call_tool(
     servers_meta: list[_ServerMeta],
     client: MultiServerMCPClient,
+    *,
+    exclude_tools: dict[str, frozenset[str]] | None = None,
 ) -> StructuredTool:
     """Build the ``mcp_call_tool`` meta-tool.
 
@@ -482,10 +493,10 @@ def _build_call_tool(
     Errors (connection, tool execution) are returned as structured error text
     rather than raising exceptions.
     """
-    # Quick-lookup set of available server names
     _available_names: frozenset[str] = frozenset(
         m.name for m in servers_meta if m.available
     )
+    _exclude = exclude_tools or {}
 
     async def _call(
         server_name: str,
@@ -510,6 +521,17 @@ def _build_call_tool(
                     "server_name": server_name,
                     "tool_name": tool_name,
                     "error": f"Unknown server '{server_name}'. Available: {sorted(_available_names)}",
+                },
+                ensure_ascii=False,
+            )
+
+        # ---- enforce exclude_tools ----
+        if tool_name in _exclude.get(server_name, frozenset()):
+            return json.dumps(
+                {
+                    "server_name": server_name,
+                    "tool_name": tool_name,
+                    "error": f"Tool '{tool_name}' is not available on server '{server_name}'.",
                 },
                 ensure_ascii=False,
             )
@@ -540,14 +562,6 @@ def _build_call_tool(
         # ---- format result ----
         return _format_call_tool_result(result, server_name, tool_name)
 
-    async def _sync_wrapper(
-        server_name: str,
-        tool_name: str,
-        arguments: dict[str, Any],
-    ) -> str:
-        """Sync wrapper that runs the async call via asyncio.run."""
-        return await _call(server_name, tool_name, arguments)
-
     return StructuredTool.from_function(
         name=_MCP_CALL_TOOL_NAME,
         description=(
@@ -555,8 +569,8 @@ def _build_call_tool(
             "Use mcp_get_tool_description first to get the required parameter schema. "
             "Arguments must be a JSON object matching the tool's inputSchema."
         ),
-        func=None,  # sync not supported (needs async session)
-        coroutine=_sync_wrapper,
+        func=None,
+        coroutine=_call,
         args_schema=_CallToolInput,
     )
 
@@ -795,15 +809,17 @@ class MCPMiddleware(AgentMiddleware[AgentState, ContextT, ResponseT]):
         self._exclude_tools = exclude_tools or {}
         self._direct_tool_threshold = direct_tool_threshold
 
-        # ---- Build connections & MultiServerMCPClient ----
+        # ---- Build connections & MultiServerMCPClient (one instance, reused) ----
         connections: dict[str, Any] = {}
         for s in self._servers_config:
             connections[s.name] = s.to_connection()
         self._client = MultiServerMCPClient(connections)
 
-        # ---- Collect tool index (init-time, may block briefly) ----
+        # ---- Collect tool index (init-time) ----
         self._servers_meta = _collect_tool_index(
-            self._servers_config, exclude_tools=exclude_tools,
+            self._servers_config,
+            client=self._client,
+            exclude_tools=exclude_tools,
         )
 
         # ---- Build tool lookup index ----
@@ -814,12 +830,21 @@ class MCPMiddleware(AgentMiddleware[AgentState, ContextT, ResponseT]):
 
         # ---- Direct ↔ wrapped mode ----
         total_tools = sum(len(m.tools) for m in self._servers_meta if m.available)
-        self._direct_mode = total_tools < direct_tool_threshold
+        self._direct_mode = total_tools <= direct_tool_threshold
 
         if self._direct_mode:
             self._register_direct()
         else:
             self._register_wrapped()
+
+        if not self.tools and self._servers_config:
+            available_count = sum(1 for m in self._servers_meta if m.available)
+            if available_count == 0:
+                logger.warning(
+                    "MCPMiddleware: all %d server(s) failed to connect — "
+                    "no MCP tools available.",
+                    len(self._servers_config),
+                )
 
         # ---- Identity map for tool_unpacker (both modes) ----
         self._identity_map: dict[str, tuple[str, str, str | None]] = {}
@@ -836,7 +861,10 @@ class MCPMiddleware(AgentMiddleware[AgentState, ContextT, ResponseT]):
         """Register the two meta-tools for wrapped (on-demand) mode."""
         self.tools: list[BaseTool] = [
             _build_get_tool_description(self._tool_index),
-            _build_call_tool(self._servers_meta, self._client),
+            _build_call_tool(
+                self._servers_meta, self._client,
+                exclude_tools=self._exclude_tools,
+            ),
         ]
 
     def _register_direct(self) -> None:
