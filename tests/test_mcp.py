@@ -23,9 +23,12 @@ from mambo_agents.middleware.mcp import (
     _append_to_system_message,
     _build_call_tool,
     _build_get_tool_description,
+    _build_direct_tool,
     _format_call_tool_result,
     _format_tool_list,
+    mcp_tool_name,
 )
+from mambo_agents.middleware.tool_unpack import ToolUnpackResult
 
 
 # ============================================================================
@@ -505,6 +508,7 @@ class TestMCPMiddlewareInit:
         ]
         mw = MCPMiddleware(
             servers=[MCPServerConfig(name="test", command="cmd", args=[])],
+            direct_tool_threshold=0,
         )
         tool_names = {t.name for t in mw.tools}
         assert "mcp_get_tool_description" in tool_names
@@ -601,3 +605,303 @@ class TestMCPMiddlewareInit:
         assert ("s", "t1") in mw._tool_index
         assert ("s", "t2") in mw._tool_index
         assert mw._tool_index[("s", "t1")].input_schema == {"p": 1}
+
+
+# ============================================================================
+# mcp_tool_name
+# ============================================================================
+
+
+class TestMcpToolName:
+    def test_basic(self):
+        assert mcp_tool_name("server", "tool") == "server__tool"
+
+    def test_with_underscores(self):
+        assert mcp_tool_name("my_server", "my_tool") == "my_server__my_tool"
+
+    def test_different_servers(self):
+        assert mcp_tool_name("filesystem", "delete_config") == "filesystem__delete_config"
+        assert mcp_tool_name("github", "create_pr") == "github__create_pr"
+
+
+# ============================================================================
+# Server name validation
+# ============================================================================
+
+
+class TestServerNameValidation:
+    @patch("mambo_agents.middleware.mcp._collect_tool_index")
+    def test_valid_names(self, mock_collect):
+        mock_collect.return_value = []
+        for name in ["s", "my_server", "server1", "a-b", "Abc_123"]:
+            MCPMiddleware(
+                servers=[MCPServerConfig(name=name, command="c", args=[])],
+            )
+
+    @patch("mambo_agents.middleware.mcp._collect_tool_index")
+    def test_empty_name_raises(self, mock_collect):
+        mock_collect.return_value = []
+        with pytest.raises(ValueError, match="must not be empty"):
+            MCPMiddleware(
+                servers=[MCPServerConfig(name="", command="c", args=[])],
+            )
+
+    @patch("mambo_agents.middleware.mcp._collect_tool_index")
+    def test_whitespace_name_raises(self, mock_collect):
+        mock_collect.return_value = []
+        with pytest.raises(ValueError, match="must not be empty"):
+            MCPMiddleware(
+                servers=[MCPServerConfig(name="   ", command="c", args=[])],
+            )
+
+    @patch("mambo_agents.middleware.mcp._collect_tool_index")
+    def test_double_underscore_raises(self, mock_collect):
+        mock_collect.return_value = []
+        with pytest.raises(ValueError, match="reserved substring"):
+            MCPMiddleware(
+                servers=[MCPServerConfig(name="a__b", command="c", args=[])],
+            )
+
+    @patch("mambo_agents.middleware.mcp._collect_tool_index")
+    def test_colon_raises(self, mock_collect):
+        mock_collect.return_value = []
+        with pytest.raises(ValueError, match="is invalid"):
+            MCPMiddleware(
+                servers=[MCPServerConfig(name="a:b", command="c", args=[])],
+            )
+
+    @patch("mambo_agents.middleware.mcp._collect_tool_index")
+    def test_too_long_raises(self, mock_collect):
+        mock_collect.return_value = []
+        long_name = "a" * 65
+        with pytest.raises(ValueError, match="exceeds"):
+            MCPMiddleware(
+                servers=[MCPServerConfig(name=long_name, command="c", args=[])],
+            )
+
+    @patch("mambo_agents.middleware.mcp._collect_tool_index")
+    def test_leading_digit_raises(self, mock_collect):
+        mock_collect.return_value = []
+        with pytest.raises(ValueError, match="is invalid"):
+            MCPMiddleware(
+                servers=[MCPServerConfig(name="0abc", command="c", args=[])],
+            )
+
+
+# ============================================================================
+# tool_unpacker
+# ============================================================================
+
+
+class TestToolUnpacker:
+    @patch("mambo_agents.middleware.mcp._collect_tool_index")
+    def test_non_mcp_tool_returns_none(self, mock_collect):
+        mock_collect.return_value = []
+        mw = MCPMiddleware(
+            servers=[MCPServerConfig(name="s", command="c", args=[])],
+        )
+        unpacker = mw.tool_unpacker
+        assert unpacker("write", {"file_path": "/f"}) is None
+        assert unpacker("edit", {}) is None
+        assert unpacker("mcp_get_tool_description", {}) is None
+
+    @patch("mambo_agents.middleware.mcp._collect_tool_index")
+    def test_mcp_call_tool_unpacks(self, mock_collect):
+        mock_collect.return_value = [
+            _ServerMeta(
+                name="demo",
+                available=True,
+                tools=[
+                    _ToolIndexEntry(
+                        server_name="demo",
+                        tool_name="echo",
+                        description="Echo message",
+                        input_schema={},
+                    ),
+                ],
+            ),
+        ]
+        mw = MCPMiddleware(
+            servers=[MCPServerConfig(name="demo", command="c", args=[])],
+        )
+        unpacker = mw.tool_unpacker
+        result = unpacker("mcp_call_tool", {
+            "server_name": "demo",
+            "tool_name": "echo",
+            "arguments": {"message": "hi"},
+        })
+        assert result is not None
+        assert result.effective_tool_name == "demo__echo"
+        assert result.effective_args == {"message": "hi"}
+        assert result.tool_description == "Echo message"
+
+    @patch("mambo_agents.middleware.mcp._collect_tool_index")
+    def test_mcp_call_tool_unknown_tool_no_description(self, mock_collect):
+        mock_collect.return_value = []
+        mw = MCPMiddleware(
+            servers=[MCPServerConfig(name="demo", command="c", args=[])],
+        )
+        unpacker = mw.tool_unpacker
+        result = unpacker("mcp_call_tool", {
+            "server_name": "demo",
+            "tool_name": "nonexistent",
+            "arguments": {"x": 1},
+        })
+        assert result is not None
+        assert result.effective_tool_name == "demo__nonexistent"
+        assert result.effective_args == {"x": 1}
+        assert result.tool_description is None
+
+    @patch("mambo_agents.middleware.mcp._collect_tool_index")
+    def test_mcp_call_tool_missing_args_defaults(self, mock_collect):
+        mock_collect.return_value = []
+        mw = MCPMiddleware(
+            servers=[MCPServerConfig(name="s", command="c", args=[])],
+        )
+        unpacker = mw.tool_unpacker
+        result = unpacker("mcp_call_tool", {})
+        assert result is not None
+        assert result.effective_tool_name == "__"
+        assert result.effective_args == {}
+        assert result.tool_description is None
+
+
+# ============================================================================
+# exclude_tools
+# ============================================================================
+
+
+class TestExcludeTools:
+    """Tests for ``exclude_tools`` parameter."""
+
+    @patch("mambo_agents.middleware.mcp._collect_tool_index")
+    def test_excluded_tools_omitted_from_index(self, mock_collect):
+        """exclude_tools is passed to _collect_tool_index for server-side filtering."""
+        mock_collect.return_value = [
+            _ServerMeta(
+                name="s",
+                available=True,
+                tools=[
+                    _ToolIndexEntry(server_name="s", tool_name="keep", description="k", input_schema={}),
+                ],
+            ),
+        ]
+        mw = MCPMiddleware(
+            servers=[MCPServerConfig(name="s", command="c", args=[])],
+            exclude_tools={"s": frozenset(["drop"])},
+        )
+        assert ("s", "keep") in mw._tool_index
+        assert ("s", "drop") not in mw._tool_index
+        # Verify exclude_tools was forwarded to _collect_tool_index
+        call_kwargs = mock_collect.call_args[1]
+        assert call_kwargs["exclude_tools"] == {"s": frozenset(["drop"])}
+
+    @patch("mambo_agents.middleware.mcp._collect_tool_index")
+    def test_exclude_tools_calls_collect_with_filter(self, mock_collect):
+        mock_collect.return_value = []
+        MCPMiddleware(
+            servers=[MCPServerConfig(name="s", command="c", args=[])],
+            exclude_tools={"s": frozenset(["a", "b"])},
+        )
+        call_kwargs = mock_collect.call_args[1]
+        assert "exclude_tools" in call_kwargs
+        assert call_kwargs["exclude_tools"]["s"] == frozenset(["a", "b"])
+
+
+# ============================================================================
+# direct_tool_threshold
+# ============================================================================
+
+
+class TestDirectToolThreshold:
+    """Tests for ``direct_tool_threshold`` parameter."""
+
+    @patch("mambo_agents.middleware.mcp._collect_tool_index")
+    def test_direct_mode_when_below_threshold(self, mock_collect):
+        mock_collect.return_value = [
+            _ServerMeta(
+                name="s",
+                available=True,
+                tools=[
+                    _ToolIndexEntry(server_name="s", tool_name="echo", description="E", input_schema={"type": "object"}),
+                ],
+            ),
+        ]
+        mw = MCPMiddleware(
+            servers=[MCPServerConfig(name="s", command="c", args=[])],
+            direct_tool_threshold=5,
+        )
+        assert mw._direct_mode is True
+        tool_names = {t.name for t in mw.tools}
+        assert "mcp_call_tool" not in tool_names
+        assert "mcp_get_tool_description" not in tool_names
+        assert "s__echo" in tool_names
+
+    @patch("mambo_agents.middleware.mcp._collect_tool_index")
+    def test_wrapped_mode_when_above_threshold(self, mock_collect):
+        tools = [
+            _ToolIndexEntry(server_name="s", tool_name=f"t{i}", description="d", input_schema={})
+            for i in range(10)
+        ]
+        mock_collect.return_value = [
+            _ServerMeta(name="s", available=True, tools=tools),
+        ]
+        mw = MCPMiddleware(
+            servers=[MCPServerConfig(name="s", command="c", args=[])],
+            direct_tool_threshold=5,
+        )
+        assert mw._direct_mode is False
+        tool_names = {t.name for t in mw.tools}
+        assert "mcp_call_tool" in tool_names
+        assert "mcp_get_tool_description" in tool_names
+
+    @patch("mambo_agents.middleware.mcp._collect_tool_index")
+    def test_direct_mode_system_prompt_not_injected(self, mock_collect):
+        from langchain.agents.middleware.types import ModelRequest
+
+        mock_collect.return_value = [
+            _ServerMeta(
+                name="s",
+                available=True,
+                tools=[
+                    _ToolIndexEntry(server_name="s", tool_name="t", description="d", input_schema={}),
+                ],
+            ),
+        ]
+        mw = MCPMiddleware(
+            servers=[MCPServerConfig(name="s", command="c", args=[])],
+            direct_tool_threshold=5,
+        )
+        req = ModelRequest(
+            model=MagicMock(),
+            messages=[],
+            system_message=SystemMessage(content="base"),
+        )
+
+        def handler(r):
+            return MagicMock()
+
+        resp = mw.wrap_model_call(req, handler)
+        assert "MCP Servers" not in str(req.system_message.content)
+
+    @patch("mambo_agents.middleware.mcp._collect_tool_index")
+    def test_tool_unpacker_works_in_direct_mode(self, mock_collect):
+        mock_collect.return_value = [
+            _ServerMeta(
+                name="demo",
+                available=True,
+                tools=[
+                    _ToolIndexEntry(server_name="demo", tool_name="echo", description="Echo", input_schema={}),
+                ],
+            ),
+        ]
+        mw = MCPMiddleware(
+            servers=[MCPServerConfig(name="demo", command="c", args=[])],
+            direct_tool_threshold=5,
+        )
+        unpacker = mw.tool_unpacker
+        result = unpacker("demo__echo", {"message": "hi"})
+        assert result is not None
+        assert result.effective_tool_name == "demo__echo"
+        assert result.effective_args == {"message": "hi"}
+        assert result.tool_description == "Echo"

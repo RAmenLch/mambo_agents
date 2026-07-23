@@ -14,8 +14,13 @@
 8. [Installing Skill Packs](#8-installing-skill-packs)
 9. [Let Your Agent Remember Your Preferences](#9-let-your-agent-remember-your-preferences)
 10. [Security & Human Approval](#10-security--human-approval)
+    - [Reviewing MCP Tools](#10x-reviewing-mcp-tools)
 11. [File Change History & Rollback](#11-file-change-history--rollback)
 12. [Integrating External MCP Tools](#12-integrating-external-mcp-tools)
+    - [`exclude_tools` — Hiding Dangerous Tools](#12x-exclude_tools--hiding-dangerous-tools)
+    - [`direct_tool_threshold` — Direct vs Wrapped Mode](#12x-direct_tool_threshold--direct-vs-wrapped-mode)
+    - [Security Review Integration](#12x-security-review-integration)
+    - [`mcp_tool_name()` Reference](#12x-mcp_tool_name-reference)
 13. [Multi-Agent Collaboration](#13-multi-agent-collaboration)
 14. [Advanced Usage](#14-advanced-usage)
 
@@ -1017,6 +1022,42 @@ agent.invoke(
 > (rather than an interrupt from another component). If omitted, the approval decision is ignored
 > and the tool executes with its original parameters.
 
+### 10.x Reviewing MCP Tools
+
+When using `MCPMiddleware`, MCP tools are exposed via the `mcp_call_tool` wrapper.
+By default the security review middleware can only see `mcp_call_tool` — not the inner
+MCP tool being invoked.  Use `mcp_tool_name()` and `tool_unpackers` to enable
+targeted review of specific MCP tools:
+
+```python
+from mambo_agents.middleware.mcp import (
+    MCPMiddleware, MCPServerConfig, mcp_tool_name,
+)
+from mambo_agents.middleware.security_review import SecurityReviewConfig
+
+mcp = MCPMiddleware(servers=[...])
+
+agent = create_mambo_agent(
+    "gpt-4o",
+    middleware=[mcp],
+    interrupt_on={
+        "mcp_call_tool": True,                         # catch-all
+        mcp_tool_name("filesystem", "delete_config"): True,  # targeted
+    },
+    security_review=SecurityReviewConfig(
+        review_tools=frozenset([
+            mcp_tool_name("filesystem", "delete_config"),  # AI review
+            # mcp_tool_name("filesystem", "read_file") omitted → direct HITL
+        ]),
+        tool_unpackers=[mcp.tool_unpacker],
+    ),
+)
+```
+
+`mcp_tool_name("filesystem", "delete_config")` returns `"filesystem__delete_config"` —
+a stable name that works identically in both wrapped and direct MCP modes.
+See `example/10_mcp_security_review.py` for a full runnable example.
+
 ---
 
 ## 11. File Change History & Rollback
@@ -1226,6 +1267,86 @@ agent = create_mambo_agent(
 | `url` | `str` | for HTTP | Server URL (sse / streamable_http / websocket) |
 | `headers` | `dict` | ❌ | HTTP headers (HTTP mode) |
 | `timeout` | `float` | ❌ | HTTP timeout (seconds) |
+
+### 12.x `exclude_tools` — Hiding Dangerous Tools
+
+Prevent specific MCP tools from being exposed to the LLM:
+
+```python
+mcp = MCPMiddleware(
+    servers=[...],
+    exclude_tools={
+        "filesystem": frozenset(["send_to_external", "install_package"]),
+        "github": frozenset(["force_push"]),
+    },
+)
+```
+
+Excluded tools are removed from the tool index before registration — they cannot
+be discovered via ``mcp_get_tool_description`` and cannot be called via
+``mcp_call_tool``.
+
+### 12.x `direct_tool_threshold` — Direct vs Wrapped Mode
+
+Control whether MCP tools are registered directly or behind the wrapper
+meta-tools.  The default threshold is **15**: when the total number of MCP
+tools across all servers is below this number, each tool is registered as
+a first-class tool named ``server__tool``.  Above the threshold, the
+``mcp_call_tool`` / ``mcp_get_tool_description`` wrapper is used instead.
+
+```python
+mcp = MCPMiddleware(
+    servers=[...],
+    direct_tool_threshold=10,  # 默认 15；设为 0 强制全部透传
+)
+```
+
+In both modes ``mcp_tool_name(server, tool)`` and ``tool_unpacker`` work
+identically — your ``interrupt_on`` and ``review_tools`` config does not
+need to change when the threshold is adjusted.
+
+### 12.x Security Review Integration
+
+MCP tools can be selectively reviewed by the security review middleware.
+Use `mcp_tool_name(server, tool)` to construct the name for `interrupt_on` and
+`review_tools`, and pass `mcp.tool_unpacker` via `tool_unpackers`:
+
+```python
+from mambo_agents.middleware.mcp import (
+    MCPMiddleware, MCPServerConfig, mcp_tool_name,
+)
+
+mcp = MCPMiddleware(servers=[...])
+
+agent = create_mambo_agent(
+    "gpt-4o",
+    middleware=[mcp],
+    interrupt_on={
+        "mcp_call_tool": True,
+        mcp_tool_name("filesystem", "delete_config"): True,
+    },
+    security_review=SecurityReviewConfig(
+        review_tools=frozenset([
+            mcp_tool_name("filesystem", "delete_config"),
+        ]),
+        tool_unpackers=[mcp.tool_unpacker],
+    ),
+)
+```
+
+### 12.x `mcp_tool_name()` Reference
+
+``mcp_tool_name(server_name, tool_name) → str`` returns the effective tool name
+used in `interrupt_on` and `review_tools`:
+
+```python
+mcp_tool_name("filesystem", "delete_config")  # → "filesystem__delete_config"
+```
+
+- **Consistent**: the same string works whether MCP is in wrapped or direct mode.
+- **Safe**: server names are validated at init (no `__`, max 64 chars, alphanumeric + `_` `-`).
+- See `example/10_mcp_security_review.py` and `example/mcp_demo_server.py` for
+a fully runnable end-to-end demo.
 
 ---
 

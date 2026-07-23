@@ -260,7 +260,7 @@ class TestConstructor:
             interrupt_on={"write": True},
             model=FakeListChatModel(responses=[]),
         )
-        assert mw._review_tools == "all"
+        assert mw._review_tools == frozenset({"write"})
 
     def test_custom_review_tools_frozenset(self) -> None:
         mw = AutoSecurityReviewMiddleware(
@@ -651,7 +651,8 @@ class TestAfterModelNoOp:
 
         scratchpad = MagicMock()
         scratchpad.get_null_resume.return_value = {
-            "source": "mambo_security_review"
+            "source": "mambo_security_review",
+            "decisions": [{"type": "approve", "tool_call_id": "ce"}],
         }
         with patch(
             "mambo_agents.middleware.security_review.CONFIG_KEY_SCRATCHPAD",
@@ -1060,3 +1061,196 @@ class TestIntegrationWithCreateAgent:
             checkpointer=MemorySaver(),
         )
         assert agent is not None
+
+
+# =============================================================================
+# 11. tool_unpackers — MCP / wrapper tool integration
+# =============================================================================
+
+
+def _make_dummy_unpacker(
+    wrapper_name: str = "mcp_call_tool",
+    effective_name: str = "demo__danger",
+    effective_args: dict[str, Any] | None = None,
+    description: str | None = "A dangerous operation",
+):
+    """Factory for a fake tool unpacker callable."""
+
+    def _unpack(tool_name: str, tool_args: dict[str, Any]):
+        if tool_name == wrapper_name:
+            return type("R", (), {
+                "effective_tool_name": effective_name,
+                "effective_args": effective_args or tool_args.get("arguments", {}),
+                "tool_description": description,
+            })()
+        return None
+
+    return _unpack
+
+
+class TestToolUnpackersConstructor:
+    """Tests for ``tool_unpackers`` parameter in ``AutoSecurityReviewMiddleware``."""
+
+    def test_tool_unpackers_stored(self) -> None:
+        unpacker = _make_dummy_unpacker()
+        mw = AutoSecurityReviewMiddleware(
+            interrupt_on={"mcp_call_tool": True, "demo__danger": True},
+            model=FakeListChatModel(responses=[]),
+            tool_unpackers=[unpacker],
+        )
+        assert len(mw._tool_unpackers) == 1
+
+    def test_tool_unpackers_default_empty(self) -> None:
+        mw = AutoSecurityReviewMiddleware(
+            interrupt_on={"write": True},
+            model=FakeListChatModel(responses=[]),
+        )
+        assert mw._tool_unpackers == []
+
+    def test_tool_unpackers_none_accepted(self) -> None:
+        mw = AutoSecurityReviewMiddleware(
+            interrupt_on={"write": True},
+            model=FakeListChatModel(responses=[]),
+            tool_unpackers=None,
+        )
+        assert mw._tool_unpackers == []
+
+    def test_review_tools_accepts_unpacked_names(self) -> None:
+        """review_tools can contain effective names not in interrupt_on keys."""
+        mw = AutoSecurityReviewMiddleware(
+            interrupt_on={"mcp_call_tool": True},
+            model=FakeListChatModel(responses=[]),
+            review_tools=frozenset(["demo__danger", "demo__safe"]),
+            tool_unpackers=[_make_dummy_unpacker()],
+        )
+        assert "demo__danger" in mw._review_tools
+
+
+class TestTryUnpack:
+    """Tests for ``_try_unpack`` method."""
+
+    def test_no_unpackers_returns_original(self) -> None:
+        mw = AutoSecurityReviewMiddleware(
+            interrupt_on={"write": True},
+            model=FakeListChatModel(responses=[]),
+        )
+        tc = _make_tool_call("write", {"path": "/f"})
+        name, args, desc = mw._try_unpack(tc)
+        assert name == "write"
+        assert args == {"path": "/f"}
+        assert desc is None
+
+    def test_unpacker_recognizes_tool(self) -> None:
+        mw = AutoSecurityReviewMiddleware(
+            interrupt_on={"mcp_call_tool": True},
+            model=FakeListChatModel(responses=[]),
+            tool_unpackers=[_make_dummy_unpacker()],
+        )
+        tc = _make_tool_call("mcp_call_tool", {
+            "server_name": "demo",
+            "tool_name": "danger",
+            "arguments": {"x": 1},
+        })
+        name, args, desc = mw._try_unpack(tc)
+        assert name == "demo__danger"
+        assert args == {"x": 1}
+        assert desc == "A dangerous operation"
+
+    def test_unpacker_does_not_recognize_tool(self) -> None:
+        """When no unpacker recognizes the tool, original info is returned."""
+        mw = AutoSecurityReviewMiddleware(
+            interrupt_on={"write": True, "mcp_call_tool": True},
+            model=FakeListChatModel(responses=[]),
+            tool_unpackers=[_make_dummy_unpacker()],
+        )
+        tc = _make_tool_call("write", {"path": "/f"})
+        name, args, desc = mw._try_unpack(tc)
+        assert name == "write"
+        assert args == {"path": "/f"}
+        assert desc is None
+
+
+class TestHandleFirstRunWithUnpacker:
+    """Tests for ``_handle_first_run`` with a tool unpacker."""
+
+    def test_config_matched_by_effective_name(self) -> None:
+        """interrupt_on with effective name (not outer name) should match."""
+        mw = AutoSecurityReviewMiddleware(
+            interrupt_on={"demo__danger": True},
+            model=FakeListChatModel(responses=[]),
+            tool_unpackers=[_make_dummy_unpacker()],
+        )
+        tc = _make_tool_call("mcp_call_tool", {
+            "server_name": "demo",
+            "tool_name": "danger",
+            "arguments": {"x": 1},
+        })
+        ai_msg = AIMessage(content="", tool_calls=[tc])
+        mw._ai_review = MagicMock(return_value=_SAFE_RESULT)  # type: ignore[method-assign]
+        with patch(
+            "mambo_agents.middleware.security_review.interrupt",
+            return_value={"decisions": []},
+        ):
+            result = mw._handle_first_run(ai_msg)
+        assert result is None
+
+    def test_review_by_effective_name(self) -> None:
+        """_should_ai_review matches effective name from unpacker."""
+        mw = AutoSecurityReviewMiddleware(
+            interrupt_on={"mcp_call_tool": True},
+            model=FakeListChatModel(responses=[]),
+            review_tools=frozenset(["demo__danger"]),
+            tool_unpackers=[_make_dummy_unpacker()],
+        )
+        assert not mw._should_ai_review("mcp_call_tool")
+        assert mw._should_ai_review("demo__danger")
+        tc = _make_tool_call("mcp_call_tool", {
+            "server_name": "demo",
+            "tool_name": "danger",
+            "arguments": {"x": 1},
+        })
+        ai_msg = AIMessage(content="", tool_calls=[tc])
+        mw._ai_review = MagicMock(return_value=_SAFE_RESULT)  # type: ignore[method-assign]
+        with patch(
+            "mambo_agents.middleware.security_review.interrupt",
+            return_value={"decisions": []},
+        ):
+            result = mw._handle_first_run(ai_msg)
+        assert result is None
+
+    def test_action_request_uses_effective_name(self) -> None:
+        """The HITL action request displays the effective (inner) tool name."""
+        from mambo_agents.middleware.security_review import HITLRequest
+
+        review_mock = MagicMock(return_value=SecurityReviewResult(
+            is_safe=False, reason="unsafe", risk_level="high",
+        ))
+
+        mw = AutoSecurityReviewMiddleware(
+            interrupt_on={"mcp_call_tool": True},
+            model=FakeListChatModel(responses=[]),
+            tool_unpackers=[_make_dummy_unpacker()],
+        )
+        mw._ai_review = review_mock  # type: ignore[method-assign]
+
+        tc = _make_tool_call("mcp_call_tool", {
+            "server_name": "demo",
+            "tool_name": "danger",
+            "arguments": {"x": 1},
+        }, "call_mcp")
+        ai_msg = AIMessage(content="", tool_calls=[tc])
+
+        with patch(
+            "mambo_agents.middleware.security_review.interrupt",
+        ) as mock_interrupt:
+            mock_interrupt.return_value = {
+                "decisions": [{"tool_call_id": "call_mcp", "type": "approve"}],
+            }
+            mw._handle_first_run(ai_msg)
+
+            call_args = mock_interrupt.call_args[0]
+            hitl = HITLRequest(**call_args[0])
+            assert len(hitl.action_requests) == 1
+            assert hitl.action_requests[0].name == "demo__danger"
+            assert hitl.action_requests[0].args == {"x": 1}
+            assert hitl.action_requests[0].tool_call_id == "call_mcp"

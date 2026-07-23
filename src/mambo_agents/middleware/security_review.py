@@ -42,6 +42,26 @@ Two review modes are available:
         ),
     )
 
+    # MCP integration: review inner MCP tools via tool_unpacker
+    from mambo_agents.middleware.mcp import mcp_tool_name
+
+    mcp = MCPMiddleware(servers=[...])
+
+    agent = create_mambo_agent(
+        "gpt-4o",
+        middleware=[mcp],
+        interrupt_on={
+            "mcp_call_tool": True,
+            mcp_tool_name("filesystem", "delete_config"): True,
+        },
+        security_review=SecurityReviewConfig(
+            review_tools=frozenset([
+                mcp_tool_name("filesystem", "delete_config"),
+            ]),
+            tool_unpackers=[mcp.tool_unpacker],
+        ),
+    )
+
 """
 
 
@@ -81,6 +101,7 @@ from mambo_agents.middleware.review_agent import (
     run_review_async,
     run_review_sync,
 )
+from mambo_agents.middleware.tool_unpack import ToolUnpackResult
 
 # ---------------------------------------------------------------------------
 # Interrupt protocol — source identifier
@@ -180,6 +201,16 @@ class SecurityReviewConfig(BaseModel):
             "Set to an empty ``frozenset()`` to give the agent no tools "
             "(pure LLM-style review).  Only read-only tools should be "
             "included — the audit backend is already read-only."
+        ),
+    )
+    tool_unpackers: list[object] | None = Field(
+        default=None,
+        description=(
+            "Optional list of tool-unpacker callables.  Each unpacker is a "
+            "function ``(tool_name, tool_args) -> ToolUnpackResult | None`` "
+            "that resolves wrapped tools (e.g., ``mcp_call_tool``) into "
+            "their inner tool identity.  See ``mambo_agents.middleware.mcp`` "
+            "and ``example/10_mcp_security_review.py``."
         ),
     )
 
@@ -398,6 +429,8 @@ def _build_review_messages(
     tool_call: ToolCall,
     *,
     tool_description: str | None = None,
+    effective_tool_name: str | None = None,
+    effective_args: dict[str, Any] | None = None,
 ) -> list[SystemMessage | HumanMessage]:
     """Build the system + human message pair for a security review.
 
@@ -411,7 +444,32 @@ def _build_review_messages(
         Optional human-readable description of the tool's purpose.
         When provided, injected into the human message so the reviewer
         understands the intent behind the raw name + args.
+    effective_tool_name:
+        When the tool call is a wrapper (e.g. ``mcp_call_tool``), this is
+        the *inner* tool name displayed to the reviewer.  The outer name
+        is still shown as context.
+    effective_args:
+        The arguments for the *inner* tool when *effective_tool_name* is set.
     """
+    if effective_tool_name is not None and effective_args is not None:
+        desc_block = ""
+        if tool_description:
+            desc_block = (
+                f"\n**Tool description:** {tool_description}"
+            )
+        return [
+            SystemMessage(content=system_prompt),
+            HumanMessage(
+                content=(
+                    f"Please review the following tool call for security risks:\n\n"
+                    f"**Wrapper tool:** `{tool_call['name']}`\n"
+                    f"**Effective tool:** `{effective_tool_name}`\n"
+                    f"**Arguments:**\n```json\n{effective_args}\n```"
+                    f"{desc_block}"
+                )
+            ),
+        ]
+
     desc_block = ""
     if tool_description:
         desc_block = (
@@ -490,6 +548,7 @@ class AutoSecurityReviewMiddleware(
         agent_tools: frozenset[str] | None = None,
         tool_descriptions: dict[str, str] | None = None,
         backend_tool_names: frozenset[str] = frozenset(),
+        tool_unpackers: list[object] | None = None,
     ) -> None:
         super().__init__()
 
@@ -526,7 +585,7 @@ class AutoSecurityReviewMiddleware(
             self._review_tools: frozenset[str] = interrupt_keys
         elif isinstance(review_tools, frozenset):
             unknown = review_tools - interrupt_keys
-            if unknown:
+            if unknown and not tool_unpackers:
                 raise ValueError(
                     f"review_tools contains tools not in interrupt_on: "
                     f"{sorted(unknown)}. review_tools must be a subset of "
@@ -546,6 +605,7 @@ class AutoSecurityReviewMiddleware(
         self._agent_tools: frozenset[str] | None = agent_tools
         self._tool_descriptions: dict[str, str] = tool_descriptions or {}
         self._backend_tool_names: frozenset[str] = backend_tool_names
+        self._tool_unpackers: list[object] = list(tool_unpackers) if tool_unpackers else []
 
         # ---------- agent-mode: pre-build review agent if backend available ----------
         self._cached_review_agent: object | None = None
@@ -654,10 +714,13 @@ class AutoSecurityReviewMiddleware(
 
     def _ai_review_llm(self, tool_call: ToolCall) -> SecurityReviewResult:
         """LLM-mode review — single structured-output call."""
-        tool_desc = self._tool_descriptions.get(tool_call["name"])
+        effective_name, effective_args, unpacked_desc = self._try_unpack(tool_call)
+        tool_desc = unpacked_desc or self._tool_descriptions.get(tool_call["name"])
         messages = _build_review_messages(
             self._review_system_prompt, tool_call,
             tool_description=tool_desc,
+            effective_tool_name=effective_name if effective_name != tool_call["name"] else None,
+            effective_args=effective_args if effective_name != tool_call["name"] else None,
         )
 
         _isolated_config: RunnableConfig = {"callbacks": []}
@@ -708,10 +771,13 @@ class AutoSecurityReviewMiddleware(
                 risk_level="high",
             )
 
-        tool_name = tool_call["name"]
-        tool_args = tool_call["args"]
+        effective_name, effective_args, unpacked_desc = self._try_unpack(tool_call)
+        tool_name = effective_name if effective_name != tool_call["name"] else tool_call["name"]
+        tool_args = effective_args if effective_name != tool_call["name"] else tool_call["args"]
         tool_desc = ""
-        if self._tool_descriptions and tool_name in self._tool_descriptions:
+        if unpacked_desc:
+            tool_desc = f"\n**Tool description:** {unpacked_desc}"
+        elif self._tool_descriptions and tool_name in self._tool_descriptions:
             tool_desc = f"\n**Tool description:** {self._tool_descriptions[tool_name]}"
 
         review_prompt = (
@@ -746,10 +812,13 @@ class AutoSecurityReviewMiddleware(
 
     async def _ai_review_llm_async(self, tool_call: ToolCall) -> SecurityReviewResult:
         """LLM-mode review — async, does NOT block the event loop."""
-        tool_desc = self._tool_descriptions.get(tool_call["name"])
+        effective_name, effective_args, unpacked_desc = self._try_unpack(tool_call)
+        tool_desc = unpacked_desc or self._tool_descriptions.get(tool_call["name"])
         messages = _build_review_messages(
             self._review_system_prompt, tool_call,
             tool_description=tool_desc,
+            effective_tool_name=effective_name if effective_name != tool_call["name"] else None,
+            effective_args=effective_args if effective_name != tool_call["name"] else None,
         )
 
         _isolated_config: RunnableConfig = {"callbacks": []}
@@ -800,10 +869,13 @@ class AutoSecurityReviewMiddleware(
                 risk_level="high",
             )
 
-        tool_name = tool_call["name"]
-        tool_args = tool_call["args"]
+        effective_name, effective_args, unpacked_desc = self._try_unpack(tool_call)
+        tool_name = effective_name if effective_name != tool_call["name"] else tool_call["name"]
+        tool_args = effective_args if effective_name != tool_call["name"] else tool_call["args"]
         tool_desc = ""
-        if self._tool_descriptions and tool_name in self._tool_descriptions:
+        if unpacked_desc:
+            tool_desc = f"\n**Tool description:** {unpacked_desc}"
+        elif self._tool_descriptions and tool_name in self._tool_descriptions:
             tool_desc = f"\n**Tool description:** {self._tool_descriptions[tool_name]}"
 
         review_prompt = (
@@ -908,9 +980,14 @@ class AutoSecurityReviewMiddleware(
 
         The ``description`` is kept clean — AI review results are delivered
         separately via ``SecurityReviewFailedEvent`` custom stream events.
+
+        When a tool-unpacker recognizes the call, the effective (inner)
+        tool name and arguments are used for the action request so the
+        human reviewer sees the real tool identity.
         """
-        tool_name = tool_call["name"]
-        tool_args = tool_call["args"]
+        effective_name, effective_args, _ = self._try_unpack(tool_call)
+        tool_name = effective_name if effective_name != tool_call["name"] else tool_call["name"]
+        tool_args = effective_args if effective_name != tool_call["name"] else tool_call["args"]
         tool_call_id: str = tool_call["id"]
 
         # --- base description (from user config or defaults) ---
@@ -1000,6 +1077,27 @@ class AutoSecurityReviewMiddleware(
         """Return ``True`` if *tool_name* should get AI-reviewed."""
         return tool_name in self._review_tools
 
+    def _try_unpack(
+        self, tool_call: ToolCall
+    ) -> tuple[str, dict[str, Any], str | None]:
+        """Try to unpack a wrapped tool call via registered unpackers.
+
+        Returns ``(effective_name, effective_args, tool_description)``.
+        When no unpacker recognizes the tool call the outer name / args
+        are returned unchanged.
+        """
+        if not self._tool_unpackers:
+            return tool_call["name"], tool_call["args"], None
+        for unpacker in self._tool_unpackers:
+            result = unpacker(tool_call["name"], tool_call["args"])
+            if result is not None:
+                return (
+                    result.effective_tool_name,
+                    result.effective_args,
+                    result.tool_description,
+                )
+        return tool_call["name"], tool_call["args"], None
+
     @staticmethod
     def _get_last_ai_message(state: AgentState[Any]) -> AIMessage | None:
         """Return the last AIMessage with tool_calls, or None."""
@@ -1071,7 +1169,8 @@ class AutoSecurityReviewMiddleware(
         msgs: list[ToolMessage] = []
 
         for tc in tool_calls:
-            config = self._interrupt_on.get(tc["name"])
+            effective_name, _, _ = self._try_unpack(tc)
+            config = self._interrupt_on.get(tc["name"]) or self._interrupt_on.get(effective_name)
             if config is None:
                 revised.append(tc)
                 continue
@@ -1108,11 +1207,12 @@ class AutoSecurityReviewMiddleware(
         configs_for_human: list[ReviewConfig] = []
 
         for tc in last_ai_msg.tool_calls:
-            config = self._interrupt_on.get(tc["name"])
+            effective_name, effective_args, _ = self._try_unpack(tc)
+            config = self._interrupt_on.get(tc["name"]) or self._interrupt_on.get(effective_name)
             if config is None:
                 continue
 
-            if self._should_ai_review(tc["name"]):
+            if self._should_ai_review(tc["name"]) or self._should_ai_review(effective_name):
                 review = self._ai_review(tc)
                 if review.is_safe:
                     if self._notify_on_pass:
@@ -1160,11 +1260,12 @@ class AutoSecurityReviewMiddleware(
         configs_for_human: list[ReviewConfig] = []
 
         for tc in last_ai_msg.tool_calls:
-            config = self._interrupt_on.get(tc["name"])
+            effective_name, effective_args, _ = self._try_unpack(tc)
+            config = self._interrupt_on.get(tc["name"]) or self._interrupt_on.get(effective_name)
             if config is None:
                 continue
 
-            if self._should_ai_review(tc["name"]):
+            if self._should_ai_review(tc["name"]) or self._should_ai_review(effective_name):
                 review = await self._ai_review_async(tc)
                 if review.is_safe:
                     if self._notify_on_pass:

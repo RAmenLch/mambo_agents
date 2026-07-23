@@ -212,13 +212,14 @@ class TestAsyncSubagentsRouting:
 
 
 class TestInterruptOnRouting:
-    def test_interrupt_on_without_checkpointer_raises(self):
-        with pytest.raises(ValueError, match="checkpointer"):
-            create_mambo_agent(
-                _create_model(),
-                backend=_make_backend(),
-                interrupt_on={"write": True},
-            )
+    def test_classic_hitl_without_explicit_checkpointer(self):
+        """interrupt_on without explicit checkpointer → defaults to InMemorySaver."""
+        agent = create_mambo_agent(
+            _create_model(),
+            backend=_make_backend(),
+            interrupt_on={"write": True},
+        )
+        assert agent is not None
 
     def test_classic_hitl_with_checkpointer(self):
         """interrupt_on with checkpointer → HumanInTheLoopMiddleware."""

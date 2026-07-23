@@ -8,6 +8,7 @@ from mambo_agents.middleware.backend_tools import BackendToolsMiddleware
 from mambo_agents.middleware.mcp import (
     MCPMiddleware,
     MCPServerConfig,
+    mcp_tool_name,
 )
 from mambo_agents.middleware.memory import (
     MamboMemoryMiddleware,
@@ -51,6 +52,7 @@ from mambo_agents.middleware.summarization import (
     SummaryHook,
     SummaryHookContext,
 )
+from mambo_agents.middleware.tool_unpack import ToolUnpackResult
 from mambo_agents.middleware.version_control import (
     BackupEvent,
     Snapshot,
@@ -76,6 +78,7 @@ __all__ = [
     "MamboPlanMiddleware",
     "MCPMiddleware",
     "MCPServerConfig",
+    "mcp_tool_name",
     "MamboSummarizationMiddleware",
     "MemoryFormatHook",
     "PatchToolCallsMiddleware",
@@ -93,6 +96,7 @@ __all__ = [
     "SummarizationMode",
     "SummaryHook",
     "SummaryHookContext",
+    "ToolUnpackResult",
     "VersionControlConfig",
     "VersionControlMiddleware",
     "VersionIndex",

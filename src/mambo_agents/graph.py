@@ -449,6 +449,7 @@ def create_mambo_agent(
                 agent_tools=_agent_tools_whitelist,
                 tool_descriptions=_tool_descriptions,
                 backend_tool_names=_backend_tool_names,
+                tool_unpackers=security_review.tool_unpackers,
             )
         else:
             # ---- Classic HITL (no AI review) ----

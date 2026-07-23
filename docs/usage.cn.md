@@ -14,8 +14,13 @@
 8. [给 Agent 装技能包](#8-给-agent-装技能包)
 9. [让 Agent 记住你的偏好](#9-让-agent-记住你的偏好)
 10. [安全与人工审批](#10-安全与人工审批)
+    - [审查 MCP 工具](#10x-审查-mcp-工具)
 11. [文件修改历史与回滚](#11-文件修改历史与回滚)
 12. [接入外部 MCP 工具](#12-接入外部-mcp-工具)
+    - [`exclude_tools` — 隐藏危险工具](#12x-exclude_tools--隐藏危险工具)
+    - [`direct_tool_threshold` — 直传-vs-包装模式](#12x-direct_tool_threshold--直传-vs-包装模式)
+    - [安全审查集成](#12x-安全审查集成)
+    - [`mcp_tool_name()` 参考](#12x-mcp_tool_name-参考)
 13. [多 Agent 协作](#13-多-agent-协作)
 14. [高级用法](#14-高级用法)
 
@@ -1001,6 +1006,40 @@ agent.invoke(
 > **`source` 字段是必须的** — 它让系统能识别这是安全审查的回复（而非其他组件的中断）。
 > 如果省略，审批决定会被忽略，工具将以原始参数执行。
 
+### 10.x 审查 MCP 工具
+
+使用 `MCPMiddleware` 时，MCP 工具通过 `mcp_call_tool` 包装暴露。安全审查中间件默认只能看到
+`mcp_call_tool`，无法识别内层 MCP 工具。使用 `mcp_tool_name()` 和 `tool_unpackers` 即可
+对特定 MCP 工具做针对性审查：
+
+```python
+from mambo_agents.middleware.mcp import (
+    MCPMiddleware, MCPServerConfig, mcp_tool_name,
+)
+from mambo_agents.middleware.security_review import SecurityReviewConfig
+
+mcp = MCPMiddleware(servers=[...])
+
+agent = create_mambo_agent(
+    "gpt-4o",
+    middleware=[mcp],
+    interrupt_on={
+        "mcp_call_tool": True,                         # 兜底：所有 MCP 调用
+        mcp_tool_name("filesystem", "delete_config"): True,  # 精确匹配
+    },
+    security_review=SecurityReviewConfig(
+        review_tools=frozenset([
+            mcp_tool_name("filesystem", "delete_config"),  # AI 预审
+            # mcp_tool_name("filesystem", "read_file") 不加 → 直接人工审批
+        ]),
+        tool_unpackers=[mcp.tool_unpacker],
+    ),
+)
+```
+
+`mcp_tool_name("filesystem", "delete_config")` 返回 `"filesystem__delete_config"` —
+一个稳定的名称，在包装模式和透传模式中保持一致。完整示例见 `example/10_mcp_security_review.py`。
+
 ---
 
 ## 11. 文件修改历史与回滚
@@ -1203,6 +1242,80 @@ agent = create_mambo_agent(
 | `url` | `str` | HTTP 必填 | 服务地址（sse / streamable_http / websocket） |
 | `headers` | `dict` | ❌ | HTTP 头（HTTP 模式） |
 | `timeout` | `float` | ❌ | HTTP 超时（秒） |
+
+### 12.x `exclude_tools` — 隐藏危险工具
+
+阻止特定 MCP 工具暴露给 LLM：
+
+```python
+mcp = MCPMiddleware(
+    servers=[...],
+    exclude_tools={
+        "filesystem": frozenset(["send_to_external", "install_package"]),
+        "github": frozenset(["force_push"]),
+    },
+)
+```
+
+被排除的工具在注册前从 tool index 中移除 — 无法通过 ``mcp_get_tool_description``
+发现，也无法通过 ``mcp_call_tool`` 调用。
+
+### 12.x `direct_tool_threshold` — 直传 vs 包装模式
+
+控制 MCP 工具是直接注册还是走包装 meta-tool。默认阈值为 **15**：所有 server
+的 MCP 工具总数低于此值时，每个工具注册为名为 ``server__tool`` 的一级工具。
+高于阈值时使用 ``mcp_call_tool`` / ``mcp_get_tool_description`` 包装。
+
+```python
+mcp = MCPMiddleware(
+    servers=[...],
+    direct_tool_threshold=10,  # 默认 15；设为 0 强制全部包装
+)
+```
+
+两种模式下 ``mcp_tool_name(server, tool)`` 和 ``tool_unpacker`` 行为一致 —
+调整阈值时无需修改 ``interrupt_on`` 和 ``review_tools`` 配置。
+
+### 12.x 安全审查集成
+
+MCP 工具可以被安全审查中间件选择性审查。用 `mcp_tool_name(server, tool)` 构造
+`interrupt_on` 和 `review_tools` 中的工具名，并通过 `tool_unpackers` 传入 `mcp.tool_unpacker`：
+
+```python
+from mambo_agents.middleware.mcp import (
+    MCPMiddleware, MCPServerConfig, mcp_tool_name,
+)
+
+mcp = MCPMiddleware(servers=[...])
+
+agent = create_mambo_agent(
+    "gpt-4o",
+    middleware=[mcp],
+    interrupt_on={
+        "mcp_call_tool": True,
+        mcp_tool_name("filesystem", "delete_config"): True,
+    },
+    security_review=SecurityReviewConfig(
+        review_tools=frozenset([
+            mcp_tool_name("filesystem", "delete_config"),
+        ]),
+        tool_unpackers=[mcp.tool_unpacker],
+    ),
+)
+```
+
+### 12.x `mcp_tool_name()` 参考
+
+``mcp_tool_name(server_name, tool_name) → str`` 返回在 `interrupt_on` 和 `review_tools`
+中使用的有效工具名：
+
+```python
+mcp_tool_name("filesystem", "delete_config")  # → "filesystem__delete_config"
+```
+
+- **一致性**：无论 MCP 处于包装模式还是透传模式，返回的字符串都相同。
+- **安全性**：server name 在初始化时经过校验（禁止含 `__`、最长 64 字符、仅允许字母数字 + `_` `-`）。
+- 完整示例见 `example/10_mcp_security_review.py` 和 `example/mcp_demo_server.py`。
 
 ---
 
