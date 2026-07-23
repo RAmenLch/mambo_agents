@@ -168,9 +168,7 @@ _TOOL_ITEM_TEMPLATE = "  - **{tool_name}**: {description}"
 class MCPServerConfig(BaseModel):
     """Configuration for a single MCP server.
 
-    Mirrors ``langchain_mcp_adapters.sessions.Connection`` fields.  Extra
-    fields not listed here (e.g. ``session_kwargs``, ``encoding``,
-    ``sse_read_timeout``) can be passed through ``extra_kwargs``.
+    Mirrors ``langchain_mcp_adapters.sessions.Connection`` fields.
     """
 
     model_config = {"extra": "forbid"}
@@ -205,6 +203,10 @@ class MCPServerConfig(BaseModel):
         default=None,
         description="HTTP timeout in seconds.",
     )
+    sse_read_timeout: float | None = Field(
+        default=None,
+        description="SSE read timeout in seconds.",
+    )
 
     def to_connection(self) -> Connection:
         """Convert to a ``Connection`` dict for ``MultiServerMCPClient``."""
@@ -226,6 +228,8 @@ class MCPServerConfig(BaseModel):
                 conn["headers"] = self.headers
             if self.timeout is not None:
                 conn["timeout"] = self.timeout
+            if self.sse_read_timeout is not None:
+                conn["sse_read_timeout"] = self.sse_read_timeout
 
         return conn  # type: ignore[return-value]
 
@@ -290,6 +294,21 @@ class _CallToolInput(BaseModel):
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
+
+def _format_exception(exc: BaseException) -> str:
+    """Format an exception, unwrapping ``BaseExceptionGroup`` to expose root causes.
+
+    Python 3.11+ ``ExceptionGroup`` / ``BaseExceptionGroup`` hide sub-exception
+    details behind a generic ``"unhandled errors in a TaskGroup (N sub-exception)"``
+    message.  This helper recursively extracts and formats every leaf exception.
+    """
+    if isinstance(exc, BaseExceptionGroup):
+        sub_errors: list[str] = []
+        for e in exc.exceptions:
+            sub_errors.append(_format_exception(e))
+        return "; ".join(sub_errors)
+    return f"{type(exc).__name__}: {exc}"
 
 
 def _append_to_system_message(
@@ -373,13 +392,13 @@ def _collect_tool_index(
                 )
             except Exception as exc:
                 logger.warning(
-                    "MCP server '%s' unavailable: %s", s.name, exc,
+                    "MCP server '%s' unavailable: %s", s.name, _format_exception(exc),
                 )
                 results.append(
                     _ServerMeta(
                         name=s.name,
                         available=False,
-                        error=str(exc),
+                        error=_format_exception(exc),
                     ),
                 )
         return results
@@ -548,13 +567,13 @@ def _build_call_tool(
                 "MCP call_tool failed: server=%s tool=%s error=%s",
                 server_name,
                 tool_name,
-                exc,
+                _format_exception(exc),
             )
             return json.dumps(
                 {
                     "server_name": server_name,
                     "tool_name": tool_name,
-                    "error": f"Tool execution failed: {exc}",
+                    "error": f"Tool execution failed: {_format_exception(exc)}",
                 },
                 ensure_ascii=False,
             )
@@ -656,7 +675,7 @@ def _build_direct_tool(
                 {
                     "server_name": server_name,
                     "tool_name": tool_entry.tool_name,
-                    "error": f"Tool execution failed: {exc}",
+                    "error": f"Tool execution failed: {_format_exception(exc)}",
                 },
                 ensure_ascii=False,
             )
