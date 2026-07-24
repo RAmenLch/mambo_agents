@@ -504,7 +504,18 @@ class TestMCPMiddlewareInit:
     @patch("mambo_agents.middleware.mcp._collect_tool_index")
     def test_registers_two_tools(self, mock_collect):
         mock_collect.return_value = [
-            _ServerMeta(name="test", available=True, tools=[]),
+            _ServerMeta(
+                name="test",
+                available=True,
+                tools=[
+                    _ToolIndexEntry(
+                        server_name="test",
+                        tool_name="dummy",
+                        description="dummy",
+                        input_schema={},
+                    ),
+                ],
+            ),
         ]
         mw = MCPMiddleware(
             servers=[MCPServerConfig(name="test", command="cmd", args=[])],

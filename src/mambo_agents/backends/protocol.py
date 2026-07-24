@@ -285,6 +285,7 @@ class BackendProtocol(abc.ABC):
         *,
         max_read_chars: int = 100_000,
         max_grep_matches: int = 1000,
+        max_grep_match_chars: int = 500,
         summarizer: ReadSummarizer | None = None,
         tool_timeouts: ToolTimeouts | None = None,
     ) -> None:
@@ -292,8 +293,11 @@ class BackendProtocol(abc.ABC):
             raise ValueError(f"max_read_chars must be >= 1, got {max_read_chars}")
         if max_grep_matches < 1:
             raise ValueError(f"max_grep_matches must be >= 1, got {max_grep_matches}")
+        if max_grep_match_chars < 1:
+            raise ValueError(f"max_grep_match_chars must be >= 1, got {max_grep_match_chars}")
         self._max_read_chars = max_read_chars
         self._max_grep_matches = max_grep_matches
+        self._max_grep_match_chars = max_grep_match_chars
         self._summarizer: ReadSummarizer = summarizer or self._default_summarizer
         self._tool_timeouts = tool_timeouts or ToolTimeouts()
 
@@ -454,8 +458,15 @@ class BackendProtocol(abc.ABC):
         matches: list[GrepMatch],
         offset: int,
         limit: int | None,
+        *,
+        pattern: str | None = None,
+        regex: bool = True,
     ) -> GrepResult:
         """Apply offset / limit slicing and ``max_grep_matches`` cap to grep results.
+
+        Also truncates individual match lines exceeding
+        ``max_grep_match_chars``, centering the window on the matched
+        substring when *pattern* is provided.
 
         Args:
             matches: All collected matches (up to ``max_grep_matches + 1``
@@ -486,12 +497,60 @@ class BackendProtocol(abc.ABC):
         effective_limit = limit if limit is not None else self._max_grep_matches
         effective_limit = min(effective_limit, self._max_grep_matches)
         sliced = matches[offset : offset + effective_limit]
+
+        if self._max_grep_match_chars > 0:
+            sliced = [
+                m if len(m.text) <= self._max_grep_match_chars
+                else m.model_copy(update={"text": self._truncate_grep_line(m.text, pattern, regex)})
+                for m in sliced
+            ]
+
         truncated = (offset + effective_limit) < total
         return GrepResult(
             matches=sliced if sliced else None,
             truncated=truncated,
             total_matches=total,
         )
+
+    def _truncate_grep_line(
+        self,
+        text: str,
+        pattern: str | None,
+        regex: bool,
+    ) -> str:
+        """Truncate *text* to ``max_grep_match_chars``, keeping the match visible.
+
+        When *pattern* is given, the truncation window is centred on the
+        first match span so the reason the line was returned stays in view.
+        Falls back to a simple head truncation if the pattern is absent or
+        cannot be compiled.
+        """
+        max_chars = self._max_grep_match_chars
+        if pattern is not None:
+            try:
+                import re as _re
+                compiled = _re.compile(pattern) if regex else _re.compile(_re.escape(pattern))
+                m = compiled.search(text)
+                if m:
+                    match_start = m.start()
+                    match_end = m.end()
+                    match_len = match_end - match_start
+                    surrounding = max_chars - match_len - 2  # reserve for "…" markers
+                    if surrounding > 0:
+                        half = surrounding // 2
+                        window_start = max(0, match_start - half)
+                        window_end = min(len(text), window_start + max_chars - 2)
+                        window_start = max(0, window_end - (max_chars - 2))
+                        parts: list[str] = []
+                        if window_start > 0:
+                            parts.append("\u2026")
+                        parts.append(text[window_start:window_end])
+                        if window_end < len(text):
+                            parts.append("\u2026")
+                        return "".join(parts)
+            except Exception:
+                pass
+        return text[:max_chars - 1] + "\u2026"
 
     # ------------------------------------------------------------------
     # Core file operations (abstract — every backend MUST implement

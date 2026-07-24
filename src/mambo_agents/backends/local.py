@@ -130,6 +130,7 @@ class LocalBackend(BackendProtocol):
         ignore_dirs: frozenset[str] | None = None,
         max_read_chars: int = 100_000,
         max_grep_matches: int = 1000,
+        max_grep_match_chars: int = 500,
         summarizer: "ReadSummarizer | None" = None,
         tool_timeouts: ToolTimeouts | None = None,
     ) -> None:
@@ -139,6 +140,7 @@ class LocalBackend(BackendProtocol):
         super().__init__(
             max_read_chars=max_read_chars,
             max_grep_matches=max_grep_matches,
+            max_grep_match_chars=max_grep_match_chars,
             summarizer=summarizer,
             tool_timeouts=_merged,
         )
@@ -274,6 +276,16 @@ class LocalBackend(BackendProtocol):
                 f"Use real filesystem paths in commands, NOT `{wr}` paths "
                 f"— the virtual workspace path does not exist on the real filesystem."
             )
+            if sys.platform == "win32":
+                desc += (
+                    "\n**Windows quoting warning:** ``cmd /c`` mishandles "
+                    "nested double quotes — patterns like "
+                    "``python -c \"...\"`` or ``echo \"...\" | ...`` "
+                    "that work on Linux/bash will fail with syntax errors. "
+                    "To run inline Python or script code, use the ``write`` "
+                    "tool to create a temporary file first, then execute "
+                    "that file. Do NOT use ``python -c`` on Windows."
+                )
         else:
             desc += " [shell execution disabled]"
         return desc
@@ -634,7 +646,7 @@ class LocalBackend(BackendProtocol):
                     if len(matches) >= self._max_grep_matches:
                         break
                     matches.append(GrepMatch(path=virt, line=li, text=text))
-            return self._apply_grep_limit(matches, offset, limit)
+            return self._apply_grep_limit(matches, offset, limit, pattern=pattern, regex=regex)
 
         # 2) Python fallback with file-size guard
 
@@ -653,7 +665,7 @@ class LocalBackend(BackendProtocol):
             try:
                 lines = resolved.read_text(encoding="utf-8").split("\n")
             except (UnicodeDecodeError, OSError):
-                return self._apply_grep_limit([], offset, limit)
+                return self._apply_grep_limit([], offset, limit, pattern=pattern, regex=regex)
             for li, line in enumerate(lines, start=1):
                 if len(matches) >= self._max_grep_matches:
                     break
@@ -661,7 +673,7 @@ class LocalBackend(BackendProtocol):
                     rel = str(resolved.relative_to(self._cwd)).replace("\\", "/")
                     virt_path = f"{wr}/{rel}"
                     matches.append(GrepMatch(path=virt_path, line=li, text=line))
-            return self._apply_grep_limit(matches, offset, limit)
+            return self._apply_grep_limit(matches, offset, limit, pattern=pattern, regex=regex)
 
         search_dir = resolved
         error_msg: BackendError | None = None
@@ -706,7 +718,7 @@ class LocalBackend(BackendProtocol):
                         virt_path = f"{wr}/{rel}"
                         matches.append(GrepMatch(path=virt_path, line=li, text=line))
         except OSError as e:
-            result = self._apply_grep_limit(matches, offset, limit)
+            result = self._apply_grep_limit(matches, offset, limit, pattern=pattern, regex=regex)
             return GrepResult(
                 error=BackendError(code=ErrorCode.OS_ERROR, path=path, message=str(e)),
                 matches=result.matches,
@@ -721,7 +733,7 @@ class LocalBackend(BackendProtocol):
                 message=f"跳过 {skipped} 个大文件 (>{self._max_file_size_bytes // (1024 * 1024)} MB)",
             )
 
-        result = self._apply_grep_limit(matches, offset, limit)
+        result = self._apply_grep_limit(matches, offset, limit, pattern=pattern, regex=regex)
         if error_msg:
             result = GrepResult(
                 error=error_msg,

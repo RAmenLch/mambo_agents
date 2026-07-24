@@ -127,6 +127,7 @@ class SshBackend(BackendProtocol):
         ignore_dirs: frozenset[str] | None = None,
         max_read_chars: int = 100_000,
         max_grep_matches: int = 1000,
+        max_grep_match_chars: int = 500,
         summarizer: "ReadSummarizer | None" = None,
         tool_timeouts: ToolTimeouts | None = None,
     ) -> None:
@@ -136,6 +137,7 @@ class SshBackend(BackendProtocol):
         super().__init__(
             max_read_chars=max_read_chars,
             max_grep_matches=max_grep_matches,
+            max_grep_match_chars=max_grep_match_chars,
             summarizer=summarizer,
             tool_timeouts=_merged,
         )
@@ -885,7 +887,7 @@ class SshBackend(BackendProtocol):
             raw = self._grep_raw(pattern, path, glob, regex)
             if raw.error and not raw.matches:
                 return raw  # fatal error, no matches
-            return self._apply_grep_limit(raw.matches or [], offset, limit)
+            return self._apply_grep_limit(raw.matches or [], offset, limit, pattern=pattern, regex=regex)
 
     def _grep_raw(
         self,

@@ -82,12 +82,14 @@ class StoreBackend(BackendProtocol):
         initial_files: dict[str, str] | None = None,
         max_read_chars: int = 100_000,
         max_grep_matches: int = 1000,
+        max_grep_match_chars: int = 500,
         summarizer: "ReadSummarizer | None" = None,
         tool_timeouts: ToolTimeouts | None = None,
     ) -> None:
         super().__init__(
             max_read_chars=max_read_chars,
             max_grep_matches=max_grep_matches,
+            max_grep_match_chars=max_grep_match_chars,
             summarizer=summarizer,
             tool_timeouts=tool_timeouts,
         )
@@ -589,7 +591,7 @@ class StoreBackend(BackendProtocol):
                     return GrepResult(error=BackendError(code=ErrorCode.NOT_FOUND, path=path, message="路径不存在"))
 
         raw_matches = _grep_in_memory(files, pattern, path.normalized, glob, regex, self._max_grep_matches)
-        return self._apply_grep_limit(raw_matches, offset, limit)
+        return self._apply_grep_limit(raw_matches, offset, limit, pattern=pattern, regex=regex)
 
     def glob(self, pattern: str, path: VirtualPath) -> GlobResult:
         if not pattern:
@@ -779,7 +781,7 @@ class StoreBackend(BackendProtocol):
                     return GrepResult(error=BackendError(code=ErrorCode.NOT_FOUND, path=path, message="路径不存在"))
 
         raw_matches = _grep_in_memory(files, pattern, path.normalized, glob, regex, self._max_grep_matches)
-        return self._apply_grep_limit(raw_matches, offset, limit)
+        return self._apply_grep_limit(raw_matches, offset, limit, pattern=pattern, regex=regex)
 
     async def aglob(self, pattern: str, path: VirtualPath) -> GlobResult:
         if not pattern:

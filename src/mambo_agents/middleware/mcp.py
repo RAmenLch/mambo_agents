@@ -738,6 +738,9 @@ def _json_type_to_python(schema: dict[str, Any]) -> type:
 # ---------------------------------------------------------------------------
 
 
+_TOOL_NAME_SAFE_RE = re.compile(r"[^a-zA-Z0-9_-]")
+
+
 def mcp_tool_name(server_name: str, tool_name: str) -> str:
     """Return the effective tool name used in ``interrupt_on`` / ``review_tools``.
 
@@ -752,8 +755,13 @@ def mcp_tool_name(server_name: str, tool_name: str) -> str:
 
     The returned string is stable and safe across both wrapped and direct
     MCP modes — users never need to know which mode is active.
+
+    Tool names are sanitised to comply with the OpenAI function-name
+    pattern ``^[a-zA-Z0-9_-]+$``.  Characters outside that set are
+    replaced with ``_``.
     """
-    return f"{server_name}__{tool_name}"
+    safe_tool = _TOOL_NAME_SAFE_RE.sub("_", tool_name)
+    return f"{server_name}__{safe_tool}"
 
 
 class MCPMiddleware(AgentMiddleware[AgentState, ContextT, ResponseT]):

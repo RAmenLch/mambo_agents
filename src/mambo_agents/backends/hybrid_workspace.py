@@ -628,7 +628,7 @@ class HybridWorkspaceBackend(BackendProtocol):
             fanout_result = self._grep_all_virtual(pattern, glob, regex)
             if fanout_result.error and not fanout_result.matches:
                 return fanout_result
-            result = self._apply_grep_limit(fanout_result.matches or [], offset, limit)
+            result = self._apply_grep_limit(fanout_result.matches or [], offset, limit, pattern=pattern, regex=regex)
             if fanout_result.error:
                 return result.model_copy(update={"error": fanout_result.error})
             return result
@@ -747,7 +747,7 @@ class HybridWorkspaceBackend(BackendProtocol):
             fanout_result = await self._agrep_all_virtual(pattern, glob, regex)
             if fanout_result.error and not fanout_result.matches:
                 return fanout_result
-            result = self._apply_grep_limit(fanout_result.matches or [], offset, limit)
+            result = self._apply_grep_limit(fanout_result.matches or [], offset, limit, pattern=pattern, regex=regex)
             if fanout_result.error:
                 return result.model_copy(update={"error": fanout_result.error})
             return result
