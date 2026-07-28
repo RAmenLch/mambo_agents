@@ -369,7 +369,7 @@ class StoreBackend(BackendProtocol):
             if "/" in relative:
                 subdirs.add(normalized + relative.split("/")[0])
             else:
-                infos.append(FileInfo(path=VirtualPath(fpath), is_dir=False, size=len(fd["content"])))
+                infos.append(FileInfo(path=VirtualPath(fpath), is_dir=False, size=_get_content_size(fd)))
 
         if not infos and not subdirs:
             if path.normalized == self.workspace_root.normalized:
@@ -637,7 +637,7 @@ class StoreBackend(BackendProtocol):
             if "/" in relative:
                 subdirs.add(normalized + relative.split("/")[0])
             else:
-                infos.append(FileInfo(path=VirtualPath(fpath), is_dir=False, size=len(fd["content"])))
+                infos.append(FileInfo(path=VirtualPath(fpath), is_dir=False, size=_get_content_size(fd)))
 
         if not infos and not subdirs:
             if path.normalized == self.workspace_root.normalized:
@@ -950,6 +950,15 @@ def _relative_to(fpath: str, path_prefix: str) -> str:
     return fpath
 
 
+def _get_content_size(fd: dict[str, str]) -> int:
+    """Return the byte size of stored content, accounting for encoding."""
+    content = fd.get("content", "")
+    encoding = fd.get("encoding", "utf-8")
+    if encoding == "base64":
+        return len(base64.b64decode(content))
+    return len(content.encode("utf-8"))
+
+
 def _grep_in_memory(
     files: dict[str, dict[str, str]],
     pattern: str,
@@ -1007,7 +1016,7 @@ def _glob_in_memory(
 
         if not fnmatch_path(_relative_to(fpath, path_prefix), pattern):
             continue
-        results.append(FileInfo(path=VirtualPath(fpath), is_dir=False, size=len(files[fpath].get("content", ""))))
+        results.append(FileInfo(path=VirtualPath(fpath), is_dir=False, size=_get_content_size(files[fpath])))
 
     for dpath in sorted(dirs_seen):
         if not fnmatch_path(_relative_to(dpath, path_prefix), pattern):
