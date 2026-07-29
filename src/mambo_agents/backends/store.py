@@ -580,17 +580,18 @@ class StoreBackend(BackendProtocol):
         normalized = path.normalized
 
         # 检查路径是否存在（文件或目录）
+        is_file = False
         if normalized != self.workspace_root.normalized:
             # 检查是否为文件
             if normalized in files:
-                pass  # 文件存在，可以继续（grep 单文件）
+                is_file = True
             else:
                 # 检查是否为目录（有子文件/目录以该路径为前缀）
                 prefix = normalized + "/"
                 if not any(fpath.startswith(prefix) for fpath in files):
                     return GrepResult(error=BackendError(code=ErrorCode.NOT_FOUND, path=path, message="路径不存在"))
 
-        raw_matches = _grep_in_memory(files, pattern, path.normalized, glob, regex, self._max_grep_matches)
+        raw_matches = _grep_in_memory(files, pattern, path.normalized, glob if not is_file else None, regex, self._max_grep_matches)
         return self._apply_grep_limit(raw_matches, offset, limit, pattern=pattern, regex=regex)
 
     def glob(self, pattern: str, path: VirtualPath) -> GlobResult:
@@ -770,17 +771,18 @@ class StoreBackend(BackendProtocol):
         normalized = path.normalized
 
         # 检查路径是否存在（文件或目录）
+        is_file = False
         if normalized != self.workspace_root.normalized:
             # 检查是否为文件
             if normalized in files:
-                pass  # 文件存在，可以继续（grep 单文件）
+                is_file = True
             else:
                 # 检查是否为目录（有子文件/目录以该路径为前缀）
                 prefix = normalized + "/"
                 if not any(fpath.startswith(prefix) for fpath in files):
                     return GrepResult(error=BackendError(code=ErrorCode.NOT_FOUND, path=path, message="路径不存在"))
 
-        raw_matches = _grep_in_memory(files, pattern, path.normalized, glob, regex, self._max_grep_matches)
+        raw_matches = _grep_in_memory(files, pattern, path.normalized, glob if not is_file else None, regex, self._max_grep_matches)
         return self._apply_grep_limit(raw_matches, offset, limit, pattern=pattern, regex=regex)
 
     async def aglob(self, pattern: str, path: VirtualPath) -> GlobResult:

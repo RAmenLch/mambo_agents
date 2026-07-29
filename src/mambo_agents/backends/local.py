@@ -628,7 +628,9 @@ class LocalBackend(BackendProtocol):
         is_dir = resolved.is_dir()
         wr = self.workspace_root.value
 
-        # 1) Try ripgrep (handles files and dirs equally; rg --glob has POSIX semantics)
+        # 1) Try ripgrep (handles files and dirs equally; --glob prunes files
+        # early for performance, but uses gitignore semantics so we still
+        # post-filter with POSIX fnmatch_path below).
         rg_glob = glob if is_dir else None
         results = self._ripgrep_grep(pattern, resolved, rg_glob, regex)
         if results is not None:
@@ -642,6 +644,15 @@ class LocalBackend(BackendProtocol):
                     virt = f"{wr}/{rel}"
                 except ValueError:
                     continue
+                # Post-filter with POSIX glob (ripgrep --glob uses gitignore semantics,
+                # not POSIX, so we filter on our side to keep consistent behaviour).
+                if glob and is_dir:
+                    try:
+                        rel_path = str(Path(fpath).relative_to(resolved)).replace("\\", "/")
+                    except ValueError:
+                        continue
+                    if not fnmatch_path(rel_path, glob):
+                        continue
                 for li, text in items:
                     if len(matches) >= self._max_grep_matches:
                         break

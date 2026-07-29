@@ -904,31 +904,36 @@ class SshBackend(BackendProtocol):
         except BackendError as e:
             return GrepResult(error=e)
         try:
-            self._sftp.stat(remote)
+            st_mode = self._sftp.stat(remote).st_mode
         except FileNotFoundError:
             return GrepResult(error=BackendError(code=ErrorCode.NOT_FOUND, path=path, message="路径不存在"))
         except OSError as e:
             return GrepResult(error=BackendError(code=ErrorCode.OS_ERROR, path=path, message=str(e)))
+        is_dir = self._attr_is_dir_maybe(st_mode)
         remote_escaped = shlex.quote(remote)
         pattern_escaped = shlex.quote(pattern)
 
-        # 1) Try ripgrep on the remote (fastest) — rg --glob has POSIX semantics
+        # 1) Try ripgrep on the remote (fastest; --glob prunes files early
+        # for performance, but uses gitignore semantics so we still
+        # post-filter with POSIX fnmatch_path below).
         matches = self._rg_remote(pattern_escaped, remote, glob, regex)
         if matches is not None:
+            if glob and is_dir and matches:
+                matches = self._apply_glob_filter(matches, path.value, glob)
             return GrepResult(matches=matches)
 
         # 2) GNU grep (fast C program, handles most cases) — post-filter with POSIX glob
         result = self._grep_remote(pattern_escaped, remote_escaped, regex)
         if result.error is None:
-            if glob and result.matches:
-                result = GrepResult(matches=self._apply_glob_filter(result.matches, self.workspace_root.value, glob))
+            if glob and is_dir and result.matches:
+                result = GrepResult(matches=self._apply_glob_filter(result.matches, path.value, glob))
             return result
 
         # 3) python3 last resort — post-filter with POSIX glob
         if self._has_python3:
             result = self._grep_python(pattern, remote, regex)
-            if glob and result.matches:
-                result = GrepResult(matches=self._apply_glob_filter(result.matches, self.workspace_root.value, glob))
+            if glob and is_dir and result.matches:
+                result = GrepResult(matches=self._apply_glob_filter(result.matches, path.value, glob))
             return result
 
         return result
@@ -1150,25 +1155,25 @@ class SshBackend(BackendProtocol):
     @staticmethod
     def _apply_glob_filter(
         matches: list[GrepMatch],
-        workspace_root: str,
+        search_path: str,
         glob_pattern: str,
     ) -> list[GrepMatch]:
         """Filter grep matches by POSIX glob pattern on the relative path.
 
         Each match's path is a **virtual** path (already converted from
-        physical remote path).  We strip *workspace_root* to get a relative
+        physical remote path).  We strip *search_path* to get a relative
         path and then apply POSIX glob matching (``*`` does not cross
         ``/``, ``**`` matches any depth).
         """
         from mambo_agents.backends.utils import fnmatch_path
 
-        prefix = workspace_root.rstrip("/") + "/"
+        prefix = search_path.rstrip("/") + "/"
         filtered: list[GrepMatch] = []
         for m in matches:
             path_str = str(m.path)
             if path_str.startswith(prefix):
                 rel = path_str[len(prefix):]
-            elif path_str == workspace_root.rstrip("/"):
+            elif path_str == search_path.rstrip("/"):
                 rel = ""
             else:
                 continue
