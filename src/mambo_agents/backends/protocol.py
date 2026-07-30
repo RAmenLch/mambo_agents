@@ -8,9 +8,7 @@ and may freely add backend-specific operations beyond the core six.
 import abc
 import asyncio
 import base64
-import mimetypes
 import threading
-from pathlib import PurePosixPath
 from typing import Any, Awaitable, Callable, ClassVar, TypeVar
 
 from langchain_core.tools import StructuredTool
@@ -38,61 +36,15 @@ from mambo_agents.backends.schemas import (
 
 
 # ============================================================================
-# File type classification helpers
+# File type classification helpers (re‑exported from utils.multimodal)
 # ============================================================================
 
-
-_EXTENSION_TO_FILE_TYPE: dict[str, FileType] = {
-    # Images (https://ai.google.dev/gemini-api/docs/image-understanding)
-    ".png": "image",
-    ".jpeg": "image",
-    ".jpg": "image",
-    ".webp": "image",
-    ".gif": "image",
-    ".heic": "image",
-    ".heif": "image",
-    # Video (https://ai.google.dev/gemini-api/docs/video-understanding)
-    ".mp4": "video",
-    ".mpeg": "video",
-    ".mov": "video",
-    ".avi": "video",
-    ".flv": "video",
-    ".mpg": "video",
-    ".webm": "video",
-    ".wmv": "video",
-    ".3gpp": "video",
-    # Audio (https://ai.google.dev/gemini-api/docs/audio)
-    ".wav": "audio",
-    ".mp3": "audio",
-    ".aiff": "audio",
-    ".aac": "audio",
-    ".ogg": "audio",
-    ".flac": "audio",
-    # Documents
-    ".pdf": "file",
-    ".ppt": "file",
-    ".pptx": "file",
-}
-
-
-def _get_file_type(path: str) -> FileType:
-    """Classify a file by its extension.
-
-    Returns:
-        One of ``"text"``, ``"image"``, ``"audio"``, ``"video"``, or ``"file"``.
-        Defaults to ``"text"`` for unrecognized extensions.
-    """
-    return _EXTENSION_TO_FILE_TYPE.get(
-        PurePosixPath(path).suffix.lower(), "text"
-    )
-
-
-def _get_mime_type(path: str) -> str:
-    """Guess the MIME type for a file path."""
-    return (
-        mimetypes.guess_type("file" + PurePosixPath(path).suffix)[0]
-        or "application/octet-stream"
-    )
+from mambo_agents.backends.utils.multimodal import (
+    EXTENSION_TO_FILE_TYPE as _EXTENSION_TO_FILE_TYPE,
+    get_file_type as _get_file_type,
+    get_mime_type as _get_mime_type,
+    validate_multimodal_content,
+)
 
 
 # ============================================================================
@@ -598,7 +550,8 @@ class BackendProtocol(abc.ABC):
                 message=f"limit must be positive, got {limit}",
             ))
         result = self.read_raw(file_path, offset, limit, include_line_numbers)
-        return self._apply_read_limit(result, file_path)
+        result = self._apply_read_limit(result, file_path)
+        return validate_multimodal_content(result, file_path)
 
     @abc.abstractmethod
     def read_raw(

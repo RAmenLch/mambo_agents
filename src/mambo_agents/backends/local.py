@@ -39,8 +39,10 @@ from mambo_agents.backends.protocol import (
     ToolTimeouts,
     UploadFileResult,
     WriteResult,
-    _get_file_type,
-    _get_mime_type,
+)
+from mambo_agents.backends.utils.multimodal import (
+    get_file_type,
+    get_mime_type,
 )
 from mambo_agents.backends.utils import (
     TreeEntry,
@@ -445,7 +447,7 @@ class LocalBackend(BackendProtocol):
 
         _O_NOFOLLOW = getattr(os, "O_NOFOLLOW", 0)
 
-        if _get_file_type(file_path.value) != "text":
+        if get_file_type(file_path.value) != "text":
             try:
                 fd = os.open(resolved, os.O_RDONLY | _O_NOFOLLOW)
                 with os.fdopen(fd, "rb") as f:
@@ -457,8 +459,8 @@ class LocalBackend(BackendProtocol):
                 content=encoded,
                 total_lines=1,
                 encoding="base64",
-                file_type=_get_file_type(file_path.value),
-                mime_type=_get_mime_type(file_path.value),
+                file_type=get_file_type(file_path.value),
+                mime_type=get_mime_type(file_path.value),
             )
 
         # Text file: attempt UTF-8 read.
@@ -501,6 +503,11 @@ class LocalBackend(BackendProtocol):
             return WriteResult(
                 error=BackendError(code=ErrorCode.EDIT_NOT_ALLOWED, path=file_path, message="路径不允许写入"),
             )
+        if get_file_type(file_path.value) != "text":
+            return WriteResult(error=BackendError(
+                code=ErrorCode.INVALID, path=file_path,
+                message="无法写入该文件，非文本格式不支持写入",
+            ))
         try:
             resolved = self._resolve(file_path)
         except BackendError as e:
@@ -517,6 +524,21 @@ class LocalBackend(BackendProtocol):
                 return WriteResult(
                     error=BackendError(code=ErrorCode.ALREADY_EXISTS, path=file_path, message="文件已存在，请用 edit() 修改或用 overwrite=True 覆盖"),
                 )
+            if resolved.exists():
+                _O_NOFOLLOW = getattr(os, "O_NOFOLLOW", 0)
+                try:
+                    fd = os.open(resolved, os.O_RDONLY | _O_NOFOLLOW)
+                    with os.fdopen(fd, "r", encoding="utf-8") as f:
+                        f.read(1)
+                except UnicodeDecodeError:
+                    return WriteResult(error=BackendError(
+                        code=ErrorCode.INVALID, path=file_path,
+                        message="无法写入该文件，非文本文件仅支持读取",
+                    ))
+                except OSError as e:
+                    return WriteResult(error=BackendError(
+                        code=ErrorCode.IO_ERROR, path=file_path, message=str(e),
+                    ))
 
             try:
                 resolved.parent.mkdir(parents=True, exist_ok=True)
@@ -544,6 +566,11 @@ class LocalBackend(BackendProtocol):
             return EditResult(
                 error=BackendError(code=ErrorCode.EDIT_NOT_ALLOWED, path=file_path, message="路径不允许编辑"),
             )
+        if get_file_type(file_path.value) != "text":
+            return EditResult(error=BackendError(
+                code=ErrorCode.INVALID, path=file_path,
+                message="无法编辑该文件，非文本格式不支持编辑",
+            ))
         try:
             resolved = self._resolve(file_path)
         except BackendError as e:
@@ -566,6 +593,11 @@ class LocalBackend(BackendProtocol):
                 fd = os.open(resolved, os.O_RDONLY | _O_NOFOLLOW)
                 with os.fdopen(fd, "r", encoding="utf-8") as f:
                     content = f.read()
+            except UnicodeDecodeError:
+                return EditResult(error=BackendError(
+                    code=ErrorCode.INVALID, path=file_path,
+                    message="无法编辑该文件，非文本文件仅支持读取",
+                ))
             except OSError as e:
                 return EditResult(error=BackendError(code=ErrorCode.IO_ERROR, path=file_path, message=str(e)))
 
@@ -705,7 +737,7 @@ class LocalBackend(BackendProtocol):
                         continue
                     if not fnmatch_path(rel_path, glob):
                         continue
-                if _get_file_type(fp.suffix) != "text":
+                if get_file_type(fp.suffix) != "text":
                     continue
 
                 # Skip files exceeding the size limit

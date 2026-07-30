@@ -141,9 +141,9 @@ class TestStoreBackendWrite:
     def test_binary_extension_gets_base64(self):
         backend = _make_backend()
         with _simulate_graph(backend):
-            backend.write(VirtualPath("/img.png"), "data")
-            files = backend._get_all_files("test")
-        assert files["/img.png"]["encoding"] == "base64"
+            r = backend.write(VirtualPath("/img.png"), "data")
+        assert r.error is not None
+        assert "非文本" in str(r.error)
 
 
 # ============================================================================
@@ -191,19 +191,18 @@ class TestStoreBackendEdit:
         assert "不存在" in str(r.error)
 
     def test_edit_binary_blocked(self):
-        backend = _make_backend()
+        backend = _make_backend(initial_files={"/img.png": "AAAA"})
         with _simulate_graph(backend):
-            backend.write(VirtualPath("/img.png"), "AAAA")
             r = backend.edit(VirtualPath("/img.png"), "AAA", "BBB")
         assert r.error is not None
-        assert "二进制" in str(r.error)
+        assert "非文本" in str(r.error)
 
     def test_edit_binary_from_initial_files_blocked(self):
         backend = _make_backend(initial_files={"/img.png": "raw"})
         with _simulate_graph(backend):
             r = backend.edit(VirtualPath("/img.png"), "raw", "new")
         assert r.error is not None
-        assert "二进制" in str(r.error)
+        assert "非文本" in str(r.error)
 
     def test_edit_trailing_newline_hint(self):
         backend = _make_backend()
@@ -238,13 +237,13 @@ class TestStoreBackendRead:
         assert "L4" in (r.content or "")
 
     def test_read_binary_base64(self):
-        backend = _make_backend()
+        content = base64.b64encode(b"\x89PNG\r\n\x1a\n\x00").decode("ascii")
+        backend = _make_backend(initial_files={"/img.png": content})
         with _simulate_graph(backend):
-            backend.write(VirtualPath("/img.png"), "binary-data-here")
             r = backend.read(VirtualPath("/img.png"))
         assert r.encoding == "base64"
         assert r.file_type == "image"
-        assert r.content == "binary-data-here"
+        assert r.content == content
 
     def test_read_not_found(self):
         backend = _make_backend()

@@ -38,8 +38,10 @@ from mambo_agents.backends.protocol import (
     ToolTimeouts,
     UploadFileResult,
     WriteResult,
-    _get_file_type,
-    _get_mime_type,
+)
+from mambo_agents.backends.utils.multimodal import (
+    get_file_type,
+    get_mime_type,
 )
 from mambo_agents.backends.utils import (
     TreeEntry,
@@ -591,8 +593,8 @@ class SshBackend(BackendProtocol):
             except OSError as e:
                 return ReadResult(error=BackendError(code=ErrorCode.OS_ERROR, path=file_path, message=str(e)))
 
-            file_type = _get_file_type(file_path.value)
-            mime_type = _get_mime_type(file_path.value)
+            file_type = get_file_type(file_path.value)
+            mime_type = get_mime_type(file_path.value)
 
             if file_type != "text":
                 try:
@@ -661,6 +663,11 @@ class SshBackend(BackendProtocol):
                 return WriteResult(
                     error=BackendError(code=ErrorCode.EDIT_NOT_ALLOWED, path=file_path, message="路径不允许写入"),
                 )
+            if get_file_type(file_path.value) != "text":
+                return WriteResult(error=BackendError(
+                    code=ErrorCode.INVALID, path=file_path,
+                    message="无法写入该文件，非文本格式不支持写入",
+                ))
             try:
                 remote = self._resolve(file_path)
             except BackendError as e:
@@ -687,6 +694,19 @@ class SshBackend(BackendProtocol):
                 return WriteResult(
                     error=BackendError(code=ErrorCode.ALREADY_EXISTS, path=file_path, message="文件已存在，请用 edit() 修改或用 overwrite=True 覆盖"),
                 )
+            if exists:
+                try:
+                    with self._sftp.open(remote, "rb") as f:
+                        f.read().decode("utf-8")
+                except UnicodeDecodeError:
+                    return WriteResult(error=BackendError(
+                        code=ErrorCode.INVALID, path=file_path,
+                        message="无法写入该文件，非文本文件仅支持读取",
+                    ))
+                except OSError as e:
+                    return WriteResult(error=BackendError(
+                        code=ErrorCode.IO_ERROR, path=file_path, message=str(e),
+                    ))
 
             # Ensure parent directories exist
             self._ensure_remote_dir(str(PurePosixPath(remote).parent))
@@ -736,6 +756,11 @@ class SshBackend(BackendProtocol):
                 return EditResult(
                     error=BackendError(code=ErrorCode.EDIT_NOT_ALLOWED, path=file_path, message="路径不允许编辑"),
                 )
+            if get_file_type(file_path.value) != "text":
+                return EditResult(error=BackendError(
+                    code=ErrorCode.INVALID, path=file_path,
+                    message="无法编辑该文件，非文本格式不支持编辑",
+                ))
             try:
                 remote = self._resolve(file_path)
             except BackendError as e:
@@ -756,6 +781,19 @@ class SshBackend(BackendProtocol):
                         message=f"Cannot edit '{file_path}': file not found. To create a new file, use write().",
                     ),
                 )
+
+            try:
+                with self._sftp.open(remote, "rb") as f:
+                    f.read().decode("utf-8")
+            except UnicodeDecodeError:
+                return EditResult(error=BackendError(
+                    code=ErrorCode.INVALID, path=file_path,
+                    message="无法编辑该文件，非文本文件仅支持读取",
+                ))
+            except OSError as e:
+                return EditResult(error=BackendError(
+                    code=ErrorCode.IO_ERROR, path=file_path, message=str(e),
+                ))
 
             old_str = normalize_line_endings(old_str)
             new_str = normalize_line_endings(new_str)

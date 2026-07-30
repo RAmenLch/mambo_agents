@@ -13,8 +13,15 @@ from mambo_agents.backends.utils._edit import (
     detect_trailing_newline_mismatch,
     normalize_line_endings,
 )
+from mambo_agents.backends.utils.multimodal import (
+    EXTENSION_TO_FILE_TYPE,
+    get_file_type,
+    get_mime_type,
+    validate_multimodal_content,
+)
 
 __all__ = [
+    "EXTENSION_TO_FILE_TYPE",
     "LINE_NUMBER_WIDTH",
     "MAX_LINE_LENGTH",
     "TreeEntry",
@@ -25,5 +32,8 @@ __all__ = [
     "format_tree_entries",
     "format_validation_error",
     "format_with_line_numbers",
+    "get_file_type",
+    "get_mime_type",
     "translate_glob",
+    "validate_multimodal_content",
 ]

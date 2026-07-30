@@ -11,12 +11,11 @@ from langgraph.prebuilt.tool_node import ToolNode
 
 from langgraph.store.memory import InMemoryStore
 
-from mambo_agents.backends.schemas import BackendError, ErrorCode, VirtualPath
-from mambo_agents.backends.protocol import (
-    ReadResult,
-    _EXTENSION_TO_FILE_TYPE,
-    _get_file_type,
-    _get_mime_type,
+from mambo_agents.backends.schemas import BackendError, ErrorCode, VirtualPath, ReadResult
+from mambo_agents.backends.utils.multimodal import (
+    EXTENSION_TO_FILE_TYPE,
+    get_file_type,
+    get_mime_type,
 )
 from mambo_agents.backends.store import StoreBackend
 from tests.test_store_backend import _simulate_graph
@@ -33,76 +32,76 @@ from mambo_agents.middleware.backend_tools import (
 
 
 class TestGetFileType:
-    """Tests for ``_get_file_type`` in protocol.py."""
+    """Tests for ``get_file_type`` in protocol.py."""
 
     def test_image_png(self):
-        assert _get_file_type("photo.png") == "image"
+        assert get_file_type("photo.png") == "image"
 
     def test_image_jpeg(self):
-        assert _get_file_type("photo.jpeg") == "image"
+        assert get_file_type("photo.jpeg") == "image"
 
     def test_image_jpg(self):
-        assert _get_file_type("photo.jpg") == "image"
+        assert get_file_type("photo.jpg") == "image"
 
     def test_image_webp(self):
-        assert _get_file_type("photo.webp") == "image"
+        assert get_file_type("photo.webp") == "image"
 
     def test_video_mp4(self):
-        assert _get_file_type("clip.mp4") == "video"
+        assert get_file_type("clip.mp4") == "video"
 
     def test_video_mov(self):
-        assert _get_file_type("clip.mov") == "video"
+        assert get_file_type("clip.mov") == "video"
 
     def test_audio_mp3(self):
-        assert _get_file_type("song.mp3") == "audio"
+        assert get_file_type("song.mp3") == "audio"
 
     def test_audio_wav(self):
-        assert _get_file_type("sound.wav") == "audio"
+        assert get_file_type("sound.wav") == "audio"
 
     def test_file_pdf(self):
-        assert _get_file_type("doc.pdf") == "file"
+        assert get_file_type("doc.pdf") == "file"
 
     def test_file_pptx(self):
-        assert _get_file_type("slides.pptx") == "file"
+        assert get_file_type("slides.pptx") == "file"
 
     def test_text_python(self):
-        assert _get_file_type("script.py") == "text"
+        assert get_file_type("script.py") == "text"
 
     def test_text_txt(self):
-        assert _get_file_type("notes.txt") == "text"
+        assert get_file_type("notes.txt") == "text"
 
     def test_text_unknown_extension(self):
-        assert _get_file_type("data.xyz123") == "text"
+        assert get_file_type("data.xyz123") == "text"
 
     def test_case_insensitive(self):
-        assert _get_file_type("photo.PNG") == "image"
-        assert _get_file_type("clip.MP4") == "video"
+        assert get_file_type("photo.PNG") == "image"
+        assert get_file_type("clip.MP4") == "video"
 
     def test_path_with_dirs(self):
-        assert _get_file_type("/home/user/photo.png") == "image"
+        assert get_file_type("/home/user/photo.png") == "image"
 
 
 class TestGetMimeType:
-    """Tests for ``_get_mime_type`` in protocol.py."""
+    """Tests for ``get_mime_type`` in protocol.py."""
 
     def test_png(self):
-        assert _get_mime_type("photo.png") == "image/png"
+        assert get_mime_type("photo.png") == "image/png"
 
     def test_jpeg(self):
-        assert _get_mime_type("photo.jpg") == "image/jpeg"
+        assert get_mime_type("photo.jpg") == "image/jpeg"
 
     def test_mp3(self):
-        assert _get_mime_type("song.mp3") == "audio/mpeg"
+        assert get_mime_type("song.mp3") == "audio/mpeg"
 
     def test_mp4(self):
-        mime = _get_mime_type("clip.mp4")
+        mime = get_mime_type("clip.mp4")
         assert mime in ("video/mp4", "application/octet-stream")
 
     def test_pdf(self):
-        assert _get_mime_type("doc.pdf") == "application/pdf"
+        assert get_mime_type("doc.pdf") == "application/pdf"
 
     def test_unknown_fallback(self):
-        assert _get_mime_type("file.xyz123") == "application/octet-stream"
+        assert get_mime_type("file.xyz123") == "application/octet-stream"
 
 
 class TestReadResultMultimodal:
@@ -166,7 +165,7 @@ class TestStoreBackendMultimodal:
     """Tests for StoreBackend.read() with multimodal files."""
 
     def test_read_image_returns_file_type(self):
-        b64 = base64.b64encode(b"\x89PNG\r\n").decode("ascii")
+        b64 = base64.b64encode(b"\x89PNG\r\n\x1a\n\x00").decode("ascii")
         backend = StoreBackend(store=InMemoryStore(), initial_files={"/photo.png": b64})
         with _simulate_graph(backend):
             result = backend.read(VirtualPath("/photo.png"))
@@ -176,7 +175,7 @@ class TestStoreBackendMultimodal:
         assert result.mime_type == "image/png"
 
     def test_read_audio_returns_file_type(self):
-        b64 = base64.b64encode(b"fake_audio").decode("ascii")
+        b64 = base64.b64encode(b"\xff\xfb\x00").decode("ascii")
         backend = StoreBackend(store=InMemoryStore(), initial_files={"/song.mp3": b64})
         with _simulate_graph(backend):
             result = backend.read(VirtualPath("/song.mp3"))
@@ -184,14 +183,14 @@ class TestStoreBackendMultimodal:
         assert result.mime_type == "audio/mpeg"
 
     def test_read_video_returns_file_type(self):
-        b64 = base64.b64encode(b"fake_video").decode("ascii")
+        b64 = base64.b64encode(b"\x00\x00\x00\x08ftyp").decode("ascii")
         backend = StoreBackend(store=InMemoryStore(), initial_files={"/clip.mp4": b64})
         with _simulate_graph(backend):
             result = backend.read(VirtualPath("/clip.mp4"))
         assert result.file_type == "video"
 
     def test_read_pdf_returns_file_type(self):
-        b64 = base64.b64encode(b"fake_pdf").decode("ascii")
+        b64 = base64.b64encode(b"%PDF").decode("ascii")
         backend = StoreBackend(store=InMemoryStore(), initial_files={"/doc.pdf": b64})
         with _simulate_graph(backend):
             result = backend.read(VirtualPath("/doc.pdf"))
@@ -209,12 +208,11 @@ class TestStoreBackendMultimodal:
 
     def test_write_image_auto_encoding(self):
         backend = StoreBackend(store=InMemoryStore())
-        b64 = base64.b64encode(b"img_data").decode("ascii")
+        b64 = base64.b64encode(b"\x89PNG\r\n\x1a\n\x00").decode("ascii")
         with _simulate_graph(backend):
-            backend.write(VirtualPath("/new_img.png"), b64)
-            result = backend.read(VirtualPath("/new_img.png"))
-        assert result.encoding == "base64"
-        assert result.file_type == "image"
+            r = backend.write(VirtualPath("/new_img.png"), b64)
+        assert r.error is not None
+        assert "非文本" in str(r.error)
 
     def test_read_not_found(self):
         backend = StoreBackend(store=InMemoryStore())
@@ -225,7 +223,7 @@ class TestStoreBackendMultimodal:
 
     def test_image_no_line_numbers(self):
         """Binary file content should NOT have line number formatting."""
-        b64 = base64.b64encode(b"\x89PNG\r\n").decode("ascii")
+        b64 = base64.b64encode(b"\x89PNG\r\n\x1a\n\x00").decode("ascii")
         backend = StoreBackend(store=InMemoryStore(), initial_files={"/photo.png": b64})
         with _simulate_graph(backend):
             result = backend.read(VirtualPath("/photo.png"))
@@ -241,7 +239,7 @@ class TestBuildCoreToolsMultimodal:
     """Tests for build_core_tools producing multimodal ToolMessage for read."""
 
     def test_read_image_returns_tool_message(self):
-        b64 = base64.b64encode(b"\x89PNG\r\n").decode("ascii")
+        b64 = base64.b64encode(b"\x89PNG\r\n\x1a\n\x00").decode("ascii")
         backend = StoreBackend(store=InMemoryStore(), initial_files={"/photo.png": b64})
         tools = build_core_tools(backend)
         read_tool = next(t for t in tools if t.name == "read")
@@ -269,7 +267,7 @@ class TestBuildCoreToolsMultimodal:
         assert "print" in result
 
     def test_read_audio_returns_tool_message(self):
-        b64 = base64.b64encode(b"fake_audio").decode("ascii")
+        b64 = base64.b64encode(b"\xff\xfb\x00").decode("ascii")
         backend = StoreBackend(store=InMemoryStore(), initial_files={"/song.mp3": b64})
         tools = build_core_tools(backend)
         read_tool = next(t for t in tools if t.name == "read")
@@ -282,7 +280,7 @@ class TestBuildCoreToolsMultimodal:
         assert blocks[0]["type"] == "audio"
 
     def test_read_video_returns_tool_message(self):
-        b64 = base64.b64encode(b"fake_video").decode("ascii")
+        b64 = base64.b64encode(b"\x00\x00\x00\x08ftyp").decode("ascii")
         backend = StoreBackend(store=InMemoryStore(), initial_files={"/clip.mp4": b64})
         tools = build_core_tools(backend)
         read_tool = next(t for t in tools if t.name == "read")
@@ -295,7 +293,7 @@ class TestBuildCoreToolsMultimodal:
         assert blocks[0]["type"] == "video"
 
     def test_read_pdf_returns_tool_message(self):
-        b64 = base64.b64encode(b"fake_pdf").decode("ascii")
+        b64 = base64.b64encode(b"%PDF").decode("ascii")
         backend = StoreBackend(store=InMemoryStore(), initial_files={"/doc.pdf": b64})
         tools = build_core_tools(backend)
         read_tool = next(t for t in tools if t.name == "read")
@@ -320,7 +318,7 @@ class TestBuildCoreToolsMultimodal:
 
     @pytest.mark.asyncio
     async def test_async_read_image_returns_tool_message(self):
-        b64 = base64.b64encode(b"\x89PNG\r\n").decode("ascii")
+        b64 = base64.b64encode(b"\x89PNG\r\n\x1a\n\x00").decode("ascii")
         backend = StoreBackend(store=InMemoryStore(), initial_files={"/photo.png": b64})
         tools = build_core_tools(backend)
         read_tool = next(t for t in tools if t.name == "read")
@@ -505,7 +503,7 @@ class TestReadToolRuntimeInjection:
 
     def test_toolnode_call_multimodal_gives_valid_tool_call_id(self):
         """Multimodal read via ToolNode produces ToolMessage with correct tool_call_id."""
-        b64 = base64.b64encode(b"\x89PNG\r\n").decode("ascii")
+        b64 = base64.b64encode(b"\x89PNG\r\n\x1a\n\x00").decode("ascii")
         backend = StoreBackend(store=InMemoryStore(), initial_files={"/photo.png": b64})
         tools = build_core_tools(backend)
         read_tool = next(t for t in tools if t.name == "read")
@@ -543,7 +541,7 @@ class TestReadToolRuntimeInjection:
     @pytest.mark.asyncio
     async def test_toolnode_async_call_multimodal_tool_call_id(self):
         """Async multimodal read via ToolNode produces correct tool_call_id."""
-        b64 = base64.b64encode(b"\x89PNG\r\n").decode("ascii")
+        b64 = base64.b64encode(b"\x89PNG\r\n\x1a\n\x00").decode("ascii")
         backend = StoreBackend(store=InMemoryStore(), initial_files={"/photo.png": b64})
         tools = build_core_tools(backend)
         read_tool = next(t for t in tools if t.name == "read")
@@ -577,7 +575,7 @@ class TestReadToolRuntimeInjection:
         This simulates what ToolNode._inject_tool_args does: it merges the
         ToolRuntime instance into the tool call args before calling tool.invoke().
         """
-        b64 = base64.b64encode(b"\x89PNG\r\n").decode("ascii")
+        b64 = base64.b64encode(b"\x89PNG\r\n\x1a\n\x00").decode("ascii")
         backend = StoreBackend(store=InMemoryStore(), initial_files={"/photo.png": b64})
         tools = build_core_tools(backend)
         read_tool = next(t for t in tools if t.name == "read")

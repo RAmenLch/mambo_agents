@@ -31,8 +31,11 @@ from mambo_agents.backends.protocol import (
     ToolTimeouts,
     UploadFileResult,
     WriteResult,
-    _get_file_type,
-    _get_mime_type,
+)
+from mambo_agents.backends.utils.multimodal import (
+    get_file_type,
+    get_mime_type,
+    validate_multimodal_content,
 )
 from mambo_agents.backends.schemas import BackendError, ErrorCode, VirtualPath, human_size
 from mambo_agents.backends.utils import (
@@ -108,7 +111,7 @@ class StoreBackend(BackendProtocol):
                         code=ErrorCode.INVALID,
                         message=f"initial_files 路径不能以 '/' 结尾: {raw_path!r}",
                     )
-                encoding = "base64" if _get_file_type(vp.normalized) != "text" else "utf-8"
+                encoding = "base64" if get_file_type(vp.normalized) != "text" else "utf-8"
                 self._initial_files[vp.normalized] = {"content": content_, "encoding": encoding}
 
         # Track which threads have received initial_files (thread-safe)
@@ -457,13 +460,24 @@ class StoreBackend(BackendProtocol):
     ) -> ReadResult:
         content = fd["content"]
         encoding = fd["encoding"]
+        file_type = get_file_type(file_path.normalized)
 
-        if encoding == "base64":
-            file_type = _get_file_type(file_path.normalized)
+        if file_type != "text":
+            if encoding != "base64":
+                return ReadResult(error=BackendError(
+                    code=ErrorCode.INVALID, path=file_path,
+                    message="多模态文件编码异常，期望 base64",
+                ))
             return ReadResult(
                 content=content, total_lines=1, encoding="base64",
-                file_type=file_type, mime_type=_get_mime_type(file_path.normalized),
+                file_type=file_type, mime_type=get_mime_type(file_path.normalized),
             )
+
+        if encoding != "utf-8":
+            return ReadResult(error=BackendError(
+                code=ErrorCode.INVALID, path=file_path,
+                message="文本文件编码异常，期望 utf-8",
+            ))
 
         lines = content.splitlines(keepends=True)
         total = len(lines)
@@ -486,6 +500,11 @@ class StoreBackend(BackendProtocol):
     ) -> WriteResult:
         if file_path.value.endswith("/"):
             return WriteResult(error=BackendError(code=ErrorCode.IS_DIR, path=file_path, message="目标是目录"))
+        if get_file_type(file_path.normalized) != "text":
+            return WriteResult(error=BackendError(
+                code=ErrorCode.INVALID, path=file_path,
+                message="无法写入该文件，非文本格式不支持写入",
+            ))
         with self._lock:
             tid = self._resolve_thread_id()
             files = self._get_all_files(tid)
@@ -500,8 +519,13 @@ class StoreBackend(BackendProtocol):
                 return WriteResult(
                     error=BackendError(code=ErrorCode.ALREADY_EXISTS, path=file_path, message="文件已存在，请用 edit() 修改或用 overwrite=True 覆盖"),
                 )
-            encoding = "base64" if _get_file_type(file_path.normalized) != "text" else "utf-8"
-            self._put_file(tid, file_path.normalized, content, encoding)
+            if overwrite and file_path.normalized in files:
+                if files[file_path.normalized]["encoding"] == "base64":
+                    return WriteResult(error=BackendError(
+                        code=ErrorCode.INVALID, path=file_path,
+                        message="无法写入该文件，文件是二进制格式",
+                    ))
+            self._put_file(tid, file_path.normalized, content, "utf-8")
             return WriteResult(path=file_path.normalized)
 
     def edit(
@@ -516,6 +540,11 @@ class StoreBackend(BackendProtocol):
             return EditResult(error=BackendError(code=ErrorCode.IS_DIR, path=file_path, message="目标是目录"))
         if not old_str:
             return EditResult(error=BackendError(code=ErrorCode.INVALID, message="old_str 不能为空"))
+        if get_file_type(file_path.normalized) != "text":
+            return EditResult(error=BackendError(
+                code=ErrorCode.INVALID, path=file_path,
+                message="无法编辑该文件，非文本格式不支持编辑",
+            ))
         with self._lock:
             tid = self._resolve_thread_id()
             files = self._get_all_files(tid)
@@ -533,7 +562,7 @@ class StoreBackend(BackendProtocol):
                 )
             if existing_fd["encoding"] == "base64":
                 return EditResult(
-                    error=BackendError(code=ErrorCode.INVALID, path=file_path, message="文件是二进制格式，请用 write() 覆盖"),
+                    error=BackendError(code=ErrorCode.INVALID, path=file_path, message="无法编辑该文件，文件是二进制格式"),
                 )
 
             old_str = normalize_line_endings(old_str)
@@ -669,13 +698,19 @@ class StoreBackend(BackendProtocol):
                 message=f"limit must be positive, got {limit}",
             ))
         result = await self.aread_raw(file_path, offset, limit, include_line_numbers)
-        return self._apply_read_limit(result, file_path)
+        result = self._apply_read_limit(result, file_path)
+        return validate_multimodal_content(result, file_path)
 
     async def awrite(
         self, file_path: VirtualPath, content: str, overwrite: bool = False,
     ) -> WriteResult:
         if file_path.value.endswith("/"):
             return WriteResult(error=BackendError(code=ErrorCode.IS_DIR, path=file_path, message="目标是目录"))
+        if get_file_type(file_path.normalized) != "text":
+            return WriteResult(error=BackendError(
+                code=ErrorCode.INVALID, path=file_path,
+                message="无法写入该文件，非文本格式不支持写入",
+            ))
         async with self._async_lock:
             tid = self._resolve_thread_id()
             files = await self._aget_all_files(tid)
@@ -690,8 +725,13 @@ class StoreBackend(BackendProtocol):
                 return WriteResult(
                     error=BackendError(code=ErrorCode.ALREADY_EXISTS, path=file_path, message="文件已存在，请用 edit() 修改或用 overwrite=True 覆盖"),
                 )
-            encoding = "base64" if _get_file_type(file_path.normalized) != "text" else "utf-8"
-            await self._aput_file(tid, file_path.normalized, content, encoding)
+            if overwrite and file_path.normalized in files:
+                if files[file_path.normalized]["encoding"] == "base64":
+                    return WriteResult(error=BackendError(
+                        code=ErrorCode.INVALID, path=file_path,
+                        message="无法写入该文件，文件是二进制格式",
+                    ))
+            await self._aput_file(tid, file_path.normalized, content, "utf-8")
             return WriteResult(path=file_path.normalized)
 
     async def aedit(
@@ -706,6 +746,11 @@ class StoreBackend(BackendProtocol):
             return EditResult(error=BackendError(code=ErrorCode.IS_DIR, path=file_path, message="目标是目录"))
         if not old_str:
             return EditResult(error=BackendError(code=ErrorCode.INVALID, message="old_str 不能为空"))
+        if get_file_type(file_path.normalized) != "text":
+            return EditResult(error=BackendError(
+                code=ErrorCode.INVALID, path=file_path,
+                message="无法编辑该文件，非文本格式不支持编辑",
+            ))
         async with self._async_lock:
             tid = self._resolve_thread_id()
             files = await self._aget_all_files(tid)
@@ -723,7 +768,7 @@ class StoreBackend(BackendProtocol):
                 )
             if existing_fd["encoding"] == "base64":
                 return EditResult(
-                    error=BackendError(code=ErrorCode.INVALID, path=file_path, message="文件是二进制格式，请用 write() 覆盖"),
+                    error=BackendError(code=ErrorCode.INVALID, path=file_path, message="无法编辑该文件，文件是二进制格式"),
                 )
 
             old_str = normalize_line_endings(old_str)
