@@ -483,6 +483,10 @@ class MamboSummarizationMiddleware(AgentMiddleware[SummarizationState, ContextT,
         # on the backend (does NOT require a real filesystem root).
         self._history_path_prefix = "/.mambo/conversation_history"
 
+        # Per-astream pending event: generated in before_agent, emitted
+        # (and state-updated) once in the first wrap_model_call.
+        self._pending_summarization_event: SummarizationEvent | None = None
+
     # ------------------------------------------------------------------
     # Hook management
     # ------------------------------------------------------------------
@@ -811,7 +815,7 @@ class MamboSummarizationMiddleware(AgentMiddleware[SummarizationState, ContextT,
         Returns:
             The effective message list the model should see.
         """
-        event = request.state.get("_summarization_event")
+        event = request.state.get("_summarization_event") or self._pending_summarization_event
         return self._apply_event_to_messages(request.messages, event)
 
     @staticmethod
@@ -1095,7 +1099,8 @@ class MamboSummarizationMiddleware(AgentMiddleware[SummarizationState, ContextT,
             cutoff_index=cutoff_index,
         )
 
-        return {"_summarization_event": new_event}
+        self._pending_summarization_event = new_event
+        return None
 
     async def _asummarize_from_state(
         self,
@@ -1152,7 +1157,8 @@ class MamboSummarizationMiddleware(AgentMiddleware[SummarizationState, ContextT,
             cutoff_index=cutoff_index,
         )
 
-        return {"_summarization_event": new_event}
+        self._pending_summarization_event = new_event
+        return None
 
     # ------------------------------------------------------------------
     # Shared finalization (hook injection → event construction)
@@ -1242,13 +1248,23 @@ class MamboSummarizationMiddleware(AgentMiddleware[SummarizationState, ContextT,
         effective = self._get_effective_messages(request)
 
         if self._mode == SummarizationMode.PER_ASTREAM:
-            # Summarization already handled in before_agent —
-            # just pass through with effective messages.
+            # Summarization already happened in before_agent —
+            # effective messages were reconstructed with the pending event.
             try:
-                return handler(request.override(messages=effective))
+                response = handler(request.override(messages=effective))
             except ContextOverflowError:
                 # Fall back to summarization on overflow even in per_astream mode
+                self._pending_summarization_event = None
                 return self._summarize_and_call(request, effective, handler)
+
+            pending = self._pending_summarization_event
+            if pending is not None:
+                self._pending_summarization_event = None
+                return ExtendedModelResponse(
+                    model_response=response,
+                    command=Command(update={"_summarization_event": pending}),
+                )
+            return response
 
         # --- per_model_call mode ---
         if not self._should_summarize(effective):
@@ -1269,9 +1285,19 @@ class MamboSummarizationMiddleware(AgentMiddleware[SummarizationState, ContextT,
 
         if self._mode == SummarizationMode.PER_ASTREAM:
             try:
-                return await handler(request.override(messages=effective))
+                response = await handler(request.override(messages=effective))
             except ContextOverflowError:
+                self._pending_summarization_event = None
                 return await self._asummarize_and_call(request, effective, handler)
+
+            pending = self._pending_summarization_event
+            if pending is not None:
+                self._pending_summarization_event = None
+                return ExtendedModelResponse(
+                    model_response=response,
+                    command=Command(update={"_summarization_event": pending}),
+                )
+            return response
 
         # --- per_model_call mode ---
         if not self._should_summarize(effective):

@@ -925,7 +925,7 @@ class TestPerAstreamMode:
         assert len(received[0]) == 5
 
     def test_before_agent_triggers_summarization(self):
-        """before_agent triggers summarization when token budget exceeded."""
+        """before_agent generates summary and stores pending event (not state update)."""
         mock = _make_mock_summary_model("Summary from before_agent.")
         mw = MamboSummarizationMiddleware(
             model=mock,
@@ -943,10 +943,12 @@ class TestPerAstreamMode:
         ]
         state = {"messages": messages}
 
+        # before_agent returns None — no state update
         result = mw.before_agent(state, MagicMock())
-        assert result is not None
-        assert "_summarization_event" in result
-        event = result["_summarization_event"]
+        assert result is None
+
+        # The event is stored as pending for wrap_model_call to emit
+        event = mw._pending_summarization_event
         assert event is not None
         assert "Summary from before_agent" in event["summary_message"].content
         # cutoff_index should be an absolute state index (no prior event → same as effective)
@@ -974,8 +976,8 @@ class TestPerAstreamMode:
         mock.invoke.assert_not_called()
 
     def test_before_agent_applies_event_to_subsequent_wrap_model_call(self):
-        """After before_agent sets _summarization_event, wrap_model_call
-        uses the compacted view."""
+        """After before_agent stores pending event, wrap_model_call
+        uses the compacted view and returns ExtendedModelResponse."""
         mock = _make_mock_summary_model("Compacted summary.")
         mw = MamboSummarizationMiddleware(
             model=mock,
@@ -993,29 +995,38 @@ class TestPerAstreamMode:
         ]
         state = {"messages": messages}
 
-        # Step 1: before_agent compacts
+        # Step 1: before_agent generates summary, stores pending event
         result = mw.before_agent(state, MagicMock())
-        assert result is not None
-        event = result["_summarization_event"]
+        assert result is None
+        event = mw._pending_summarization_event
+        assert event is not None
 
-        # Step 2: wrap_model_call sees the compacted view
-        state_with_event = {**state, "_summarization_event": event}
-        request = _make_request(messages, state=state_with_event)
+        # Step 2: wrap_model_call sees the compacted view via pending event
+        request = _make_request(messages, state=state)  # no event in state
         received = []
 
         def handler(req):
             received.append(list(req.messages))
             return "ok"
 
-        # wrap_model_call should NOT trigger another summarization —
-        # it just reconstructs effective messages and passes through
-        mw.wrap_model_call(request, handler)
+        # wrap_model_call uses pending event to reconstruct messages,
+        # then emits ExtendedModelResponse and clears pending
+        response = mw.wrap_model_call(request, handler)
         assert len(received) == 1
         # Effective: [summary_msg, *messages[cutoff_idx:]]
         effective = received[0]
         assert len(effective) < 5  # compacted
         assert isinstance(effective[0], HumanMessage)
         assert "Compacted summary" in effective[0].content
+
+        # Should return ExtendedModelResponse with the event
+        from langchain.agents.middleware.types import ExtendedModelResponse
+        assert isinstance(response, ExtendedModelResponse)
+        assert response.command is not None
+        assert "_summarization_event" in response.command.update
+
+        # Pending should be cleared after first wrap_model_call
+        assert mw._pending_summarization_event is None
 
     def test_per_model_call_mode_ignores_before_agent(self):
         """In per_model_call mode, before_agent returns None."""
@@ -1040,7 +1051,7 @@ class TestPerAstreamMode:
         assert result is None
 
     def test_before_agent_with_hook_injection(self):
-        """before_agent respects summary hooks."""
+        """before_agent respects summary hooks and stores pending event."""
         mock = _make_mock_summary_model("Summary with hooks.")
 
         def custom_hook(ctx):
@@ -1064,8 +1075,8 @@ class TestPerAstreamMode:
         state = {"messages": messages}
 
         result = mw.before_agent(state, MagicMock())
-        assert result is not None
-        event = result["_summarization_event"]
+        assert result is None
+        event = mw._pending_summarization_event
         content = event["summary_message"].content
         assert "Summary with hooks" in content
         assert "HOOK_CONTENT" in content
