@@ -1866,3 +1866,44 @@ class SshBackend(BackendProtocol):
                     )
             return results
 
+    def download_files(
+        self,
+        paths: list[VirtualPath],
+    ) -> list[DownloadFileResult]:
+        """Download multiple files as raw bytes from the remote server.
+
+        Reads raw bytes directly via SFTP (not through ``read_raw``),
+        mirroring ``LocalBackend.download_files``.
+        """
+        with self._sync_lock:
+            results: list[DownloadFileResult] = []
+            for path in paths:
+                try:
+                    remote = self._resolve(path)
+                    st_mode = self._sftp.stat(remote).st_mode
+                    if self._attr_is_dir_maybe(st_mode):
+                        results.append(DownloadFileResult(
+                            path=path, content=None,
+                            error=BackendError(code=ErrorCode.IS_DIR, path=path, message="目标是目录"),
+                        ))
+                        continue
+                    with self._sftp.open(remote, "rb") as f:
+                        raw = f.read()
+                    results.append(DownloadFileResult(path=path, content=raw))
+                except FileNotFoundError:
+                    results.append(DownloadFileResult(
+                        path=path, content=None,
+                        error=BackendError(code=ErrorCode.NOT_FOUND, path=path, message="文件不存在"),
+                    ))
+                except OSError as e:
+                    results.append(DownloadFileResult(
+                        path=path, content=None,
+                        error=BackendError(code=ErrorCode.IO_ERROR, path=path, message=str(e)),
+                    ))
+                except Exception as e:
+                    results.append(DownloadFileResult(
+                        path=path, content=None,
+                        error=BackendError(code=ErrorCode.INVALID, path=path, message=f"{type(e).__name__}: {e}"),
+                    ))
+            return results
+
