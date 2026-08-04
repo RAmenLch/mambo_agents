@@ -62,6 +62,23 @@ _DEFAULT_EXECUTE_TIMEOUT = 120
 _MAX_OUTPUT_BYTES = 100_000
 
 
+def _in_ignored_dir(
+    virt_path: str,
+    ignore_dirs: frozenset[str],
+    workspace_root: str,
+) -> bool:
+    """Segment-level check: True if any parent-directory segment of *virt_path*
+    matches one of the bare directory names in *ignore_dirs*.
+
+    Matches path segments only, not substrings — e.g. with ``ignore_dirs={"a"}``,
+    ``/workspace/ac/x.txt`` passes (segment ``"ac"`` != ``"a"``) while
+    ``/workspace/a/c/x.txt`` is excluded (segment ``"a"`` matches).
+    """
+    virt_path = str(virt_path)
+    rel = virt_path[len(workspace_root):].lstrip("/")
+    return any(seg in ignore_dirs for seg in rel.split("/")[:-1])
+
+
 # ---------------------------------------------------------------------------
 # SshBackend
 # ---------------------------------------------------------------------------
@@ -102,9 +119,11 @@ class SshBackend(BackendProtocol):
             Mutually exclusive with *edit_blacklist*.
         edit_blacklist: Virtual path prefixes forbidden for edit/write/delete.
             Mutually exclusive with *edit_whitelist*.
-        ignore_dirs: Virtual directory paths whose children are hidden
-            in ``tree()`` output.  The directory itself is shown with
-            an ``/(ignore)`` marker but its content is not expanded.
+        ignore_dirs: Directory names (bare basenames, e.g. ``"node_modules"``)
+            whose children are hidden in ``tree()`` output and whose files are
+            excluded from ``grep()`` results.  Any directory matching one of
+            these names (at any depth) is shown with an ``/(ignore)`` marker
+            but its content is not expanded.
     """
 
     # Default per-tool timeout values specific to this backend (overridable via __init__).
@@ -925,6 +944,14 @@ class SshBackend(BackendProtocol):
             raw = self._grep_raw(pattern, path, glob, regex)
             if raw.error and not raw.matches:
                 return raw  # fatal error, no matches
+            # Uniform segment-level exclusion of ignore_dirs across all
+            # search paths (rg / GNU grep / python3), incl. single-file searches.
+            if raw.matches and self._ignore_dirs:
+                wr = self.workspace_root.value
+                raw.matches = [
+                    m for m in raw.matches
+                    if not _in_ignored_dir(m.path, self._ignore_dirs, wr)
+                ]
             return self._apply_grep_limit(raw.matches or [], offset, limit, pattern=pattern, regex=regex)
 
     def _grep_raw(
@@ -984,7 +1011,9 @@ class SshBackend(BackendProtocol):
         regex: bool = True,
     ) -> list[GrepMatch] | None:
         """Run ripgrep on the remote server.  Returns ``None`` if unavailable."""
-        cmd = "rg --json"
+        # Search everything: hidden files/dirs and gitignored paths are included;
+        # hiding is controlled exclusively by ignore_dirs (see _in_ignored_dir).
+        cmd = "rg --json --hidden --no-ignore"
         if not regex:
             cmd += " -F"
         if glob:
@@ -1042,13 +1071,10 @@ class SshBackend(BackendProtocol):
         regex_b64 = base64.b64encode(str(regex).encode()).decode()
         remote_repr = repr(remote)
 
-        # Convert virtual ignore_dirs → relative names for remote os.walk
-        wr = self.workspace_root.value
+        # Bare directory names for remote os.walk pruning (basename match,
+        # consistent with the uniform segment-level filter in grep()).
         ignore_names_b64 = base64.b64encode(
-            json.dumps([
-                p[len(wr):].lstrip("/").rsplit("/", 1)[-1]
-                for p in self._ignore_dirs
-            ]).encode()
+            json.dumps(sorted(self._ignore_dirs)).encode()
         ).decode()
 
         script = (
@@ -1085,11 +1111,8 @@ class SshBackend(BackendProtocol):
             f"else:\n"
             f"    res = []\n"
             f"    for root, dirs, files in os.walk(d):\n"
-            f"        dirs[:] = [x for x in dirs\n"
-            f"                   if not x.startswith('.') and x not in SKIP_DIRS]\n"
+            f"        dirs[:] = [x for x in dirs if x not in SKIP_DIRS]\n"
             f"        for fname in files:\n"
-            f"            if fname.startswith('.'):\n"
-            f"                continue\n"
             f"            if os.path.splitext(fname)[1].lower() in BINARY_EXTS:\n"
             f"                continue\n"
             f"            fp = os.path.join(root, fname)\n"
@@ -1439,12 +1462,6 @@ class SshBackend(BackendProtocol):
             else:
                 out, err, exit_code = self._tree_find(remote, depth)
 
-            # Map virtual ignore_dirs → relative paths expected in output
-            wr = self.workspace_root.value
-            ignore_rel_paths: frozenset[str] = frozenset(
-                p[len(wr):].lstrip("/") for p in self._ignore_dirs
-            )
-
             if exit_code > 1 or not out.strip():
                 return f"(empty or inaccessible)"
 
@@ -1477,13 +1494,18 @@ class SshBackend(BackendProtocol):
                     return 1
                 return rel.count("/") + 1
 
-            # Filter out children of ignored dirs AND the ignored dirs themselves
-            # (we'll add ignored dirs back later with the ignore marker)
+            # Match ignored dirs by bare name (basename) — the dir itself and
+            # all its descendants are removed (we'll add the dirs back later
+            # with the ignore marker).
+            matched: set[str] = {
+                d for d in dirs if d.rsplit("/", 1)[-1] in self._ignore_dirs
+            }
+
             filtered_dirs: set[str] = set()
             for d in dirs:
                 if any(
-                    d == ign or d.startswith(ign + "/")
-                    for ign in ignore_rel_paths
+                    d == m or d.startswith(m + "/")
+                    for m in matched
                 ):
                     continue
                 filtered_dirs.add(d)
@@ -1493,8 +1515,8 @@ class SshBackend(BackendProtocol):
                 # Build full relative path for checking
                 full_rel = f"{parent}/{name}" if parent != "." else name
                 if any(
-                    full_rel == ign or full_rel.startswith(ign + "/")
-                    for ign in ignore_rel_paths
+                    full_rel == m or full_rel.startswith(m + "/")
+                    for m in matched
                 ):
                     continue
                 filtered_files.append((parent, name, size))
@@ -1523,12 +1545,13 @@ class SshBackend(BackendProtocol):
                         has_children = False
                     marker = "depth_exceeded" if has_children else "empty"
                 else:
-                    # Check emptiness from parsed data
+                    # Check emptiness from unfiltered data so that a parent
+                    # holding only ignored dirs is not marked /(empty).
                     has_children = any(
-                        fp == d for fp, _n, _s in filtered_files
+                        fp == d for fp, _n, _s in file_entries
                     ) or any(
                         sub != d and sub.startswith(d + "/")
-                        for sub in filtered_dirs
+                        for sub in dirs
                     )
                     if not has_children:
                         marker = "empty"
@@ -1542,15 +1565,14 @@ class SshBackend(BackendProtocol):
                     marker=marker,
                 )))
 
-            # Add ignored dirs (show but with ignore marker, no children)
-            for ign in sorted(ignore_rel_paths):
-                if ign in dirs:  # only if it actually exists
-                    sort_path = ign + "/"
-                    dir_file_entries.append((sort_path, TreeEntry(
-                        name=ign.split("/")[-1] + "/",
-                        depth=ign.count("/") + 1,
-                        marker="ignore",
-                    )))
+            # Add ignored dirs back (show but with ignore marker, no children)
+            for m in sorted(matched):
+                sort_path = m + "/"
+                dir_file_entries.append((sort_path, TreeEntry(
+                    name=m.rsplit("/", 1)[-1] + "/",
+                    depth=m.count("/") + 1,
+                    marker="ignore",
+                )))
 
             # Files
             for parent, name, size in filtered_files:
@@ -1601,13 +1623,10 @@ class SshBackend(BackendProtocol):
             f"    if cur_d > md:\n"
             f"        dirs[:] = []\n"
             f"        continue\n"
-            f"    dirs[:] = [x for x in dirs if not x.startswith('.')]\n"
             f"    for name in dirs:\n"
             f"        p = rd + '/' + name if rd else name\n"
             f"        res.append(('d', p, 0))\n"
             f"    for name in files:\n"
-            f"        if name.startswith('.'):\n"
-            f"            continue\n"
             f"        p = rd + '/' + name if rd else name\n"
             f"        fp = os.path.join(root, name)\n"
             f"        try:\n"
@@ -1629,7 +1648,7 @@ class SshBackend(BackendProtocol):
         """Fallback tree via ``find -printf`` (GNU find only)."""
         remote_escaped = shlex.quote(remote)
         cmd = (
-            f"find {remote_escaped} -maxdepth {depth} -not -path '*/.*' "
+            f"find {remote_escaped} -maxdepth {depth} "
             f"\\( -type d -printf 'd %P\\n' , -type f -printf 'f %P %s\\n' \\) "
             f"2>/dev/null | sort"
         )

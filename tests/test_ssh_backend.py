@@ -559,3 +559,102 @@ class TestTreeDepthCalculation:
             f"nested.txt should be deeper than subdir/; "
             f"connector pos {nested_cp} <= {subdir_cp}.\n{result}"
         )
+
+
+# ============================================================================
+# tree – ignore_dirs (bare directory names)
+# ============================================================================
+
+
+class TestTreeIgnoreDirs:
+    """ignore_dirs match by bare directory name at any depth.
+
+    The dir itself is shown with an ``/(ignore)`` marker, its children
+    are hidden, and multiple same-name dirs are each marked.
+    """
+
+    def test_top_level_ignored_dir(self, ssh_backend):
+        """Top-level node_modules is marked and its children hidden."""
+        ssh_backend._ignore_dirs = frozenset({"node_modules"})
+        ssh_backend._has_python3 = False
+        fake_out = (
+            "d node_modules\n"
+            "f node_modules/pkg.json 10\n"
+            "d src\n"
+            "f src/main.py 5\n"
+        )
+        ssh_backend._exec = MagicMock(return_value=(fake_out, "", 0))
+        ssh_backend._sftp.listdir_attr = MagicMock(return_value=[])
+
+        result = ssh_backend.tree(VirtualPath("/workspace"), depth=3)
+        assert "node_modules/(ignore)" in result
+        assert "pkg.json" not in result
+        assert "src/" in result
+        assert "main.py" in result
+
+    def test_nested_same_name_dirs_all_marked(self, ssh_backend):
+        """Same-name dirs at different depths are each marked."""
+        ssh_backend._ignore_dirs = frozenset({"node_modules"})
+        ssh_backend._has_python3 = False
+        fake_out = (
+            "d node_modules\n"
+            "d a\n"
+            "d a/node_modules\n"
+            "f a/node_modules/deep.js 3\n"
+        )
+        ssh_backend._exec = MagicMock(return_value=(fake_out, "", 0))
+        ssh_backend._sftp.listdir_attr = MagicMock(return_value=[])
+
+        result = ssh_backend.tree(VirtualPath("/workspace"), depth=3)
+        lines = result.split("\n")
+        assert sum("node_modules/(ignore)" in l for l in lines) == 2
+        assert "deep.js" not in result
+
+    def test_dot_dir_marked_when_ignored(self, ssh_backend):
+        """Hidden dirs are now visible; .git is marked when in ignore_dirs."""
+        ssh_backend._ignore_dirs = frozenset({".git"})
+        ssh_backend._has_python3 = False
+        fake_out = (
+            "d .git\n"
+            "f .git/config 20\n"
+            "f main.py 5\n"
+        )
+        ssh_backend._exec = MagicMock(return_value=(fake_out, "", 0))
+        ssh_backend._sftp.listdir_attr = MagicMock(return_value=[])
+
+        result = ssh_backend.tree(VirtualPath("/workspace"), depth=3)
+        assert ".git/(ignore)" in result
+        assert "config" not in result
+        assert "main.py" in result
+
+    def test_parent_of_ignored_dir_not_empty(self, ssh_backend):
+        """A parent holding only ignored dirs must not be marked /(empty)."""
+        ssh_backend._ignore_dirs = frozenset({"node_modules"})
+        ssh_backend._has_python3 = False
+        fake_out = (
+            "d a\n"
+            "d a/node_modules\n"
+        )
+        ssh_backend._exec = MagicMock(return_value=(fake_out, "", 0))
+        ssh_backend._sftp.listdir_attr = MagicMock(return_value=[])
+
+        result = ssh_backend.tree(VirtualPath("/workspace"), depth=3)
+        assert "a/" in result
+        assert "a/(empty)" not in result
+        assert "node_modules/(ignore)" in result
+
+    def test_grep_excludes_ignored_dir_by_segment(self, ssh_backend):
+        """grep results under ignore_dirs are excluded (segment match)."""
+        from mambo_agents.backends.schemas import GrepMatch, GrepResult
+
+        ssh_backend._ignore_dirs = frozenset({"a"})
+        ssh_backend._grep_raw = MagicMock(return_value=GrepResult(matches=[
+            GrepMatch(path=f"{_W}/ac/x.txt", line=1, text="needle"),
+            GrepMatch(path=f"{_W}/a/c/y.txt", line=1, text="needle"),
+        ]))
+
+        r = ssh_backend.grep("needle", path=VirtualPath("/workspace"))
+        assert r.matches is not None
+        paths = [m.path for m in r.matches]
+        assert f"{_W}/ac/x.txt" in paths
+        assert all("a/c" not in p for p in paths)

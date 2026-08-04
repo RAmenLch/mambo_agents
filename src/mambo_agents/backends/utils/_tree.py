@@ -34,7 +34,7 @@ def format_tree_entries(
 
     Directory markers are appended to the display name:
     - ``/(empty)`` — directory has no children
-    - ``/(ignore)`` — directory in ignore_dirs (children hidden)
+    - ``/(ignore)`` — directory whose name is in ignore_dirs (children hidden)
     - ``/(...)`` — depth limit reached, children not shown
     """
     if not entries:

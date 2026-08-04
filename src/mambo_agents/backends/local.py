@@ -108,9 +108,11 @@ class LocalBackend(BackendProtocol):
         edit_blacklist: Virtual path prefixes forbidden for edit/write/delete.
             Mutually exclusive with *edit_whitelist*.  When set, any
             path matching a prefix is rejected.
-        ignore_dirs: Virtual directory paths whose children are hidden
-            in ``tree()`` output.  The directory itself is shown with
-            an ``/(ignore)`` marker but its content is not expanded.
+        ignore_dirs: Directory names (bare basenames, e.g. ``"node_modules"``)
+            whose children are hidden in ``tree()`` output and whose files are
+            excluded from ``grep()`` results.  Any directory matching one of
+            these names (at any depth) is shown with an ``/(ignore)`` marker
+            but its content is not expanded.
     """
 
     # Default per-tool timeout values specific to this backend (overridable via __init__).
@@ -280,13 +282,14 @@ class LocalBackend(BackendProtocol):
             )
             if sys.platform == "win32":
                 desc += (
-                    "\n**Windows quoting warning:** ``cmd /c`` mishandles "
-                    "nested double quotes — patterns like "
-                    "``python -c \"...\"`` or ``echo \"...\" | ...`` "
-                    "that work on Linux/bash will fail with syntax errors. "
-                    "To run inline Python or script code, use the ``write`` "
-                    "tool to create a temporary file first, then execute "
-                    "that file. Do NOT use ``python -c`` on Windows."
+                    "\n**Windows quoting rules:** cmd.exe has no single-quote "
+                    "support and no backslash escaping (unlike bash). "
+                    "``python -c \"print('x')\"`` works — double quotes "
+                    "outside, single quotes inside the code. But "
+                    "``python -c 'print(\"x\")'`` (single-quoted delimiter) "
+                    "fails silently (exit 0, no output). For anything "
+                    "non-trivial, prefer writing a temporary script file "
+                    "with the write tool, then executing it."
                 )
         else:
             desc += " [shell execution disabled]"
@@ -688,6 +691,8 @@ class LocalBackend(BackendProtocol):
                 for li, text in items:
                     if len(matches) >= self._max_grep_matches:
                         break
+                    if _in_ignored_dir(virt, self._ignore_dirs, wr):
+                        continue
                     matches.append(GrepMatch(path=virt, line=li, text=text))
             return self._apply_grep_limit(matches, offset, limit, pattern=pattern, regex=regex)
 
@@ -715,6 +720,8 @@ class LocalBackend(BackendProtocol):
                 if compiled.search(line):
                     rel = str(resolved.relative_to(self._cwd)).replace("\\", "/")
                     virt_path = f"{wr}/{rel}"
+                    if _in_ignored_dir(virt_path, self._ignore_dirs, wr):
+                        continue
                     matches.append(GrepMatch(path=virt_path, line=li, text=line))
             return self._apply_grep_limit(matches, offset, limit, pattern=pattern, regex=regex)
 
@@ -759,6 +766,8 @@ class LocalBackend(BackendProtocol):
                     if compiled.search(line):
                         rel = str(fp.relative_to(self._cwd)).replace("\\", "/")
                         virt_path = f"{wr}/{rel}"
+                        if _in_ignored_dir(virt_path, self._ignore_dirs, wr):
+                            continue
                         matches.append(GrepMatch(path=virt_path, line=li, text=line))
         except OSError as e:
             result = self._apply_grep_limit(matches, offset, limit, pattern=pattern, regex=regex)
@@ -806,7 +815,9 @@ class LocalBackend(BackendProtocol):
         if not shutil.which("rg"):
             return None
 
-        cmd = ["rg", "--json"]
+        # Search everything: hidden files/dirs and gitignored paths are included;
+        # hiding is controlled exclusively by ignore_dirs (see _in_ignored_dir).
+        cmd = ["rg", "--json", "--hidden", "--no-ignore"]
         if not regex:
             cmd.append("-F")
         if include_glob:
@@ -922,7 +933,6 @@ class LocalBackend(BackendProtocol):
             depth,
             cwd=self._cwd,
             ignore_dirs=self._ignore_dirs,
-            workspace_root=self.workspace_root.value,
         )
         return format_tree_entries(entries)
 
@@ -994,50 +1004,55 @@ class LocalBackend(BackendProtocol):
             msg = f"timeout must be positive, got {effective_timeout}"
             raise ValueError(msg)
 
-        # Build platform-specific shell invocation
+        # Build platform-specific shell invocation.
+        # Windows: pass the raw command string with shell=True so cmd /c
+        # receives it verbatim, exactly as typed at the prompt.  The list
+        # form ["cmd", "/c", command] went through subprocess.list2cmdline,
+        # which escapes " as \" — cmd.exe has no backslash escaping, so any
+        # command containing double quotes (e.g. python -c "print('x')") was
+        # silently mangled.  POSIX keeps the list form: execve passes argv
+        # directly, no escaping involved.
         if sys.platform == "win32":
-            cmd_list: list[str] = ["cmd", "/c", command]
+            shell_cmd: str | list[str] = command
+            use_shell = True
         else:
-            cmd_list = ["sh", "-c", command]
+            shell_cmd = ["sh", "-c", command]
+            use_shell = False
+        display_cmd = command if isinstance(shell_cmd, str) else " ".join(shell_cmd)
 
         try:
+            # Capture raw bytes and decode manually.  text=True decodes in a
+            # reader thread: on a cp936 system, UTF-8 child output raises
+            # UnicodeDecodeError inside that thread (stdout silently becomes
+            # None) and the fallback below never runs.  Decoding here in the
+            # main thread keeps the fallback working.
+            result = subprocess.run(
+                shell_cmd,
+                check=False,
+                capture_output=True,
+                stdin=subprocess.DEVNULL,
+                timeout=effective_timeout,
+                env=self._env if self._env else None,
+                cwd=str(self._cwd),
+                shell=use_shell,
+            )
+
             # Auto-detect system encoding: locale encoding on Windows (cp936 for
             # Chinese GBK, cp932 for Japanese, etc.), UTF-8 on Linux/macOS.
             system_encoding = locale.getpreferredencoding(False)
 
-            # Try locale encoding first; fall back to UTF-8 with replacement on
-            # failure (e.g. if locale encoding mismatches the actual output).
-            try:
-                result = subprocess.run(
-                    cmd_list,
-                    check=False,
-                    capture_output=True,
-                    stdin=subprocess.DEVNULL,
-                    text=True,
-                    encoding=system_encoding,
-                    timeout=effective_timeout,
-                    env=self._env if self._env else None,
-                    cwd=str(self._cwd),
-                )
-            except UnicodeDecodeError:
-                result = subprocess.run(
-                    cmd_list,
-                    check=False,
-                    capture_output=True,
-                    stdin=subprocess.DEVNULL,
-                    text=True,
-                    encoding="utf-8",
-                    errors="replace",
-                    timeout=effective_timeout,
-                    env=self._env if self._env else None,
-                    cwd=str(self._cwd),
-                )
+            def _decode(data: bytes) -> str:
+                try:
+                    text = data.decode(system_encoding)
+                except UnicodeDecodeError:
+                    text = data.decode("utf-8", errors="replace")
+                return text.replace("\r\n", "\n")
 
             output_parts: list[str] = []
             if result.stdout:
-                output_parts.append(result.stdout.rstrip())
+                output_parts.append(_decode(result.stdout).rstrip())
             if result.stderr:
-                for line in result.stderr.strip().split("\n"):
+                for line in _decode(result.stderr).strip().split("\n"):
                     output_parts.append(f"[stderr] {line}")
 
             if output_parts:
@@ -1046,7 +1061,7 @@ class LocalBackend(BackendProtocol):
                 if result.returncode != 0:
                     output = (
                         f"<no output> — command failed with exit code {result.returncode}\n"
-                        f"Ran: {' '.join(cmd_list)}"
+                        f"Ran: {display_cmd}"
                     )
                 else:
                     output = "<no output>"
@@ -1196,7 +1211,6 @@ def _walk_tree(
     cwd: Path | None = None,
     current_depth: int = 0,
     ignore_dirs: frozenset[str] = frozenset(),
-    workspace_root: str = "/workspace",
 ) -> list[TreeEntry]:
     """Recursively walk a directory tree.
 
@@ -1219,10 +1233,8 @@ def _walk_tree(
         if not child.is_dir():
             continue
 
-        virt = _virtual_path(child, cwd, workspace_root) if cwd else ""
-
         # Ignored directory: show it but skip children
-        if virt and virt in ignore_dirs:
+        if child.name in ignore_dirs:
             entries.append(TreeEntry(
                 name=child.name + "/",
                 depth=current_depth,
@@ -1269,7 +1281,6 @@ def _walk_tree(
                 cwd=cwd,
                 current_depth=current_depth + 1,
                 ignore_dirs=ignore_dirs,
-                workspace_root=workspace_root,
             )
             entries.extend(sub)
 
@@ -1288,9 +1299,18 @@ def _walk_tree(
     return entries
 
 
-def _virtual_path(child: Path, cwd: Path, workspace_root: str) -> str:
-    """Convert a child Path to a virtual absolute path (POSIX separators)."""
-    try:
-        return f"{workspace_root}/{str(child.relative_to(cwd)).replace(chr(92), '/')}"
-    except ValueError:
-        return ""
+def _in_ignored_dir(
+    virt_path: str,
+    ignore_dirs: frozenset[str],
+    workspace_root: str,
+) -> bool:
+    """Segment-level check: True if any parent-directory segment of *virt_path*
+    matches one of the bare directory names in *ignore_dirs*.
+
+    Matches path segments only, not substrings — e.g. with ``ignore_dirs={"a"}``,
+    ``/workspace/ac/x.txt`` passes (segment ``"ac"`` != ``"a"``) while
+    ``/workspace/a/c/x.txt`` is excluded (segment ``"a"`` matches).
+    """
+    virt_path = str(virt_path)
+    rel = virt_path[len(workspace_root):].lstrip("/")
+    return any(seg in ignore_dirs for seg in rel.split("/")[:-1])

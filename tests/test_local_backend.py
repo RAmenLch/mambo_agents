@@ -140,6 +140,37 @@ class TestLocalBackend:
         assert r.matches is not None
         assert any("foo" in m.text for m in r.matches)
 
+    def test_grep_ignore_dirs_segment_match(self, tmp_root):
+        """grep excludes files under ignore_dirs by path segment, not substring."""
+        backend = LocalBackend(
+            root_dir=str(tmp_root),
+            ignore_dirs=frozenset({"a"}),
+        )
+        # /ws/ac/* must pass (segment "ac" != "a")
+        backend.write(VirtualPath(f"{_W}/ac/x.txt"), "needle")
+        # /ws/a/c/* must be excluded (segment "a" matches)
+        (tmp_root / "a" / "c").mkdir(parents=True)
+        backend.write(VirtualPath(f"{_W}/a/c/y.txt"), "needle")
+
+        r = backend.grep("needle", path=VirtualPath(f"{_W}/"))
+        assert r.matches is not None
+        paths = [m.path for m in r.matches]
+        assert f"{_W}/ac/x.txt" in paths
+        assert all("a/c" not in p for p in paths)
+
+    def test_grep_ignore_dirs_single_file(self, tmp_root):
+        """Single-file grep inside an ignored dir returns no matches."""
+        backend = LocalBackend(
+            root_dir=str(tmp_root),
+            ignore_dirs=frozenset({"node_modules"}),
+        )
+        (tmp_root / "node_modules").mkdir()
+        backend.write(VirtualPath(f"{_W}/node_modules/pkg.js"), "needle")
+
+        r = backend.grep("needle", path=VirtualPath(f"{_W}/node_modules/pkg.js"))
+        assert r.matches is None  # no matches → matches=None (existing convention)
+        assert r.total_matches == 0
+
     def test_glob(self, tmp_root):
         backend = LocalBackend(root_dir=str(tmp_root))
         backend.write(VirtualPath(f"{_W}/src/main.py"), "code")
@@ -325,10 +356,10 @@ class TestLocalBackend:
     # ------------------------------------------------------------------
 
     def test_tree_ignore_dirs(self, tmp_root):
-        """ignore_dirs hides children of marked directories but still shows the dir."""
+        """ignore_dirs (bare names) hides children of marked dirs but still shows the dir."""
         backend = LocalBackend(
             root_dir=str(tmp_root),
-            ignore_dirs=frozenset({f"{_W}/node_modules"}),
+            ignore_dirs=frozenset({"node_modules"}),
         )
         (tmp_root / "src").mkdir()
         backend.write(VirtualPath(f"{_W}/src/main.py"), "code")
@@ -336,12 +367,17 @@ class TestLocalBackend:
         nm.mkdir()
         (nm / "package.json").write_text("{}")
         (nm / "lodash").mkdir()
+        # Same-name dir at a deeper level is also ignored
+        nested = tmp_root / "src" / "node_modules"
+        nested.mkdir()
+        (nested / "pkg.json").write_text("{}")
 
         result = backend.tree(VirtualPath(f"{_W}/"), depth=3)
         assert "node_modules/(ignore)" in result
         # Children of node_modules should not appear
         assert "package.json" not in result
         assert "lodash" not in result
+        assert "pkg.json" not in result
         # src should still be shown
         assert "src/" in result
         assert "main.py" in result
