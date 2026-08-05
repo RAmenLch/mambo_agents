@@ -672,8 +672,6 @@ class LocalBackend(BackendProtocol):
             # ripgrep paths are physical → convert to virtual
             matches: list[GrepMatch] = []
             for fpath, items in results.items():
-                if len(matches) >= self._max_grep_matches:
-                    break
                 try:
                     rel = str(Path(fpath).relative_to(self._cwd)).replace("\\", "/")
                     virt = f"{wr}/{rel}"
@@ -689,11 +687,10 @@ class LocalBackend(BackendProtocol):
                     if not fnmatch_path(rel_path, glob):
                         continue
                 for li, text in items:
-                    if len(matches) >= self._max_grep_matches:
-                        break
                     if _in_ignored_dir(virt, self._ignore_dirs, wr):
                         continue
                     matches.append(GrepMatch(path=virt, line=li, text=text))
+            matches.sort(key=lambda m: (str(m.path), m.line))
             return self._apply_grep_limit(matches, offset, limit, pattern=pattern, regex=regex)
 
         # 2) Python fallback with file-size guard
@@ -728,7 +725,7 @@ class LocalBackend(BackendProtocol):
         search_dir = resolved
         error_msg: BackendError | None = None
         try:
-            for fp in search_dir.rglob("*"):
+            for fp in sorted(search_dir.rglob("*")):
                 if len(matches) >= self._max_grep_matches:
                     break
                 try:
@@ -770,6 +767,7 @@ class LocalBackend(BackendProtocol):
                             continue
                         matches.append(GrepMatch(path=virt_path, line=li, text=line))
         except OSError as e:
+            matches.sort(key=lambda m: (str(m.path), m.line))
             result = self._apply_grep_limit(matches, offset, limit, pattern=pattern, regex=regex)
             return GrepResult(
                 error=BackendError(code=ErrorCode.OS_ERROR, path=path, message=str(e)),
@@ -785,6 +783,7 @@ class LocalBackend(BackendProtocol):
                 message=f"跳过 {skipped} 个大文件 (>{self._max_file_size_bytes // (1024 * 1024)} MB)",
             )
 
+        matches.sort(key=lambda m: (str(m.path), m.line))
         result = self._apply_grep_limit(matches, offset, limit, pattern=pattern, regex=regex)
         if error_msg:
             result = GrepResult(

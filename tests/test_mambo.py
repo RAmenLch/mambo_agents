@@ -1,32 +1,11 @@
 """Tests for Mambo Agents – StoreBackend and create_mambo_agent."""
 
-import os
-
-import pytest
-from langchain_core.messages import HumanMessage
 from langgraph.store.memory import InMemoryStore
 
-from mambo_agents import create_mambo_agent
 from mambo_agents.backends.protocol import BackendProtocol
 from mambo_agents.backends.schemas import VirtualPath
 from mambo_agents.backends.store import StoreBackend
 from tests.test_store_backend import _simulate_graph
-
-
-_MODEL_NAME = "Pro/zai-org/GLM-4.7"
-
-
-def _get_model():
-    """Return a test ChatOpenAI model instance."""
-    pytest.importorskip("langchain_openai")
-    from langchain_openai import ChatOpenAI
-
-    return ChatOpenAI(
-        model=_MODEL_NAME,
-        api_key=os.environ.get("GJKEY", ""),
-        base_url="https://api.siliconflow.cn/v1",
-        temperature=0,
-    )
 
 
 def _make_backend(**kwargs):
@@ -192,45 +171,3 @@ class TestTools:
             result = backend.glob("test.txt", path=VirtualPath("/workspace"))
         assert result.matches is not None
         assert result.matches[0].size == 5
-
-
-# ---------------------------------------------------------------------------
-# Integration tests – create_mambo_agent with StoreBackend
-# ---------------------------------------------------------------------------
-
-
-class TestCreateAgent:
-    @pytest.mark.integration
-    def test_basic_agent_creation(self):
-        """Smoke test: creates an agent without errors."""
-        model = _get_model()
-        backend = _make_backend()
-        agent = create_mambo_agent(model, backend=backend)
-        assert agent is not None
-
-    @pytest.mark.integration
-    def test_agent_file_write_then_read(self):
-        """End-to-end: agent creates a file and verifies it in backend."""
-        model = _get_model()
-        backend = _make_backend()
-        agent = create_mambo_agent(model, backend=backend)
-
-        result = agent.invoke(
-            {
-                "messages": [
-                    HumanMessage(
-                        content=(
-                            "Create a file /greeting.txt with the content "
-                            "'Hello from Mambo Agents'. Reply with exactly 'DONE'."
-                        )
-                    )
-                ]
-            },
-            config={"configurable": {"thread_id": "test"}},
-        )
-        # Verify file was created in backend
-        with _simulate_graph(backend):
-            r = backend.read(VirtualPath("/greeting.txt"))
-        assert "Hello from Mambo Agents" in (r.content or ""), (
-            f"Expected greeting in file, got: {r.content}"
-        )

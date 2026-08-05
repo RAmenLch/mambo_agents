@@ -197,10 +197,11 @@ class SecurityReviewConfig(BaseModel):
         default=None,
         description=(
             "Backend tool names to expose to the review agent in agent mode. "
-            "``None`` (default) means all registered tools are available. "
-            "Set to an empty ``frozenset()`` to give the agent no tools "
-            "(pure LLM-style review).  Only read-only tools should be "
-            "included — the audit backend is already read-only."
+            "``None`` (default) is equivalent to an empty ``frozenset()``: "
+            "no extra tools are exposed (the review agent still gets the "
+            "core read-only tools ``ls``/``read``/``grep``/``glob``). "
+            "Extra tools must be explicitly listed here.  Only read-only "
+            "tools should be included — the audit backend is already read-only."
         ),
     )
     tool_unpackers: list[object] | None = Field(
@@ -628,14 +629,16 @@ class AutoSecurityReviewMiddleware(
         if self._agent_backend is not None:
             # Core read-only tools are always present — never filtered
             core_tools = build_core_tools(self._agent_backend)
-            # agent_tools only controls EXTRA tools from the backend
+            # agent_tools only controls EXTRA tools from the backend.
+            # None is equivalent to an empty set: extra tools must be
+            # explicitly whitelisted to be exposed.
             if self._agent_tools is not None:
                 extra = [
                     t for t in self._agent_backend.tools
                     if t.name in self._agent_tools
                 ]
             else:
-                extra = list(self._agent_backend.tools)
+                extra = []
             tools = core_tools + extra
 
         # Build system prompt with path-mapping info from the backend

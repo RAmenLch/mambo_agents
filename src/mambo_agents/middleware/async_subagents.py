@@ -18,6 +18,12 @@ Key differences from the sync ``task`` tool:
 
 Crash recovery: on system restart, tasks that were ``running`` before the
 crash are detected via checkpointer state and marked as ``crashed``.
+
+.. warning::
+
+    **Experimental (实验性):** 本模块使用较少、测试覆盖不足，属于实验性质。
+    API 可能在没有弃用期的情况下直接变更或移除，请勿在关键路径依赖它。
+    实例化 :class:`AsyncSubAgentMiddleware` 时会发出 ``FutureWarning``。
 """
 
 from __future__ import annotations
@@ -25,6 +31,7 @@ from __future__ import annotations
 import threading
 import time
 import uuid
+import warnings
 from collections.abc import Awaitable, Callable, Sequence
 from typing import Annotated, Any, Literal, NotRequired
 
@@ -939,6 +946,12 @@ def _build_subagent_specs(
 class AsyncSubAgentMiddleware(AgentMiddleware[AgentState, ContextT, ResponseT]):
     """Middleware that provides async (background) subagents.
 
+    .. warning::
+
+        **Experimental (实验性):** 本类使用较少、测试覆盖不足。
+        API 可能在没有弃用期的情况下直接变更或移除（PEP 411 provisional 风格）。
+        实例化时会发出 ``FutureWarning``。
+
     Unlike :class:`SubAgentMiddleware` which blocks until completion,
     async subagents run in background threads and are queried via
     ``async_status`` / ``async_list``.
@@ -988,6 +1001,12 @@ class AsyncSubAgentMiddleware(AgentMiddleware[AgentState, ContextT, ResponseT]):
         default_timeout: float = 3600.0,
     ) -> None:
         super().__init__()
+        warnings.warn(
+            "AsyncSubAgentMiddleware is experimental and not fully tested; "
+            "its API may change or be removed without a deprecation period.",
+            FutureWarning,
+            stacklevel=2,
+        )
         if not async_subagents:
             raise ValueError("At least one async_subagent must be specified")
 

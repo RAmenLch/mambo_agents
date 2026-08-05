@@ -488,9 +488,9 @@ class TestTreeDepthCalculation:
 
         # Simulate find output: one dir with two image files inside it
         fake_out = (
-            "d 0849fe09\n"
-            "f 0849fe09/Anima_00013_.png 1048576\n"
-            "f 0849fe09/Anima_00014_.png 2048\n"
+            "d\t0849fe09\n"
+            "f\t0849fe09/Anima_00013_.png\t1048576\n"
+            "f\t0849fe09/Anima_00014_.png\t2048\n"
         )
         from unittest.mock import MagicMock
         ssh_backend._exec = MagicMock(return_value=(fake_out, "", 0))
@@ -530,9 +530,9 @@ class TestTreeDepthCalculation:
         ssh_backend._has_python3 = False
 
         fake_out = (
-            "f root_file.txt 100\n"
-            "d subdir\n"
-            "f subdir/nested.txt 200\n"
+            "f\troot_file.txt\t100\n"
+            "d\tsubdir\n"
+            "f\tsubdir/nested.txt\t200\n"
         )
         from unittest.mock import MagicMock
         ssh_backend._exec = MagicMock(return_value=(fake_out, "", 0))
@@ -562,6 +562,86 @@ class TestTreeDepthCalculation:
 
 
 # ============================================================================
+# tree – names containing spaces
+# ============================================================================
+
+
+class TestTreeNamesWithSpaces:
+    """Regression: names with spaces must survive the remote-output parsing.
+
+    The remote protocol is tab-separated (``d\t<path>`` / ``f\t<path>\t<size>``)
+    so paths containing spaces are not tokenized away.
+    """
+
+    def test_file_with_spaces_keeps_full_name_and_size(self, ssh_backend):
+        ssh_backend._has_python3 = False
+        fake_out = (
+            "f\t文件 带空格.txt\t4\n"
+            "f\tplain.txt\t11\n"
+        )
+        ssh_backend._exec = MagicMock(return_value=(fake_out, "", 0))
+
+        result = ssh_backend.tree(VirtualPath("/workspace"), depth=3)
+        assert "文件 带空格.txt (4 B)" in result
+        assert "文件 (0 B)" not in result
+
+    def test_dir_with_spaces_shows_children(self, ssh_backend):
+        ssh_backend._has_python3 = False
+        fake_out = (
+            "d\t两词目录 a b\n"
+            "f\t两词目录 a b/plain.txt\t6\n"
+        )
+        ssh_backend._exec = MagicMock(return_value=(fake_out, "", 0))
+
+        result = ssh_backend.tree(VirtualPath("/workspace"), depth=3)
+        assert "两词目录 a b/" in result
+        assert "两词目录 a b/(empty)" not in result
+        assert "两词目录 a b/plain.txt" not in result
+        assert "plain.txt (6 B)" in result
+
+    def test_nested_space_dirs(self, ssh_backend):
+        ssh_backend._has_python3 = False
+        fake_out = (
+            "d\touter a\n"
+            "d\touter a/inner b\n"
+            "f\touter a/inner b/deep c.txt\t3\n"
+        )
+        ssh_backend._exec = MagicMock(return_value=(fake_out, "", 0))
+
+        result = ssh_backend.tree(VirtualPath("/workspace"), depth=3)
+        assert "outer a/" in result
+        assert "inner b/" in result
+        assert "deep c.txt (3 B)" in result
+
+    def test_leading_trailing_spaces(self, ssh_backend):
+        ssh_backend._has_python3 = False
+        fake_out = (
+            "d\t lead\n"
+            "f\t lead/x.txt\t1\n"
+            "d\ttrail \n"
+            "f\ttrail /y.txt\t2\n"
+        )
+        ssh_backend._exec = MagicMock(return_value=(fake_out, "", 0))
+
+        result = ssh_backend.tree(VirtualPath("/workspace"), depth=3)
+        assert " lead/" in result
+        assert "trail /" in result
+        assert "x.txt (1 B)" in result
+        assert "y.txt (2 B)" in result
+
+    def test_root_path_with_spaces_still_works(self, ssh_backend):
+        ssh_backend._has_python3 = False
+        fake_out = (
+            "f\tplain.txt\t11\n"
+        )
+        ssh_backend._exec = MagicMock(return_value=(fake_out, "", 0))
+
+        result = ssh_backend.tree(VirtualPath("/workspace/两词目录 a b"), depth=3)
+        assert "两词目录 a b/" in result
+        assert "plain.txt (11 B)" in result
+
+
+# ============================================================================
 # tree – ignore_dirs (bare directory names)
 # ============================================================================
 
@@ -578,10 +658,10 @@ class TestTreeIgnoreDirs:
         ssh_backend._ignore_dirs = frozenset({"node_modules"})
         ssh_backend._has_python3 = False
         fake_out = (
-            "d node_modules\n"
-            "f node_modules/pkg.json 10\n"
-            "d src\n"
-            "f src/main.py 5\n"
+            "d\tnode_modules\n"
+            "f\tnode_modules/pkg.json\t10\n"
+            "d\tsrc\n"
+            "f\tsrc/main.py\t5\n"
         )
         ssh_backend._exec = MagicMock(return_value=(fake_out, "", 0))
         ssh_backend._sftp.listdir_attr = MagicMock(return_value=[])
@@ -597,10 +677,10 @@ class TestTreeIgnoreDirs:
         ssh_backend._ignore_dirs = frozenset({"node_modules"})
         ssh_backend._has_python3 = False
         fake_out = (
-            "d node_modules\n"
-            "d a\n"
-            "d a/node_modules\n"
-            "f a/node_modules/deep.js 3\n"
+            "d\tnode_modules\n"
+            "d\ta\n"
+            "d\ta/node_modules\n"
+            "f\ta/node_modules/deep.js\t3\n"
         )
         ssh_backend._exec = MagicMock(return_value=(fake_out, "", 0))
         ssh_backend._sftp.listdir_attr = MagicMock(return_value=[])
@@ -615,9 +695,9 @@ class TestTreeIgnoreDirs:
         ssh_backend._ignore_dirs = frozenset({".git"})
         ssh_backend._has_python3 = False
         fake_out = (
-            "d .git\n"
-            "f .git/config 20\n"
-            "f main.py 5\n"
+            "d\t.git\n"
+            "f\t.git/config\t20\n"
+            "f\tmain.py\t5\n"
         )
         ssh_backend._exec = MagicMock(return_value=(fake_out, "", 0))
         ssh_backend._sftp.listdir_attr = MagicMock(return_value=[])
@@ -632,8 +712,8 @@ class TestTreeIgnoreDirs:
         ssh_backend._ignore_dirs = frozenset({"node_modules"})
         ssh_backend._has_python3 = False
         fake_out = (
-            "d a\n"
-            "d a/node_modules\n"
+            "d\ta\n"
+            "d\ta/node_modules\n"
         )
         ssh_backend._exec = MagicMock(return_value=(fake_out, "", 0))
         ssh_backend._sftp.listdir_attr = MagicMock(return_value=[])

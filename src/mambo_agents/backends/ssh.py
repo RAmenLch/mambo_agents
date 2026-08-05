@@ -1472,7 +1472,7 @@ class SshBackend(BackendProtocol):
             for line in out.splitlines():
                 if not line.strip():
                     continue
-                parts = line.split(" ", 2)
+                parts = line.split("\t")
                 if len(parts) < 2:
                     continue
                 entry_type = parts[0]
@@ -1606,9 +1606,10 @@ class SshBackend(BackendProtocol):
     ) -> tuple[str, str, int]:
         """List directory tree via remote ``python3`` with :func:`os.walk`.
 
-        Output format is identical to the ``find`` fallback:
-        ``d <relative_path>`` for directories,
-        ``f <relative_path> <size>`` for files.
+        Output format is identical to the ``find`` fallback,
+        tab-separated so that paths containing spaces parse correctly:
+        ``d\t<relative_path>`` for directories,
+        ``f\t<relative_path>\t<size>`` for files.
         """
         remote_repr = repr(remote)
 
@@ -1636,7 +1637,7 @@ class SshBackend(BackendProtocol):
             f"        res.append(('f', p, sz))\n"
             f"res.sort()\n"
             f"for t, p, sz in res:\n"
-            f"    print(f'{{t}} {{p}} {{sz}}' if t == 'f' else f'{{t}} {{p}}')\n"
+            f"    print(f'{{t}}\\t{{p}}\\t{{sz}}' if t == 'f' else f'{{t}}\\t{{p}}')\n"
         )
 
         cmd = f"python3 << 'PYEOF'\n{script}PYEOF"
@@ -1649,7 +1650,7 @@ class SshBackend(BackendProtocol):
         remote_escaped = shlex.quote(remote)
         cmd = (
             f"find {remote_escaped} -maxdepth {depth} "
-            f"\\( -type d -printf 'd %P\\n' , -type f -printf 'f %P %s\\n' \\) "
+            f"\\( -type d -printf 'd\\t%P\\n' , -type f -printf 'f\\t%P\\t%s\\n' \\) "
             f"2>/dev/null | sort"
         )
         return self._exec(cmd, timeout=30)

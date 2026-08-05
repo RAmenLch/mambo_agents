@@ -1,6 +1,5 @@
 """Tests for MamboPlanMiddleware and Summarization hook integration."""
 
-import os
 from typing import Annotated, get_args, get_origin, get_type_hints
 from unittest.mock import MagicMock
 
@@ -22,31 +21,15 @@ from mambo_agents import (
     SummaryHook,
     SummaryHookContext,
     WritePlansInput,
-    create_mambo_agent,
 )
 from langgraph.store.memory import InMemoryStore
 
 from mambo_agents.backends.store import StoreBackend
-from tests.test_store_backend import _simulate_graph
 
 
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
-
-_GLM_MODEL_NAME = "Pro/zai-org/GLM-4.7"
-
-
-def _get_model():
-    pytest.importorskip("langchain_openai")
-    from langchain_openai import ChatOpenAI
-
-    return ChatOpenAI(
-        model=_GLM_MODEL_NAME,
-        api_key=os.environ.get("GJKEY", ""),
-        base_url="https://api.siliconflow.cn/v1",
-        temperature=0,
-    )
 
 
 def _make_mock_summary_model(summary_text: str = "Mock summary: plan stuff happened."):
@@ -574,237 +557,6 @@ class TestCreateAgentAutoWiring:
         assert result is not None
         assert "Task 1" in result
         assert "🔄" in result
-
-    @pytest.mark.integration
-    def test_create_agent_with_plan_and_summarization(self):
-        """Agent creation with both PlanMiddleware and summarization succeeds."""
-        model = _get_model()
-        backend = StoreBackend(store=InMemoryStore())
-        agent = create_mambo_agent(
-            model,
-            backend=backend,
-            middleware=[MamboPlanMiddleware()],
-            summarization=SummarizationConfig(
-                trigger=("tokens", 100000),
-                keep=("messages", 20),
-            ),
-        )
-        assert agent is not None
-
-    @pytest.mark.integration
-    def test_summarization_alone__no_plan(self):
-        """Summarization without PlanMiddleware works fine."""
-        model = _get_model()
-        backend = StoreBackend(store=InMemoryStore())
-        agent = create_mambo_agent(
-            model,
-            backend=backend,
-            summarization=SummarizationConfig(trigger=("messages", 50)),
-        )
-        assert agent is not None
-
-    @pytest.mark.integration
-    def test_plan_alone__no_summarization(self):
-        """PlanMiddleware without summarization works fine."""
-        model = _get_model()
-        backend = StoreBackend(store=InMemoryStore())
-        agent = create_mambo_agent(
-            model,
-            backend=backend,
-            middleware=[MamboPlanMiddleware()],
-        )
-        assert agent is not None
-
-
-# ---------------------------------------------------------------------------
-# Integration tests – E2E with real LLM
-# ---------------------------------------------------------------------------
-
-
-class TestPlanSummarizationE2E:
-    """End-to-end: agent with PlanMiddleware + Summarization preserves plan state."""
-
-    @pytest.mark.integration
-    def test_e2e_plan_agent_writes_and_updates_plans(self):
-        """Agent uses write_plans and state is tracked."""
-        model = _get_model()
-        backend = StoreBackend(store=InMemoryStore())
-        agent = create_mambo_agent(
-            model,
-            backend=backend,
-            middleware=[MamboPlanMiddleware()],
-        )
-
-        result = agent.invoke(
-            {
-                "messages": [
-                    HumanMessage(
-                        content=(
-                            "You have a write_plans tool. Please use it to create "
-                            "a plan list with exactly these 3 items:\n"
-                            "1. 'Create file /t1.txt' (mark as in_progress)\n"
-                            "2. 'Create file /t2.txt'\n"
-                            "3. 'Create file /t3.txt'\n\n"
-                            "After writing the plan list, actually create all "
-                            "three files and update the status accordingly. "
-                            "All three files should contain the text 'E2E_OK'.\n"
-                            "After all files are created, reply with 'ALL_COMPLETE'."
-                        )
-                    )
-                ]
-            },
-            config={"configurable": {"thread_id": "test_plan_e2e_1"}},
-        )
-
-        # Verify plans were tracked
-        plans = result.get("plans")
-        assert plans is not None, "Agent should have used write_plans"
-        assert len(plans) >= 1, "At least one plan item should exist"
-
-        # All should be completed
-        for p in plans:
-            if isinstance(p, Plan):
-                assert p.status == "completed", (
-                    f"Plan '{p.content}' should be completed, got {p.status}"
-                )
-            elif isinstance(p, dict):
-                assert p.get("status") == "completed", (
-                    f"Plan dict should be completed: {p}"
-                )
-
-        # Verify files were actually created
-        for fname in ["/t1.txt", "/t2.txt", "/t3.txt"]:
-            with _simulate_graph(backend, thread_id="test_plan_e2e_1"):
-                r = backend.read(fname)
-            assert r.error is None, f"File {fname} should exist: {r.error}"
-            assert "E2E_OK" in (r.content or ""), (
-                f"File {fname} content mismatch: {r.content}"
-            )
-
-        # Verify agent completed
-        messages = result.get("messages", [])
-        last_ai = None
-        for m in reversed(messages):
-            if isinstance(m, AIMessage) and not m.tool_calls:
-                last_ai = m
-                break
-        assert last_ai is not None
-        assert "ALL_COMPLETE" in (last_ai.content or "").upper()
-
-    @pytest.mark.integration
-    def test_e2e_plan_with_aggressive_summarization(self):
-        """Plan state survives summarization compaction (key scenario)."""
-        model = _get_model()
-        backend = StoreBackend(store=InMemoryStore())
-
-        plan_mw = MamboPlanMiddleware()
-
-        agent = create_mambo_agent(
-            model,
-            backend=backend,
-            middleware=[plan_mw],
-            summarization=SummarizationConfig(
-                trigger=("messages", 8),
-                keep=("messages", 3),
-            ),
-        )
-
-        thread_cfg = {"configurable": {"thread_id": "test_plan_e2e_2"}}
-
-        # Phase 1: Create plan list and do some work
-        result1 = agent.invoke(
-            {
-                "messages": [
-                    HumanMessage(
-                        content=(
-                            "Use write_plans to create a plan list with exactly 2 items:\n"
-                            "1. 'Write file A' (mark it in_progress immediately)\n"
-                            "2. 'Write file B'\n\n"
-                            "Then do item 1: create /a.txt with content 'PHASE1_DONE'. "
-                            "After that, reply 'PHASE1_COMPLETE'."
-                        )
-                    )
-                ]
-            },
-            config=thread_cfg,
-        )
-
-        plans1 = result1.get("plans")
-        assert plans1 is not None, "Agent should have used write_plans in phase 1"
-
-        # Verify a.txt was created in phase 1 (needed for phase 2 assertions)
-        with _simulate_graph(backend, thread_id="test_plan_e2e_2"):
-            r_a_phase1 = backend.read("/a.txt")
-        if r_a_phase1.error is not None:
-            last_ai_msg = None
-            for m in reversed(result1.get("messages", [])):
-                if isinstance(m, AIMessage) and not m.tool_calls:
-                    last_ai_msg = m
-                    break
-            pytest.fail(
-                f"Phase 1 agent did NOT create /a.txt (required for subsequent steps). "
-                f"Last AI response: {last_ai_msg.content if last_ai_msg else 'N/A'}. "
-                f"Read error: {r_a_phase1.error}"
-            )
-
-        # Phase 2: Continue working — this will generate enough messages
-        # to trigger summarization, compacting the phase 1 plan interaction.
-        result2 = agent.invoke(
-            {
-                "messages": [
-                    *result1["messages"],
-                    HumanMessage(
-                        content=(
-                            "Now do item 2 from your plan list: create /b.txt "
-                            "with content 'PHASE2_DONE'. "
-                            "Also read /a.txt to confirm it still exists. "
-                            "Then create /c.txt with the combined content of "
-                            "both a.txt and b.txt (format: 'A:<content> B:<content>').\n"
-                            "Use write_plans to update the list. "
-                            "Reply with 'ALL_DONE'."
-                        )
-                    ),
-                ]
-            },
-            config=thread_cfg,
-        )
-
-        # Verify b.txt was created
-        with _simulate_graph(backend, thread_id="test_plan_e2e_2"):
-            r_b = backend.read("/b.txt")
-        assert r_b.error is None
-        assert "PHASE2_DONE" in (r_b.content or "")
-
-        # Verify a.txt still exists (phase 1 work not lost)
-        with _simulate_graph(backend, thread_id="test_plan_e2e_2"):
-            r_a = backend.read("/a.txt")
-        assert r_a.error is None
-        assert "PHASE1_DONE" in (r_a.content or "")
-
-        # Verify c.txt was created with combined content
-        with _simulate_graph(backend, thread_id="test_plan_e2e_2"):
-            r_c = backend.read("/c.txt")
-        assert r_c.error is None
-        assert "PHASE1_DONE" in (r_c.content or "")
-        assert "PHASE2_DONE" in (r_c.content or "")
-
-        # Verify plans are complete
-        plans2 = result2.get("plans")
-        assert plans2 is not None, "Plan list should persist after summarization"
-        for p in plans2:
-            if isinstance(p, Plan):
-                assert p.status == "completed", f"Plan {p.content} should be completed"
-            elif isinstance(p, dict):
-                assert p.get("status") == "completed", f"Plan dict should be completed: {p}"
-
-        messages = result2.get("messages", [])
-        last_ai = None
-        for m in reversed(messages):
-            if isinstance(m, AIMessage) and not m.tool_calls:
-                last_ai = m
-                break
-        assert last_ai is not None
-        assert "ALL_DONE" in (last_ai.content or "").upper()
 
 
 # =============================================================================

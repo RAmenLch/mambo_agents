@@ -74,6 +74,10 @@ print(result["messages"][-1].content)
 > **默认后端：** 不指定 `backend` 时，Agent 使用 `StoreBackend` + `InMemoryStore`，
 > 文件存储在会话内存中，进程重启后消失。如需持久化（对接 PostgreSQL 等）或
 > 操作真实磁盘，请指定 `backend=LocalBackend(...)`（见下一节）。
+>
+> **路径约定：** `StoreBackend` 的文件统一放在 `/workspace/` 前缀下
+> （如 `/workspace/hello.py`）；前缀之外的路径（如 `/hello.py`）不会出现在
+> `ls /workspace` / `glob` 视图中。详见 [5.2](#52-虚拟文件系统storebackend)。
 
 ### 3.2 操作本地文件系统
 
@@ -127,9 +131,9 @@ async for event in agent.astream(
 ):
     print(event)
     # 输出示例（每个节点完成后触发一次）：
-    # {'agent': {'messages': [AIMessage(content='我先用 ls 看看目录结构...')]}}
+    # {'model': {'messages': [AIMessage(content='我先用 ls 看看目录结构...')]}}
     # {'tools': {'messages': [ToolMessage(content='...', name='ls')]}}
-    # {'agent': {'messages': [AIMessage(content='项目包含以下文件...')]}}
+    # {'model': {'messages': [AIMessage(content='项目包含以下文件...')]}}
 ```
 
 **逐 token 流式输出（实时显示 LLM 生成内容）：**
@@ -251,7 +255,7 @@ from mambo_agents import create_mambo_agent, StoreBackend
 agent = create_mambo_agent(
     "gpt-4o",
     backend=StoreBackend(initial_files={
-        "/config.json": '{"port": 8080}',
+        "/workspace/config.json": '{"port": 8080}',
     }),
     summarization={
         "trigger": ("tokens", 200000),
@@ -280,7 +284,7 @@ Agent 的"手"——通过 `backend` 参数指定后端，决定了 Agent 能在
 | `grep(pattern, path, glob, regex, offset, limit)` | 搜索文本内容 |
 | `glob(pattern, path)` | 按通配符查找文件和目录 |
 
-每个后端还可以通过 `tools` 属性暴露额外的工具（如 `tree`、`delete`、`execute`）。
+每个后端还可以通过 `tools` 属性暴露额外的工具（如 `tree`、`delete`、`execute`；`HybridWorkspaceBackend` 额外提供 `copy`）。
 
 > **路径约定：** 所有后端使用以 `/` 开头的绝对路径（如 `/workspace/src/main.py`）。
 > 部分配置参数（如 `memory_sources`）接受 `VirtualPath` 类型，也可直接传 `str`，
@@ -296,10 +300,13 @@ Agent 的"手"——通过 `backend` 参数指定后端，决定了 Agent 能在
 from mambo_agents import StoreBackend
 
 # 默认使用内存存储（进程重启后消失）
+# 注意：文件必须放在工作区根 "/workspace" 下，才能在 Agent 默认的
+# `ls /workspace` 视图中可见；不带前缀的 key 虽然能按精确路径读取，
+# 但在根目录的 ls/glob 视图中不可见。
 backend = StoreBackend(
     initial_files={
-        "/config.json": '{"port": 8080}',
-        "/README.md": "# My Project",
+        "/workspace/config.json": '{"port": 8080}',
+        "/workspace/README.md": "# My Project",
     }
 )
 
@@ -308,9 +315,14 @@ from langgraph.store.postgres import PostgresStore
 
 backend = StoreBackend(
     store=PostgresStore.from_conn_string("postgresql://..."),
-    initial_files={"/config.json": '{"port": 8080}'},
+    initial_files={"/workspace/config.json": '{"port": 8080}'},
 )
 ```
+
+> **路径约定：** `StoreBackend` 的 `workspace_root` 固定为 `/workspace`。
+> 预填充的 `initial_files` key 必须以 `/workspace/` 开头（如 `/workspace/config.json`），
+> 并应引导 Agent 把文件创建在 `/workspace/` 下 —— 否则文件只能按精确路径访问，
+> 不会出现在 Agent 默认的 `ls /workspace` / `glob` 视图中。
 
 常用 `BaseStore` 实现：
 
@@ -406,10 +418,13 @@ backend = HybridWorkspaceBackend(
 )
 
 # 多虚拟 workspace
+# 注意：虚拟 StoreBackend 的 workspace_root 固定为 "/workspace"，
+# initial_files 的 key 必须带 "/workspace/" 前缀才能与路由重写后的
+# 路径匹配 —— 否则预填充的文件 Agent 读取不到。
 backend = HybridWorkspaceBackend(
     real_backend=LocalBackend(root_dir="/tmp/project"),
     virtual_workspaces={
-        "skills": StoreBackend(initial_files={"/python.md": "..."}),
+        "skills": StoreBackend(initial_files={"/workspace/python.md": "..."}),
         "cache": StoreBackend(),
     },
 )
@@ -418,16 +433,24 @@ backend = HybridWorkspaceBackend(
 backend = HybridWorkspaceBackend(
     real_backend=LocalBackend(root_dir="/tmp/project"),
     virtual_workspaces={
-        ".": StoreBackend(initial_files={"/config.yml": "..."}),
+        ".": StoreBackend(initial_files={"/workspace/config.yml": "..."}),
     },
 )
 ```
 
 **路径路由规则：**
-- `/.mambo/skills/xxx` → "skills" 虚拟 workspace（strip 前缀后传 `/xxx`）
-- `/.mambo/xxx` → 默认 StoreBackend（strip 前缀后传 `/xxx`）
+- `/.mambo/skills/xxx` → "skills" 虚拟 workspace（strip 前缀后，再拼上虚拟后端的 `workspace_root` —— `StoreBackend` 为 `/workspace` —— 才转发给虚拟后端）
+- `/.mambo/xxx` → 默认 StoreBackend（重写规则同上）
 - `/{workspace_root}/...` → 真实后端（路径会被 rewrite：strip workspace_root，prepend 真实后端的 workspace_root）
 - 其他路径（如 `/`、`/etc`）将被拒绝
+
+**虚拟 workspace 注意事项：**
+- 虚拟 `StoreBackend` 的 `workspace_root` 固定为 `/workspace`（而非 `/`），因此预填充的 `initial_files` key 必须以 `/workspace/` 开头；写成 `/python.md` 会存入一个不可达的路径，Agent 无法读取。
+- 虚拟后端在运行时通过 `get_store()` 从图执行上下文解析 `BaseStore`。若需要在图外访问（例如在自己的脚本里用 `download_files()` 验证文件），请给虚拟 `StoreBackend` 显式传 `store=`（默认 workspace 则给 `HybridWorkspaceBackend` 传 `store=`），让图内外共享同一个 store 实例；否则图外调用会 fallback 到私有 `InMemoryStore`，看不到 Agent 写入的文件。
+- 完整可运行示例见 `example/11_hybrid_workspace.py`。
+
+**额外工具：** `copy(source, destination)` — 跨后端单文件复制
+（虚拟 ↔ 真实，或虚拟 workspace 之间），目标已存在时直接覆盖。
 
 **用途：**
 - 内部存储（大结果驱逐、对话历史转储）
@@ -499,6 +522,7 @@ backend = LocalBackend(summarizer=composite_summarizer([
 | 会话隔离 | 自动 | 手动 | 手动 | 自动(/.mambo/) |
 | Shell 执行 | ❌ | 可选 | 可选 | 取决于真实后端 |
 | 删除操作 | ❌ | ✅ | ✅ | 取决于真实后端 |
+| 复制操作 | ❌ | ❌ | ❌ | ✅ |
 | grep 加速 | N/A | ripgrep | 远程 rg/grep | 继承委托 |
 | 网络依赖 | ❌ | ❌ | ✅ | 可选 |
 | 适用场景 | 测试/原型 | 本地开发 | 远程部署 | 生产环境 |
@@ -532,8 +556,8 @@ agent = create_mambo_agent(
 
 | 模式 | 说明 |
 |------|------|
-| `per_astream` | （默认）在开始前执行一次摘要，之后整个运行周期不再检查 |
-| `per_model_call` | 每次模型调用时都检查是否需要摘要，即使在运行过程中 |
+| `PER_ASTREAM` | （默认）在开始前执行一次摘要，之后整个运行周期不再检查 |
+| `PER_MODEL_CALL` | 每次模型调用时都检查是否需要摘要，即使在运行过程中 |
 
 ```python
 from mambo_agents import SummarizationMode
@@ -541,7 +565,7 @@ from mambo_agents import SummarizationMode
 agent = create_mambo_agent(
     "gpt-4o",
     summarization={
-        "mode": SummarizationMode.per_model_call,
+        "mode": SummarizationMode.PER_MODEL_CALL,
         "trigger": ("tokens", 200000),
         "keep": ("messages", 20),
     },
@@ -558,9 +582,9 @@ agent = create_mambo_agent(
 from mambo_agents import SummarizationConfig, SummarizationMode
 
 SummarizationConfig(
-    mode: SummarizationMode = SummarizationMode.per_astream,
-    # SummarizationMode.per_astream（默认）：在开始前执行一次摘要
-    # SummarizationMode.per_model_call：每次模型调用时都检查是否需要摘要
+    mode: SummarizationMode = SummarizationMode.PER_ASTREAM,
+    # SummarizationMode.PER_ASTREAM（默认）：在开始前执行一次摘要
+    # SummarizationMode.PER_MODEL_CALL：每次模型调用时都检查是否需要摘要
 
     trigger: ("tokens", 200000) | ("messages", 50) | None = None,
     # 触发条件 — 累计超过阈值时触发摘要。None = 不触发
@@ -586,8 +610,8 @@ SummarizationConfig(
     backend: BackendProtocol | None = None,
     # offload_to_backend 使用的后端
 
-    summary_prompt: str | None = None,
-    # 自定义摘要提示词
+    summary_prompt: str = DEFAULT_MAMBO_SUMMARY_PROMPT,
+    # 内置摘要提示词（含 {messages} 占位符）
 
     chained_summary_prompt: str | None = None,
     # 链式摘要提示词（之前已有摘要时使用）
@@ -607,7 +631,7 @@ SummarizationConfig(
 |------|------|------|
 | `cutoff_index` | `int` | `state["messages"]` 中的绝对索引。此索引**之前**的所有消息已被摘要替换为一条 `summary_message`。 |
 | `summary_message` | `HumanMessage` | LLM 生成的摘要消息，包含三个标准部分：`SESSION INTENT`（会话目标）、`SUMMARY`（关键决策与结论）、`ARTIFACTS`（创建/修改的文件及变更描述）。消息标记有 `additional_kwargs={"lc_source": "summarization"}` 用于链式摘要识别。 |
-| `file_path` | `str \| None` | 当 `offload_to_backend=True` 时，被驱逐的消息会持久化到后端的 `/conversation_history/{thread_id}.md` 路径。`None` 表示未开启 offload 或 offload 失败。 |
+| `file_path` | `str \| None` | 当 `offload_to_backend=True` 时，被驱逐的消息会持久化到后端的 `/.mambo/conversation_history/{thread_id}.md` 路径。`None` 表示未开启 offload 或 offload 失败。 |
 | `last_summarized_message` | `AnyMessage \| None` | 被摘要区域中最后一条真实消息（不含摘要标记消息）。用于了解压缩窗口的精确边界。 |
 
 **检测摘要事件的方式：**
@@ -700,7 +724,7 @@ for event in agent.stream(
     stream_mode="updates",
 ):
     for node_name, node_output in event.items():
-        if node_name == "agent":
+        if node_name == "model":
             # AIMessage.tool_calls 中可看到 write_plans 被调用及参数
             for msg in node_output.get("messages", []):
                 if msg.tool_calls:
@@ -770,7 +794,7 @@ license: MIT
 
 | 类型 | 示例 | 标签来源 |
 |------|------|----------|
-| 裸路径 | `"/skills/user/"` | 路径最后组件大写 |
+| 裸路径 | `"/skills/user/"` | 路径最后组件首字母大写（`"/skills/user/"` → `User`；特例：`built_in_skills` → `Built-in`，`skills` 叶子上跳一级） |
 | 元组 | `("/path", "我的技能")` | 自定义标签 |
 
 多来源加载：后加载的技能覆盖同名的先前技能（后胜出）。
@@ -970,7 +994,11 @@ SecurityReviewConfig(
 
     agent_tools: frozenset[str] | None = None,
     # agent 模式下暴露给审查 agent 的后端工具名列表
-    # None = 所有已注册后端工具均可用
+    # None = 无额外工具（与空集一致）；必须显式指定
+
+    tool_unpackers: list[object] | None = None,
+    # 工具解包器列表：将包装工具（如 mcp_call_tool）解析为内层工具身份
+    # 用于 MCP 工具审查（传入 mcp.tool_unpacker）
 )
 ```
 
@@ -1170,9 +1198,6 @@ VersionControlConfig(
     # LangGraph BaseStore 用于版本数据持久化。
     # None = 从图执行上下文自动解析。
 
-    auto_snapshot: bool = True,
-    # True（默认）时，变更工具调用时自动触发备份。
-
     whitelist_folders: list[VirtualPath] = [],
     # 要监控的虚拟路径绝对路径列表。空列表 = 不处理任何文件。
 
@@ -1242,6 +1267,7 @@ agent = create_mambo_agent(
 | `url` | `str` | HTTP 必填 | 服务地址（sse / streamable_http / websocket） |
 | `headers` | `dict` | ❌ | HTTP 头（HTTP 模式） |
 | `timeout` | `float` | ❌ | HTTP 超时（秒） |
+| `sse_read_timeout` | `float` | ❌ | SSE 读超时（秒） |
 
 ### 12.x `exclude_tools` — 隐藏危险工具
 
@@ -1263,7 +1289,7 @@ mcp = MCPMiddleware(
 ### 12.x `direct_tool_threshold` — 直传 vs 包装模式
 
 控制 MCP 工具是直接注册还是走包装 meta-tool。默认阈值为 **15**：所有 server
-的 MCP 工具总数低于此值时，每个工具注册为名为 ``server__tool`` 的一级工具。
+的 MCP 工具总数不超过此值时，每个工具注册为名为 ``server__tool`` 的一级工具。
 高于阈值时使用 ``mcp_call_tool`` / ``mcp_get_tool_description`` 包装。
 
 ```python
@@ -1520,9 +1546,9 @@ agent = create_mambo_agent(
 agent = create_mambo_agent(
     "gpt-4o",
     backend=StoreBackend(initial_files={
-        "/app/main.py": "def main():\n    print('hello')",
-        "/app/config.yaml": "port: 8080\ndebug: true",
-        "/app/requirements.txt": "fastapi==0.100.0\nuvicorn==0.23.0",
+        "/workspace/app/main.py": "def main():\n    print('hello')",
+        "/workspace/app/config.yaml": "port: 8080\ndebug: true",
+        "/workspace/app/requirements.txt": "fastapi==0.100.0\nuvicorn==0.23.0",
     }),
 )
 ```

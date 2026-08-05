@@ -336,17 +336,27 @@ def create_mambo_agent(
     _vc_middleware: VersionControlMiddleware | None = None
     if version_control is not None and version_control is not False:
         vc_store: VersionStore
+        vc_kwargs: dict[str, Any] = {}
         if isinstance(version_control, VersionStore):
             vc_store = version_control
         elif isinstance(version_control, VersionControlConfig):
             vc_store = VersionStore(store=version_control.store)
+            vc_kwargs = {
+                "whitelist_folders": version_control.whitelist_folders,
+                "mutating_tool_names": version_control.mutating_tool_names,
+            }
         else:
             # bool True or anything else → auto-resolve store
             vc_store = VersionStore()
 
+        if not vc_kwargs:
+            # Convenience forms (True / VersionStore): back up the whole workspace
+            vc_kwargs = {"whitelist_folders": [backend.workspace_root]}
+
         _vc_middleware = VersionControlMiddleware(
             store=vc_store,
             backend=backend,
+            **vc_kwargs,
         )
         mw.append(_vc_middleware)
 
@@ -443,6 +453,7 @@ def create_mambo_agent(
                 model=_review_model,
                 review_tools=_review_tools,
                 security_review_system_prompt=security_review.system_prompt,
+                notify_on_pass=security_review.notify_on_pass,
                 review_mode=_review_mode,
                 agent_max_steps=_agent_max_steps,
                 agent_backend=_agent_backend,

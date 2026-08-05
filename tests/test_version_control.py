@@ -614,7 +614,6 @@ class TestVersionControlConfig:
     def test_defaults(self):
         cfg = VersionControlConfig()
         assert cfg.store is None
-        assert cfg.auto_snapshot is True
         assert cfg.whitelist_folders == []
         assert cfg.mutating_tool_names == ["write", "edit", "delete"]
 
@@ -622,12 +621,10 @@ class TestVersionControlConfig:
         store = InMemoryStore()
         cfg = VersionControlConfig(
             store=store,
-            auto_snapshot=False,
             whitelist_folders=[VirtualPath("/workspace/src")],
             mutating_tool_names=["write", "patch"],
         )
         assert cfg.store is store
-        assert cfg.auto_snapshot is False
         assert cfg.whitelist_folders == [VirtualPath("/workspace/src")]
         assert cfg.mutating_tool_names == ["write", "patch"]
 

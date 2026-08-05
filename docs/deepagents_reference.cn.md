@@ -2,7 +2,7 @@
 
 # 关于 deepagents 的参考声明
 
-## 1. 参考申明
+## 1. 参考声明
 
 **Mambo Agents** 项目承认并感谢 [deepagents](https://github.com/langchain-ai/deepagents)（v0.5.7，LangChain 团队）的开源工作。本项目在其基础架构之上进行了大量重构和扩展，核心灵感来源于 deepagents 的 **中间件管道（Middleware Pipeline）** 和 **后端抽象（Backend Protocol）** 两大设计范式。
 
@@ -34,7 +34,7 @@
 | **本地文件+执行** | `LocalShellBackend`（`FilesystemBackend` + `SandboxBackendProtocol`）<br>• 通过继承 `SandboxBackendProtocol` 获得 `execute()`<br>• 使用 `subprocess.run(shell=True)` 直连宿主机，无隔离 | `LocalBackend`（自带 `execute()`）<br>• `execute()` 是后端自身方法，无需额外协议层<br>• 同样直连宿主机，但内聚在单一类中 | Mambo 不做 LocalShellBackend/FilesystemBackend 两套类分离，本地文件操作和本地 shell 执行天然一体 |
 | **远程文件+执行** | `LangSmithSandbox`（继承 `BaseSandbox`）<br>• 对接 LangSmith 云端容器服务，实现真正的进程隔离<br>• 文件操作全部委托给 `execute()`，通过 SDK 收发命令 | `SshBackend`（基于 paramiko）<br>• `execute()` 通过 SSH 信道在远端执行<br>• 文件操作直接操作远端文件系统（ls/read/write 等不走 execute，有原生实现） | deepagents 的远程方案绑定特定云服务（LangSmith），适合容器化配置好的环境；Mambo 的 SSH 方案更通用，任何有 sshd 的机器都可用 |
 | **execute 架构理念** | `execute()` 需要通过 `SandboxBackendProtocol` 获得<br>• 协议层次：`BackendProtocol`（纯文件）→ `SandboxBackendProtocol`（+ execute）→ `BaseSandbox`（便利封装）<br>• 只有声明为 "Sandbox" 的后端才能执行命令 | `execute()` 是后端自带的可选能力<br>• 协议层次：只有 `BackendProtocol`，任何后端想加 execute 直接在自家类上实现即可<br>• `LocalBackend`、`SshBackend` 各怀 execute，`StoreBackend` 没有 — 按需启用，不强制分类 | Mambo 追求更通用、更灵活的 execute 启用方式：不引入独立的 Sandbox 协议层，execute 就是一个普通的方法，由各后端自行决定是否提供 |
-| **跨会话持久化** | ✅ `StoreBackend`（基于 LangGraph BaseStore） | ✅ `StoreBackend`（基于 LangGraph BaseStore，`thread_id` 锁死在构造时） | Mambo 的 StoreBackend 是自行实现的，继承自 `BackendProtocol`，构造时锁死 `thread_id` 实现会话隔离 |
+| **跨会话持久化** | ✅ `StoreBackend`（基于 LangGraph BaseStore） | ✅ `StoreBackend`（基于 LangGraph BaseStore，`thread_id` 默认从 graph config 动态解析） | Mambo 的 StoreBackend 是自行实现的，继承自 `BackendProtocol`，默认从 graph config 动态解析 `thread_id`（仅显式传入时锁定） |
 
 ### 2.2 中间件栈差异
 
@@ -45,7 +45,7 @@
 | **多模型兼容** | ❌ 无工具消息重排序 | ✅ `ReorderToolMessagesMiddleware` | 某些多模态模型对工具消息顺序敏感，Mambo 显式处理 |
 | **工具扩展性** | `FilesystemMiddleware`（六核心工具 + 后端额外工具 + 多模态 read） | ✅ `BackendToolsMiddleware`（六核心工具 + 后端额外工具自动注入）<br>• `include_line_numbers` 参数：Mambo 的 `read` 默认不返回行号，模型可自行决定在需要定位行号时传 `True`（deepagents 总是无条件加行号，不可关闭）<br>• `build_tool_descriptions()` 提取所有工具描述映射，供 `AutoSecurityReviewMiddleware` 安全审查时理解工具用途 | 基础工具层面的差异化：`include_line_numbers` 的可控性减少了无关噪音；`build_tool_descriptions()` 使工具描述可被其他中间件消费 |
 | **大结果驱逐** | ✅ `FilesystemMiddleware` 内置驱逐（保存到 `/large_tool_results/`）<br>• 驱逐时机：`wrap_model_call`（预模型调用时批量处理消息历史） | ✅ `BackendToolsMiddleware` 驱逐（保存到 `/.mambo/large_tool_results/`）<br>• 驱逐时机：`wrap_tool_call`（工具返回结果后即时拦截，而非等到下一轮模型调用） | 双端均实现大结果驱逐（包括多模态块保留和 Command 多消息场景），核心差异仅在于驱逐时机：Mambo 在工具返回后立即生效，deepagents 在模型调用前批量处理 |
-| **大文件读取限制与摘要** | ✅ `read_file` 内置 `_truncate()`：超过字符阈值后附加静态 `READ_FILE_TRUNCATION_MSG`（固定模板消息，无文件类型区分能力） | ✅ `BackendProtocol` 内置 `max_read_chars` + 可插拔 `ReadSummarizer` 回调<br>• 回调签名 `(file_path, content, max_chars) -> str`，可基于文件后缀（`.py`/`.json`/`.yaml` 等）生成差异化指导摘要<br>• 默认摘要器引导模型用 `offset`+`limit` 分段读取；用户注入自定义回调即可按文件类型定制策略<br>• 二进制/多模态文件永不截断<br>• 附赠 `read_summarizers` 子包，含 9 种预置摘要器（Python / JS / TS / Java / C / C++ / Go / Rust / Markdown / JSON），提取结构大纲 + 精确行号 | 两方均有字符级读取上限和截断提示；Mambo 的核心差异在于**可插拔回调**体系 — 将大文件内容替换为按文件类型定制的"指导性摘要"，帮助模型做出更正确的下一步决策，而非仅给出固定截断警告 |
+| **大文件读取限制与摘要** | ✅ `read_file` 内置 `_truncate()`：超过字符阈值后附加静态 `READ_FILE_TRUNCATION_MSG`（固定模板消息，无文件类型区分能力） | ✅ `BackendProtocol` 内置 `max_read_chars` + 可插拔 `ReadSummarizer` 回调<br>• 回调签名 `(file_path, content, max_chars) -> str`，可基于文件后缀（`.py`/`.json`/`.yaml` 等）生成差异化指导摘要<br>• 默认摘要器引导模型用 `offset`+`limit` 分段读取；用户注入自定义回调即可按文件类型定制策略<br>• 二进制/多模态文件永不截断<br>• 附赠 `read_summarizers` 子包，含 9 种预置摘要器（Python / JavaScript / Markdown / JSON / Java / C / C++ / Go / Rust），提取结构大纲 + 精确行号 | 两方均有字符级读取上限和截断提示；Mambo 的核心差异在于**可插拔回调**体系 — 将大文件内容替换为按文件类型定制的"指导性摘要"，帮助模型做出更正确的下一步决策，而非仅给出固定截断警告 |
 | **记忆系统** | ✅ `MemoryMiddleware`（AGENTS.md） | ✅ `MamboMemoryMiddleware`（AGENTS.md） | Mambo 参考 deepagents 的 `MemoryMiddleware` 设计（`before_agent` 通过 `backend.download_files` 加载 AGENTS.md 到 state、`wrap_model_call` 注入 `<agent_memory>` 系统提示、多 sources 合并加载），在此基础上增加可选自定义 `format_prompt` 格式化回调 |
 | **Profile 系统** | ✅ `ProviderProfile` + `HarnessProfile`（模型/提供商调优） | ❌ 未实现 | Mambo 暂不聚焦模型级细粒度调优，由用户自行配置 |
 | **Anthropic 缓存** | ✅ `AnthropicPromptCachingMiddleware` | ❌ 未实现 | Mambo 暂不绑定特定提供商优化 |
@@ -56,7 +56,7 @@
 | 对比维度 | deepagents | Mambo Agents | 取舍说明 |
 |----------|------------|--------------|----------|
 | **类型安全** | 部分使用 TypedDict | ✅ 全链路 Pydantic 类型（无 Dict/Any 鸭子类型） | 严格类型控制是 Mambo 的核心编码规范 |
-| **路由后端** | `CompositeBackend`（default + routes 字典，任意前缀 → 任意后端）<br>• 路由完全自由：`/memories/` → StoreBackend、`/cache/` → StateBackend 等任意组合<br>• `ls("/")` 透明聚合所有路由后端<br>• `execute()` 始终委托 default 后端，通过 `SandboxBackendProtocol` 类型判定 | `HybridWorkspaceBackend`（1 真实 + N 虚拟，统一 `/.mambo/` 前缀）<br><br>**硬性约束：**<br>• 虚拟 workspace 前缀固定 `/.mambo/`，不可自定义为其他路由路径<br>• 虚拟 workspace 仅开放 6 核心文件工具 <br>• System prompt 显式告知 AI 以上约束<br><br>**放宽之处：**<br>• 内置 `copy` 工具，支持跨后端（虚拟 ↔ 真实）的单文件搬运<br>• 支持真实后端灵活的提供工具,而不仅限于execute | `CompositeBackend` 的任意前缀路由提供了最大灵活度，但 AI 可能会做出 `execute`（如 `cat /memories/...`）绕过路由层的决定,导致比较严重的幻觉；`HybridWorkspaceBackend` 用固定前缀 + 显式工具白名单的提示词限制AI操作，并且放宽对真实后端的tools限制 |
+| **路由后端** | `CompositeBackend`（default + routes 字典，任意前缀 → 任意后端）<br>• 路由完全自由：`/memories/` → StoreBackend、`/cache/` → StateBackend 等任意组合<br>• `ls("/")` 透明聚合所有路由后端<br>• `execute()` 始终委托 default 后端，通过 `SandboxBackendProtocol` 类型判定 | `HybridWorkspaceBackend`（1 真实 + N 虚拟，统一 `/.mambo/` 前缀）<br><br>**硬性约束：**<br>• 虚拟 workspace 前缀默认为 `/.mambo/`，可通过 `mambo_prefix` 参数自定义<br>• 虚拟 workspace 仅开放 6 核心文件工具 <br>• System prompt 显式告知 AI 以上约束<br><br>**放宽之处：**<br>• 内置 `copy` 工具，支持跨后端（虚拟 ↔ 真实）的单文件搬运<br>• 支持真实后端灵活的提供工具,而不仅限于execute | `CompositeBackend` 的任意前缀路由提供了最大灵活度，但 AI 可能会做出 `execute`（如 `cat /memories/...`）绕过路由层的决定,导致比较严重的幻觉；`HybridWorkspaceBackend` 用默认固定前缀 + 显式工具白名单的提示词限制AI操作，并且放宽对真实后端的tools限制 |
 
 ---
 
@@ -68,10 +68,10 @@
 
 | 功能 | deepagents | Mambo Agents |
 |------|------------|--------------|
-| 协议定义 | `BackendProtocol` + `SandboxBackendProtocol`（independent execute layer） | `BackendProtocol`（execute is also a backend method，no independent protocol layer） |
-| 内存存储 | `StateBackend` | `StoreBackend`（自实现，基于 LangGraph BaseStore，构造时锁死 `thread_id`） |
-| 本地 execute | `LocalShellBackend`（`FilesystemBackend` + `SandboxBackendProtocol`，two layers of parent classes） | `LocalBackend`（single class with built-in `execute()`，`tree`，`delete`） |
-| 远程 execute | `LangSmithSandbox`（cloud container service，all file operation are delegated to `execute()`） | `SshBackend`（native SSH，`execute()` via SSH channel，file operation has native implementations） |
+| 协议定义 | `BackendProtocol` + `SandboxBackendProtocol`（独立 execute 层） | `BackendProtocol`（execute 也是后端方法，无独立协议层） |
+| 内存存储 | `StateBackend` | `StoreBackend`（自实现，基于 LangGraph BaseStore，`thread_id` 默认从 graph config 动态解析） |
+| 本地 execute | `LocalShellBackend`（`FilesystemBackend` + `SandboxBackendProtocol`，两层父类） | `LocalBackend`（单类自带 `execute()`、`tree`、`delete`） |
+| 远程 execute | `LangSmithSandbox`（云端容器服务，所有文件操作委托给 `execute()`） | `SshBackend`（原生 SSH，`execute()` 通过 SSH 信道执行，文件操作有原生实现） |
 | 路径路由 | `CompositeBackend`（灵活多后端路由，任意前缀 → 任意后端；`execute()` 可能绕过路由层） | `HybridWorkspaceBackend`（1 真实 + N 虚拟路由：`/.mambo/<name>/` → 内存，其余 → 真实后端；System prompt 显式告知 AI workspace 语义） |
 | 跨会话存储 | `StoreBackend` | `StoreBackend`（自实现） |
 
@@ -84,7 +84,7 @@
 | 技能披露 | `SkillsMiddleware` | `SkillsMiddleware`（重构） |
 | 同步子代理 | `SubAgentMiddleware` | `SubAgentMiddleware`（重构；`subagent_event` 流式事件、三级粒度、状态透传） |
 | 异步子代理 | `AsyncSubAgentMiddleware` | `AsyncSubAgentMiddleware`（重构） |
-| 对话摘要 | `SummarizationMiddleware` | `MamboSummarizationMiddleware`（扩展）<br>• **链式摘要**：在多轮摘要中保留前次摘要内容，使用 `CHAINED_SUMMARY_PROMPT` 要求模型合并历史摘要而非覆盖，防止跨轮次信息丢失<br>• **CJK token 计数**：自动检测中文/日文/韩文字符占比，使用与英文不同的 chars-per-token 比例估算 token 数，避免 CJK 文本的 token 严重低估<br>• **保护最近用户消息**：确保最新的 user message 不会被摘要掉（langchain 基类无此保护）<br>• **可选后端持久化**：被移除的原始消息可写入 `BackendProtocol` 的 `/conversation_history/{thread_id}.md` 文件 |
+| 对话摘要 | `SummarizationMiddleware` | `MamboSummarizationMiddleware`（扩展）<br>• **链式摘要**：在多轮摘要中保留前次摘要内容，使用 `DEFAULT_MAMBO_CHAINED_SUMMARY_PROMPT` 要求模型合并历史摘要而非覆盖，防止跨轮次信息丢失<br>• **CJK token 计数**：自动检测中文/日文/韩文字符占比，使用与英文不同的 chars-per-token 比例估算 token 数，避免 CJK 文本的 token 严重低估<br>• **保护最近用户消息**：确保最新的 user message 不会被摘要掉（langchain 基类无此保护）<br>• **可选后端持久化**：被移除的原始消息可写入 `BackendProtocol` 的 `/.mambo/conversation_history/{thread_id}.md` 文件 |
 | 悬空工具修复 | `PatchToolCallsMiddleware` | `PatchToolCallsMiddleware`（保持） |
 | 工具消息重排序 | ❌ | ✅ `ReorderToolMessagesMiddleware` |
 | 安全审查 | `HumanInTheLoopMiddleware` | ✅ `AutoSecurityReviewMiddleware`（AI 预审 + 人工审批；llm/agent 双模式） |
@@ -98,8 +98,8 @@
 | 功能 | deepagents | Mambo Agents |
 |------|------------|--------------|
 | 主构造函数 | `create_deep_agent()` | `create_mambo_agent()` |
-| Profile 系统 | ✅ ProviderProfile + HarnessProfile | ❌ |
-| 子代理类型 | `SubAgent` / `CompiledSubAgent` / `AsyncSubAgent` | `SubAgent` / `CompiledSubAgent` / `AsyncSubAgent` |
+| Profile 系统 | ✅ `ProviderProfile` + `HarnessProfile` | ❌ |
+| 子代理类型 | `SubAgent` / `CompiledSubAgent` / `AsyncSubAgent` | `SubAgent` / `CompiledSubAgent` |
 
 ---
 

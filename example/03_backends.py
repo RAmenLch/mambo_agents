@@ -35,22 +35,24 @@ def main_store_backend():
     model = ChatDeepSeek(model="deepseek-v4-flash")
 
     # 创建带初始文件的虚拟文件系统
+    # 注意：文件必须放在 /workspace/ 前缀下，才能在 Agent 的
+    # ls /workspace 视图中可见（StoreBackend 的 workspace_root 固定为 /workspace）
     backend = StoreBackend(initial_files={
-        "/app/main.py": (
+        "/workspace/app/main.py": (
             "def greet(name: str) -> str:\n"
             '    return f"Hello, {name}!"\n'
             "\n"
             'if __name__ == "__main__":\n'
             '    print(greet("World"))\n'
         ),
-        "/app/config.yaml": (
+        "/workspace/app/config.yaml": (
             "server:\n"
             "  port: 8080\n"
             "  host: 0.0.0.0\n"
             "database:\n"
             "  url: localhost:5432\n"
         ),
-        "/app/requirements.txt": (
+        "/workspace/app/requirements.txt": (
             "fastapi==0.100.0\n"
             "uvicorn==0.23.0\n"
         ),
@@ -60,7 +62,7 @@ def main_store_backend():
 
     result = agent.invoke({
         "messages": [HumanMessage(
-            "查看 /app/config.yaml 的内容，然后把 server.port 改成 9090"
+            "查看 /workspace/app/config.yaml 的内容，然后把 server.port 改成 9090"
         )]
     }, config={"configurable": {"thread_id": "session-1"}})
     print(result["messages"][-1].content[:500], "...")
@@ -109,13 +111,13 @@ async def main_astream():
     model = ChatDeepSeek(model="deepseek-v4-flash")
 
     backend = StoreBackend(initial_files={
-        "/project/README.md": "# My Project\n\nA sample project.\n",
+        "/workspace/project/README.md": "# My Project\n\nA sample project.\n",
     })
     agent = create_mambo_agent(model, backend=backend)
 
     async for event in agent.astream(
         {"messages": [HumanMessage(
-            "查看 /project/README.md，然后添加一个 '## Features' 章节"
+            "查看 /workspace/project/README.md，然后添加一个 '## Features' 章节"
         )]},
         stream_mode="updates",
         config={"configurable": {"thread_id": "session-1"}},

@@ -48,11 +48,12 @@ result = agent.invoke({"messages": [HumanMessage("创建一个 hello.py 文件")
 │  ┌─────────────┐  ┌──────────┐  ┌────────────────────┐  │
 │  │   Backend   │  │  Model   │  │    Middleware Stack │  │
 │  │  Protocol   │  │ (LLM)    │  │                    │  │
-│  │             │  │          │  │ BackendTools       │  │
-│  │ State       │  │          │  │ Skills             │  │
-│  │ Local       │  │          │  │ Memory             │  │
-│  │ SSH         │  │          │  │ Summarization      │  │
-│  │ TempWs      │  │          │  │ Planning           │  │
+│  │  Store      │  │          │  │ BackendTools       │  │
+│  │  Local      │  │          │  │ Skills             │  │
+│  │  SSH        │  │          │  │ Memory             │  │
+│  │  Hybrid     │  │          │  │ VersionControl     │  │
+│  │  ReadOnly   │  │          │  │ Summarization      │  │
+│  │             │  │          │  │ Planning           │  │
 │  └─────────────┘  └──────────┘  │ SubAgents          │  │
 │                                 │ AsyncSubAgents     │  │
 │                                 │ SecurityReview     │  │

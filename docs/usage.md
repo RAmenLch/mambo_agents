@@ -74,6 +74,10 @@ print(result["messages"][-1].content)
 > **Default backend:** When `backend` is not specified, the agent uses `StoreBackend` + `InMemoryStore`.
 > Files are stored in session memory and disappear on process restart. For persistence (e.g. PostgreSQL)
 > or real disk operations, specify `backend=LocalBackend(...)` (see next section).
+>
+> **Path convention:** `StoreBackend` addresses files under the `/workspace/` prefix
+> (e.g. `/workspace/hello.py`); paths outside it (e.g. `/hello.py`) are not visible
+> in `ls /workspace` / `glob` views. See [5.2](#52-virtual-filesystem-storebackend).
 
 ### 3.2 Working with a Local Filesystem
 
@@ -127,9 +131,9 @@ async for event in agent.astream(
 ):
     print(event)
     # Example output (fires once per completed step):
-    # {'agent': {'messages': [AIMessage(content='Let me first ls the directory structure...')]}}
+    # {'model': {'messages': [AIMessage(content='Let me first ls the directory structure...')]}}
     # {'tools': {'messages': [ToolMessage(content='...', name='ls')]}}
-    # {'agent': {'messages': [AIMessage(content='The project contains the following files...')]}}
+    # {'model': {'messages': [AIMessage(content='The project contains the following files...')]}}
 ```
 
 **Token-by-token streaming (real-time LLM output):**
@@ -251,7 +255,7 @@ from mambo_agents import create_mambo_agent, StoreBackend
 agent = create_mambo_agent(
     "gpt-4o",
     backend=StoreBackend(initial_files={
-        "/config.json": '{"port": 8080}',
+        "/workspace/config.json": '{"port": 8080}',
     }),
     summarization={
         "trigger": ("tokens", 200000),
@@ -280,7 +284,7 @@ All backends must implement 6 core operations:
 | `grep(pattern, path, glob, regex, offset, limit)` | Search text content |
 | `glob(pattern, path)` | Find files and directories by wildcard pattern |
 
-Each backend can also expose extra tools via its `tools` property (e.g. `tree`, `delete`, `execute`).
+Each backend can also expose extra tools via its `tools` property (e.g. `tree`, `delete`, `execute`; `HybridWorkspaceBackend` additionally provides `copy`).
 
 > **Path conventions:** All backends use absolute paths starting with `/` (e.g. `/workspace/src/main.py`).
 > Some config parameters (e.g. `memory_sources`) accept `VirtualPath` or plain `str` — the framework
@@ -295,10 +299,13 @@ Each backend can also expose extra tools via its `tools` property (e.g. `tree`, 
 from mambo_agents import StoreBackend
 
 # Default in-memory storage (disappears on process restart)
+# NOTE: files must live under the workspace root "/workspace" so they show
+# up in the agent's default `ls /workspace` view. Keys without the prefix
+# are still readable by exact path, but invisible to ls/glob at the root.
 backend = StoreBackend(
     initial_files={
-        "/config.json": '{"port": 8080}',
-        "/README.md": "# My Project",
+        "/workspace/config.json": '{"port": 8080}',
+        "/workspace/README.md": "# My Project",
     }
 )
 
@@ -307,9 +314,15 @@ from langgraph.store.postgres import PostgresStore
 
 backend = StoreBackend(
     store=PostgresStore.from_conn_string("postgresql://..."),
-    initial_files={"/config.json": '{"port": 8080}'},
+    initial_files={"/workspace/config.json": '{"port": 8080}'},
 )
 ```
+
+> **Path convention:** `StoreBackend`'s `workspace_root` is fixed at `/workspace`.
+> Pre-populated `initial_files` keys must start with `/workspace/` (e.g. `/workspace/config.json`),
+> and agents should be instructed to create files under `/workspace/` as well — otherwise
+> files are reachable only by their exact path and do **not** appear in the agent's
+> default `ls /workspace` / `glob` views.
 
 Common `BaseStore` implementations:
 
@@ -405,10 +418,13 @@ backend = HybridWorkspaceBackend(
 )
 
 # Multiple virtual workspaces
+# NOTE: a virtual StoreBackend's workspace_root is fixed at "/workspace",
+# so initial_files keys MUST use the "/workspace/" prefix to match the
+# path the router delegates — otherwise pre-populated files are invisible.
 backend = HybridWorkspaceBackend(
     real_backend=LocalBackend(root_dir="/tmp/project"),
     virtual_workspaces={
-        "skills": StoreBackend(initial_files={"/python.md": "..."}),
+        "skills": StoreBackend(initial_files={"/workspace/python.md": "..."}),
         "cache": StoreBackend(),
     },
 )
@@ -417,16 +433,24 @@ backend = HybridWorkspaceBackend(
 backend = HybridWorkspaceBackend(
     real_backend=LocalBackend(root_dir="/tmp/project"),
     virtual_workspaces={
-        ".": StoreBackend(initial_files={"/config.yml": "..."}),
+        ".": StoreBackend(initial_files={"/workspace/config.yml": "..."}),
     },
 )
 ```
 
 **Path routing rules:**
-- `/.mambo/skills/xxx` → "skills" virtual workspace (prefix stripped, passes `/xxx`)
-- `/.mambo/xxx` → default StoreBackend (prefix stripped, passes `/xxx`)
+- `/.mambo/skills/xxx` → "skills" virtual workspace (prefix stripped, then re-prefixed with the virtual backend's `workspace_root` — `/workspace` for `StoreBackend` — before delegation)
+- `/.mambo/xxx` → default StoreBackend (same rewrite as above)
 - `/{workspace_root}/...` → real backend (path rewritten: strip workspace_root, prepend real backend's workspace_root)
 - Other paths (e.g. `/`, `/etc`) are rejected
+
+**Virtual workspace notes:**
+- A virtual `StoreBackend` has a fixed `workspace_root` of `/workspace` (not `/`), so pre-populated `initial_files` keys must start with `/workspace/`. A key like `/python.md` would be stored under an unreachable path and the agent cannot read it.
+- The virtual backend resolves its `BaseStore` from the graph execution context (`get_store()`). For graph-outside access (e.g. verifying files with `download_files()` from your own script), construct the virtual `StoreBackend` with an explicit `store=` (and pass `store=` to `HybridWorkspaceBackend` for the default workspace) so the same store instance is shared. Otherwise graph-outside calls fall back to a private `InMemoryStore` and cannot see the agent's files.
+- See `example/11_hybrid_workspace.py` for a fully runnable demo.
+
+**Extra tool:** `copy(source, destination)` — copies a single file across backends
+(virtual ↔ real, or between virtual workspaces), overwriting the destination if it exists.
 
 **Use cases:**
 - Internal storage (large result eviction, conversation history dumps)
@@ -502,6 +526,7 @@ backend = LocalBackend(summarizer=composite_summarizer([
 | Session Isolation | Automatic | Manual | Manual | Automatic (/.mambo/) |
 | Shell Execution | ❌ | Optional | Optional | Depends on real backend |
 | Delete Operation | ❌ | ✅ | ✅ | Depends on real backend |
+| Copy Operation | ❌ | ❌ | ❌ | ✅ |
 | grep Acceleration | N/A | ripgrep | Remote rg/grep | Inherits delegate |
 | Network Dependency | ❌ | ❌ | ✅ | Optional |
 | Best For | Testing / Prototyping | Local Development | Remote Deployment | Production |
@@ -535,8 +560,8 @@ agent = create_mambo_agent(
 
 | Mode | Description |
 |------|-------------|
-| `per_astream` | (Default) Summarize once before execution starts. No further checks during the run. |
-| `per_model_call` | Check summarization on every model call, even mid-run. |
+| `PER_ASTREAM` | (Default) Summarize once before execution starts. No further checks during the run. |
+| `PER_MODEL_CALL` | Check summarization on every model call, even mid-run. |
 
 ```python
 from mambo_agents import SummarizationMode
@@ -544,7 +569,7 @@ from mambo_agents import SummarizationMode
 agent = create_mambo_agent(
     "gpt-4o",
     summarization={
-        "mode": SummarizationMode.per_model_call,
+        "mode": SummarizationMode.PER_MODEL_CALL,
         "trigger": ("tokens", 200000),
         "keep": ("messages", 20),
     },
@@ -563,9 +588,9 @@ summarization. `MamboPlanMiddleware` uses this mechanism to preserve the current
 from mambo_agents import SummarizationConfig, SummarizationMode
 
 SummarizationConfig(
-    mode: SummarizationMode = SummarizationMode.per_astream,
-    # SummarizationMode.per_astream (default): summarize once before execution starts
-    # SummarizationMode.per_model_call: check summarization on every model call
+    mode: SummarizationMode = SummarizationMode.PER_ASTREAM,
+    # SummarizationMode.PER_ASTREAM (default): summarize once before execution starts
+    # SummarizationMode.PER_MODEL_CALL: check summarization on every model call
 
     trigger: ("tokens", 200000) | ("messages", 50) | None = None,
     # Trigger condition — compact when cumulative exceeds threshold. None = never trigger
@@ -591,8 +616,8 @@ SummarizationConfig(
     backend: BackendProtocol | None = None,
     # Backend used for offload_to_backend
 
-    summary_prompt: str | None = None,
-    # Custom summarization prompt
+    summary_prompt: str = DEFAULT_MAMBO_SUMMARY_PROMPT,
+    # Built-in summarization prompt (with {messages} placeholder)
 
     chained_summary_prompt: str | None = None,
     # Chained summary prompt (used when prior summaries exist)
@@ -612,7 +637,7 @@ When summarization is triggered, the middleware stores the summary event in the 
 |------|------|-------------|
 | `cutoff_index` | `int` | Absolute index in `state["messages"]`. All messages **before** this index have been replaced by a single `summary_message`. |
 | `summary_message` | `HumanMessage` | LLM-generated summary message with three standard sections: `SESSION INTENT` (session goal), `SUMMARY` (key decisions & conclusions), `ARTIFACTS` (created/modified files and changes). Tagged with `additional_kwargs={"lc_source": "summarization"}` for chained summarization. |
-| `file_path` | `str \| None` | When `offload_to_backend=True`, evicted messages are persisted to `/conversation_history/{thread_id}.md` on the backend. `None` means offload is disabled or failed. |
+| `file_path` | `str \| None` | When `offload_to_backend=True`, evicted messages are persisted to `/.mambo/conversation_history/{thread_id}.md` on the backend. `None` means offload is disabled or failed. |
 | `last_summarized_message` | `AnyMessage \| None` | The last real message in the summarized zone (excluding summary markers). Useful for understanding the exact compaction boundary. |
 
 **Detecting summarization events:**
@@ -706,7 +731,7 @@ for event in agent.stream(
     stream_mode="updates",
 ):
     for node_name, node_output in event.items():
-        if node_name == "agent":
+        if node_name == "model":
             # AIMessage.tool_calls shows write_plans invocation and args
             for msg in node_output.get("messages", []):
                 if msg.tool_calls:
@@ -777,7 +802,7 @@ license: MIT
 
 | Type | Example | Label Source |
 |------|---------|--------------|
-| bare path | `"/skills/user/"` | Last path component, uppercased |
+| bare path | `"/skills/user/"` | Last path component, capitalized (`"/skills/user/"` → `User`; special cases: `built_in_skills` → `Built-in`, a `skills` leaf climbs one level) |
 | tuple | `("/path", "My Skill")` | Custom label |
 
 Multi-source loading: later-loaded skills override earlier ones with the same name (last wins).
@@ -985,7 +1010,11 @@ SecurityReviewConfig(
 
     agent_tools: frozenset[str] | None = None,
     # Backend tool names to expose to the review agent in agent mode
-    # None = all registered backend tools are available
+    # None = no extra tools (same as empty set); must be explicitly specified
+
+    tool_unpackers: list[object] | None = None,
+    # Tool-unpacker callables: resolve wrapped tools (e.g. mcp_call_tool)
+    # into their inner tool identity.  Pass mcp.tool_unpacker for MCP tools.
 )
 ```
 
@@ -1192,9 +1221,6 @@ VersionControlConfig(
     # LangGraph BaseStore for version data persistence.
     # None = auto-resolved from graph execution context.
 
-    auto_snapshot: bool = True,
-    # When True (default), mutate-tool calls automatically trigger backups.
-
     whitelist_folders: list[VirtualPath] = [],
     # Absolute virtual paths to monitor. Empty = no files processed.
 
@@ -1267,6 +1293,7 @@ agent = create_mambo_agent(
 | `url` | `str` | for HTTP | Server URL (sse / streamable_http / websocket) |
 | `headers` | `dict` | ❌ | HTTP headers (HTTP mode) |
 | `timeout` | `float` | ❌ | HTTP timeout (seconds) |
+| `sse_read_timeout` | `float` | ❌ | SSE read timeout (seconds) |
 
 ### 12.x `exclude_tools` — Hiding Dangerous Tools
 
@@ -1290,14 +1317,14 @@ be discovered via ``mcp_get_tool_description`` and cannot be called via
 
 Control whether MCP tools are registered directly or behind the wrapper
 meta-tools.  The default threshold is **15**: when the total number of MCP
-tools across all servers is below this number, each tool is registered as
+tools across all servers does not exceed this number, each tool is registered as
 a first-class tool named ``server__tool``.  Above the threshold, the
 ``mcp_call_tool`` / ``mcp_get_tool_description`` wrapper is used instead.
 
 ```python
 mcp = MCPMiddleware(
     servers=[...],
-    direct_tool_threshold=10,  # 默认 15；设为 0 强制全部透传
+    direct_tool_threshold=10,  # default 15; set to 0 to force full wrapping
 )
 ```
 
@@ -1555,9 +1582,9 @@ agent = create_mambo_agent(
 agent = create_mambo_agent(
     "gpt-4o",
     backend=StoreBackend(initial_files={
-        "/app/main.py": "def main():\n    print('hello')",
-        "/app/config.yaml": "port: 8080\ndebug: true",
-        "/app/requirements.txt": "fastapi==0.100.0\nuvicorn==0.23.0",
+        "/workspace/app/main.py": "def main():\n    print('hello')",
+        "/workspace/app/config.yaml": "port: 8080\ndebug: true",
+        "/workspace/app/requirements.txt": "fastapi==0.100.0\nuvicorn==0.23.0",
     }),
 )
 ```

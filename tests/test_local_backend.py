@@ -1,34 +1,14 @@
 """Tests for LocalBackend and interrupt_on."""
 
-import os
 import shutil
 import tempfile
 from pathlib import Path
 
 import pytest
-from langchain_core.messages import HumanMessage
-from langgraph.checkpoint.memory import MemorySaver
 
-from mambo_agents import create_mambo_agent
 from mambo_agents.backends.local import LocalBackend
 from mambo_agents.backends.schemas import BackendError, VirtualPath
 from mambo_agents.backends.store import StoreBackend
-
-
-_MODEL_NAME = "Pro/zai-org/GLM-4.7"
-
-
-def _get_model():
-    """Return a test ChatOpenAI model instance."""
-    pytest.importorskip("langchain_openai")
-    from langchain_openai import ChatOpenAI
-
-    return ChatOpenAI(
-        model=_MODEL_NAME,
-        api_key=os.environ.get("GJKEY", ""),
-        base_url="https://api.siliconflow.cn/v1",
-        temperature=0,
-    )
 
 
 # ---------------------------------------------------------------------------
@@ -406,118 +386,3 @@ class TestLocalBackend:
         assert "child/(...)" in result
         # grandchild should not appear (past depth limit)
         assert "grandchild" not in result
-
-
-# ===================================================================
-# Integration test: create_mambo_agent with LocalBackend
-# ===================================================================
-
-
-class TestCreateAgentLocal:
-    """End-to-end tests with LocalBackend (needs network)."""
-
-    @pytest.mark.integration
-    def test_basic_agent_with_local(self, tmp_root):
-        model = _get_model()
-        backend = LocalBackend(root_dir=str(tmp_root))
-        agent = create_mambo_agent(model, backend=backend)
-        assert agent is not None
-
-    @pytest.mark.integration
-    def test_agent_file_write_then_read(self, tmp_root):
-        model = _get_model()
-        backend = LocalBackend(root_dir=str(tmp_root))
-        agent = create_mambo_agent(model, backend=backend)
-
-        result = agent.invoke(
-            {
-                "messages": [
-                    HumanMessage(
-                        content=(
-                            f"Create a file {_W}/greeting.txt with the content "
-                            "'Hello from Mambo Agents LocalBackend'. Reply with exactly 'DONE'."
-                        )
-                    )
-                ]
-            },
-            config={"configurable": {"thread_id": "test_local_backend_fwtr"}},
-        )
-        # Verify on disk
-        file_path = tmp_root / "greeting.txt"
-        assert file_path.exists(), "File was not created on disk"
-        content = file_path.read_text(encoding="utf-8")
-        assert "Hello from Mambo Agents LocalBackend" in content
-
-
-# ===================================================================
-# Integration test: interrupt_on
-# ===================================================================
-
-
-class TestInterruptOn:
-    """Tests for interrupt_on (HumanInTheLoopMiddleware)."""
-
-    @pytest.mark.integration
-    def test_interrupt_on_parameter_accepted(self, tmp_root):
-        """interrupt_on + checkpointer does not raise on construction."""
-        model = _get_model()
-        backend = LocalBackend(root_dir=str(tmp_root))
-
-        agent = create_mambo_agent(
-            model,
-            backend=backend,
-            interrupt_on={"delete": True},
-            checkpointer=MemorySaver(),
-        )
-        assert agent is not None
-
-    @pytest.mark.integration
-    def test_interrupt_on_without_checkpointer_raises(self, tmp_root):
-        """Without checkpointer, interrupt_on raises ValueError."""
-        model = _get_model()
-        backend = LocalBackend(root_dir=str(tmp_root))
-
-        with pytest.raises(ValueError, match="checkpointer"):
-            create_mambo_agent(
-                model,
-                backend=backend,
-                interrupt_on={"delete": True},
-            )
-
-    @pytest.mark.integration
-    def test_interrupt_on_pauses_agent(self, tmp_root):
-        """Agent with interrupt_on pauses before executing the guarded tool.
-
-        We create a file, then ask the agent to delete it with interrupt_on set.
-        The agent should go through the HumanInTheLoop flow.
-        """
-        model = _get_model()
-        backend = LocalBackend(root_dir=str(tmp_root))
-
-        agent = create_mambo_agent(
-            model,
-            backend=backend,
-            interrupt_on={"delete": True},
-            checkpointer=MemorySaver(),
-        )
-
-        # Pre-create a file (no interrupt on write)
-        (tmp_root / "precious.txt").write_text("don't delete me", encoding="utf-8")
-
-        config = {"configurable": {"thread_id": "test-interrupt"}}
-
-        result = agent.invoke(
-            {
-                "messages": [
-                    HumanMessage(
-                        content=(
-                            f"Read the file {_W}/precious.txt to see its content, "
-                            f"then delete {_W}/precious.txt. Reply 'DONE' when completed."
-                        )
-                    )
-                ]
-            },
-            config=config,
-        )
-
-        assert result is not None

@@ -148,8 +148,11 @@ class HybridWorkspaceBackend(BackendProtocol):
             ``/.mambo/`` StoreBackend; other keys create
             ``/.mambo/<name>/`` namespaces.  Each value is a
             :class:`BackendProtocol` (typically :class:`StoreBackend`).
-            Virtual backends see their workspace as rooted at ``"/"`` —
-            the ``/.mambo/<name>/`` prefix is stripped before delegation.
+            The ``/.mambo/<name>/`` prefix is stripped, then the path is
+            re-prefixed with the virtual backend's own ``workspace_root``
+            (``/workspace`` for ``StoreBackend``) before delegation — so
+            pre-populated ``initial_files`` keys must use that prefix to be
+            reachable through the router.
         mambo_prefix:
             Shared prefix for all virtual workspaces.  Default ``"/.mambo/"``.
         workspace_root:
@@ -820,6 +823,8 @@ class HybridWorkspaceBackend(BackendProtocol):
                     for m in result.matches
                 )
 
+        if all_matches:
+            all_matches.sort(key=lambda m: (str(m.path), m.line))
         return GrepResult(
             error=BackendError(
                 code=ErrorCode.INVALID,
@@ -913,6 +918,8 @@ class HybridWorkspaceBackend(BackendProtocol):
                     for m in result.matches
                 )
 
+        if all_matches:
+            all_matches.sort(key=lambda m: (str(m.path), m.line))
         return GrepResult(
             error=BackendError(
                 code=ErrorCode.INVALID,

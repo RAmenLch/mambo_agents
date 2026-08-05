@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "mambo-agents"
-version = "0.2.0b31"
+version = "0.2.0b32"
 description = "AI Agent framework on LangChain/LangGraph — multi-backend filesystem, sub-agent scheduling, conversation summarization, security review, and skills system out of the box."
 readme = "README.md"
 license = { file = "LICENSE" }
@@ -55,9 +55,6 @@ Issues = "https://github.com/RAmenLch/mambo_agents/issues"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/mambo_agents"]
-
-[project.scripts]
-mambo-chat = "mambo_agents.cli.chat:main"
 
 [tool.pytest.ini_options]
 markers = [

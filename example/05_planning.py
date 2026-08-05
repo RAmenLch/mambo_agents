@@ -78,7 +78,7 @@ def demo_stream_planning():
     """演示通过 stream_mode='updates' 观察 write_plans 工具调用和计划更新。
 
     stream_mode='updates' 按节点输出事件，每个节点完成后触发一次：
-    - 'agent' 节点：AIMessage（含 tool_calls，可看到 write_plans 被调用）
+    - 'model' 节点：AIMessage（含 tool_calls，可看到 write_plans 被调用）
     - 'tools' 节点：ToolMessage（含 write_plans 的返回值，即完整的计划列表）
     """
     print("=" * 60)
@@ -113,8 +113,8 @@ def demo_stream_planning():
     ):
         # event 是一个 dict，key 是节点名，value 是该节点的输出
         for node_name, node_output in event.items():
-            if node_name == "agent":
-                # agent 节点的输出包含 AIMessage
+            if node_name == "model":
+                # model 节点的输出包含 AIMessage
                 messages = node_output.get("messages", [])
                 for msg in messages:
                     if isinstance(msg, AIMessage):
@@ -122,7 +122,7 @@ def demo_stream_planning():
                         if msg.tool_calls:
                             for tc in msg.tool_calls:
                                 if tc["name"] == "write_plans":
-                                    print(f"\n🔧 [agent] 调用 write_plans 工具：")
+                                    print(f"\n🔧 [model] 调用 write_plans 工具：")
                                     # tc["args"] 包含 {"plans": [{"content": "...", "status": "..."}, ...]}
                                     args = tc["args"]
                                     if "plans" in args:
@@ -137,13 +137,13 @@ def demo_stream_planning():
                                                 f"{plan_item.get('content', '?')}"
                                             )
                                 else:
-                                    print(f"\n🔧 [agent] 调用工具：{tc['name']}")
+                                    print(f"\n🔧 [model] 调用工具：{tc['name']}")
                                     print(f"     args: {json.dumps(tc['args'], ensure_ascii=False)[:150]}")
                         else:
                             # 普通文本回复
                             content = msg.content
                             if isinstance(content, str) and content.strip():
-                                print(f"\n💬 [agent] {content[:150]}...")
+                                print(f"\n💬 [model] {content[:150]}...")
 
             elif node_name == "tools":
                 # tools 节点的输出包含 ToolMessage

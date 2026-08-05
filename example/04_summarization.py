@@ -201,10 +201,55 @@ def demo_stream_values_summarization():
                 print(f"  （本轮未触发新的摘要）")
 
 
+def demo_per_model_call_mode():
+    """演示 SummarizationMode.PER_MODEL_CALL - 每次模型调用前都检查摘要。
+
+    与默认的 PER_ASTREAM（每次执行前只摘要一次）不同，
+    PER_MODEL_CALL 在单次执行过程中多次调用模型时也会检查阈值，
+    适合单轮任务特别长、中间可能超窗的场景。
+    """
+    print("\n" + "=" * 60)
+    print("Part 4：SummarizationMode.PER_MODEL_CALL")
+    print("=" * 60)
+
+    model = ChatDeepSeek(model="deepseek-v4-flash")
+
+    agent = create_mambo_agent(
+        model,
+        summarization={
+            "mode": SummarizationMode.PER_MODEL_CALL,  # 每次模型调用前检查
+            "trigger": ("tokens", 500),
+            "keep": ("messages", 3),
+            "model": model,
+        },
+    )
+
+    config = {"configurable": {"thread_id": "per-model-call-demo"}}
+
+    topics = [
+        "什么是 Python 的 GIL？",
+        "GIL 对多线程性能有什么影响？",
+        "async/await 能绕开 GIL 吗？",
+    ]
+
+    for i, topic in enumerate(topics):
+        print(f"\n--- 第 {i + 1} 轮：{topic[:30]}... ---")
+        result = agent.invoke(
+            {"messages": [HumanMessage(topic)]},
+            config=config,
+        )
+        last_msg = result["messages"][-1]
+        print(f"[回复] {last_msg.content[:200]}...")
+
+    print("\n提示：与 Part 1-3（默认 PER_ASTREAM）对比——本模式在单次执行的")
+    print("多次模型调用之间也会触发摘要，适合长任务防超窗。")
+
+
 def main():
     demo_basic_summarization()
     demo_summarization_event()
     demo_stream_values_summarization()
+    demo_per_model_call_mode()
 
 
 if __name__ == "__main__":

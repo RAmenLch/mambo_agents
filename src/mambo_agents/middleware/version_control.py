@@ -207,9 +207,6 @@ class VersionControlConfig(BaseModel):
     falling back to a lazy ``InMemoryStore``.  Ignored when a
     :class:`VersionStore` is passed directly to :func:`create_mambo_agent`."""
 
-    auto_snapshot: bool = True
-    """When ``True`` (default), mutate-tool calls automatically trigger backups."""
-
     whitelist_folders: list[VirtualPath] = Field(default_factory=list)
     """Absolute virtual paths of folders to monitor in whitelist mode.
 
