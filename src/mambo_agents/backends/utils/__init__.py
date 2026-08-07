@@ -1,5 +1,6 @@
 """Shared helpers used across multiple backend implementations."""
 
+from mambo_agents.backends.utils._decode import decode_output
 from mambo_agents.backends.utils._format import (
     LINE_NUMBER_WIDTH,
     MAX_LINE_LENGTH,
@@ -25,6 +26,7 @@ __all__ = [
     "LINE_NUMBER_WIDTH",
     "MAX_LINE_LENGTH",
     "TreeEntry",
+    "decode_output",
     "check_path_allowed",
     "detect_trailing_newline_mismatch",
     "normalize_line_endings",

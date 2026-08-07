@@ -7,10 +7,40 @@ from mambo_agents.backends.schemas import human_size, VirtualPath
 from mambo_agents.backends.utils import (
     TreeEntry,
     check_path_allowed,
+    decode_output,
     detect_trailing_newline_mismatch,
     format_tree_entries,
     format_with_line_numbers,
 )
+
+
+# ============================================================================
+# decode_output
+# ============================================================================
+
+
+class TestDecodeOutput:
+    def test_utf8_bytes(self):
+        assert decode_output("你好世界".encode("utf-8")) == "你好世界"
+
+    def test_utf8_preferred_over_gbk_system(self, monkeypatch):
+        """UTF-8 字节流在 cp936 系统上必须按 UTF-8 解码(旧实现会解成乱码)。"""
+        monkeypatch.setattr("locale.getpreferredencoding", lambda *a, **k: "cp936")
+        assert decode_output("你好世界".encode("utf-8")) == "你好世界"
+
+    def test_gbk_bytes_falls_back_to_system_encoding(self, monkeypatch):
+        monkeypatch.setattr("locale.getpreferredencoding", lambda *a, **k: "cp936")
+        assert decode_output("你好世界".encode("gbk")) == "你好世界"
+
+    def test_crlf_normalized(self):
+        assert decode_output(b"a\r\nb\r\n") == "a\nb\n"
+
+    def test_empty_bytes(self):
+        assert decode_output(b"") == ""
+
+    def test_invalid_bytes_use_replacement(self, monkeypatch):
+        monkeypatch.setattr("locale.getpreferredencoding", lambda *a, **k: "ascii")
+        assert decode_output(b"\xff\xfe\xfd") == "\ufffd\ufffd\ufffd"
 
 
 # ============================================================================

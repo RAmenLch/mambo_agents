@@ -1,6 +1,7 @@
 """Tests for LocalBackend and interrupt_on."""
 
 import shutil
+import sys
 import tempfile
 from pathlib import Path
 
@@ -241,6 +242,14 @@ class TestLocalBackend:
         backend = LocalBackend(root_dir=str(tmp_root))
         r = backend.execute("nonexistent_command_xyz_12345")
         assert "Error" in r or "Exit code:" in r
+
+    def test_execute_utf8_output_on_gbk_system(self, tmp_root, monkeypatch):
+        """UTF-8 子进程输出在 cp936 系统上必须正确解码,而不是乱码。"""
+        backend = LocalBackend(root_dir=str(tmp_root))
+        monkeypatch.setattr("locale.getpreferredencoding", lambda *a, **k: "cp936")
+        code = "import sys; sys.stdout.buffer.write('你好世界 hello'.encode('utf-8'))"
+        r = backend.execute(f'"{sys.executable}" -c "{code}"')
+        assert "你好世界 hello" in r
 
     # ------------------------------------------------------------------
     # Tools property (extra tools only)

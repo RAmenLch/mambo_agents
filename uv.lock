@@ -747,7 +747,7 @@ wheels = [
 
 [[package]]
 name = "mambo-agents"
-version = "0.2.0b32"
+version = "0.2.0b33"
 source = { editable = "." }
 dependencies = [
     { name = "langchain" },

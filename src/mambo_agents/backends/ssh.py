@@ -46,6 +46,7 @@ from mambo_agents.backends.utils.multimodal import (
 from mambo_agents.backends.utils import (
     TreeEntry,
     check_path_allowed,
+    decode_output,
     normalize_line_endings,
     format_tree_entries,
     format_validation_error,
@@ -227,7 +228,7 @@ class SshBackend(BackendProtocol):
         remote_root = self._raw_remote_root
         if remote_root.startswith("~"):
             _, stdout, _ = client.exec_command("echo $HOME")
-            home = stdout.read().decode().strip()
+            home = decode_output(stdout.read()).strip()
             # Replace the leading ~ with $HOME
             remote_root = home + remote_root[1:]
 
@@ -393,8 +394,8 @@ class SshBackend(BackendProtocol):
                 # Give drain threads a brief window to collect partial data
                 out_thread.join(timeout=3)
                 err_thread.join(timeout=3)
-                partial_out = b"".join(out_chunks).decode(errors="replace")
-                partial_err = b"".join(err_chunks).decode(errors="replace")
+                partial_out = decode_output(b"".join(out_chunks))
+                partial_err = decode_output(b"".join(err_chunks))
                 hint = f"\n(stderr) {partial_err}" if partial_err.strip() else ""
                 return (partial_out, f"Timeout: command exceeded {t} seconds.{hint}", -1)
             except Exception as exc:
@@ -407,8 +408,8 @@ class SshBackend(BackendProtocol):
             if _timed_out.is_set():
                 out_thread.join(timeout=3)
                 err_thread.join(timeout=3)
-                partial_out = b"".join(out_chunks).decode(errors="replace")
-                partial_err = b"".join(err_chunks).decode(errors="replace")
+                partial_out = decode_output(b"".join(out_chunks))
+                partial_err = decode_output(b"".join(err_chunks))
                 hint = f"\n(stderr) {partial_err}" if partial_err.strip() else ""
                 return (partial_out, f"Timeout: command exceeded {t} seconds.{hint}", -1)
         finally:
@@ -417,8 +418,8 @@ class SshBackend(BackendProtocol):
         out_thread.join(timeout=5)
         err_thread.join(timeout=5)
 
-        out = b"".join(out_chunks).decode(errors="replace")
-        err = b"".join(err_chunks).decode(errors="replace")
+        out = decode_output(b"".join(out_chunks))
+        err = decode_output(b"".join(err_chunks))
         return out, err, exit_code
 
     # ------------------------------------------------------------------

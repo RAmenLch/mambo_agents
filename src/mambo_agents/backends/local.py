@@ -10,7 +10,6 @@ from __future__ import annotations
 import asyncio
 import base64
 import json
-import locale
 import os
 import re
 import shutil
@@ -47,6 +46,7 @@ from mambo_agents.backends.utils.multimodal import (
 from mambo_agents.backends.utils import (
     TreeEntry,
     check_path_allowed,
+    decode_output,
     detect_trailing_newline_mismatch,
     normalize_line_endings,
     fnmatch_path,
@@ -1036,22 +1036,13 @@ class LocalBackend(BackendProtocol):
                 shell=use_shell,
             )
 
-            # Auto-detect system encoding: locale encoding on Windows (cp936 for
-            # Chinese GBK, cp932 for Japanese, etc.), UTF-8 on Linux/macOS.
-            system_encoding = locale.getpreferredencoding(False)
-
-            def _decode(data: bytes) -> str:
-                try:
-                    text = data.decode(system_encoding)
-                except UnicodeDecodeError:
-                    text = data.decode("utf-8", errors="replace")
-                return text.replace("\r\n", "\n")
-
+            # Decode raw bytes with UTF-8 first (modern CLIs emit UTF-8;
+            # see decode_output for the full fallback strategy).
             output_parts: list[str] = []
             if result.stdout:
-                output_parts.append(_decode(result.stdout).rstrip())
+                output_parts.append(decode_output(result.stdout).rstrip())
             if result.stderr:
-                for line in _decode(result.stderr).strip().split("\n"):
+                for line in decode_output(result.stderr).strip().split("\n"):
                     output_parts.append(f"[stderr] {line}")
 
             if output_parts:
