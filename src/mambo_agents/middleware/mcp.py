@@ -92,6 +92,7 @@ import logging
 from collections.abc import Awaitable, Callable, Sequence
 from typing import Annotated, Any, Literal
 
+import httpx
 from langchain.agents.middleware.types import (
     AgentMiddleware,
     AgentState,
@@ -207,6 +208,23 @@ class MCPServerConfig(BaseModel):
         default=None,
         description="SSE read timeout in seconds.",
     )
+    proxy: str | None = Field(
+        default=None,
+        description=(
+            "Explicit HTTP proxy URL (e.g. 'http://user:pass@host:port') for "
+            "sse / streamable_http transports. Takes precedence over "
+            "environment proxies."
+        ),
+    )
+    enable_proxy: bool = Field(
+        default=True,
+        description=(
+            "Whether proxy usage is allowed. If False, environment and system "
+            "proxies are ignored and connections go direct. If True, uses "
+            "`proxy` when set, otherwise falls back to environment proxy "
+            "variables. Only applies to sse / streamable_http transports."
+        ),
+    )
 
     def to_connection(self) -> Connection:
         """Convert to a ``Connection`` dict for ``MultiServerMCPClient``."""
@@ -230,6 +248,22 @@ class MCPServerConfig(BaseModel):
                 conn["timeout"] = self.timeout
             if self.sse_read_timeout is not None:
                 conn["sse_read_timeout"] = self.sse_read_timeout
+
+            # Proxy handling for HTTP-based transports.  `websocket` does not
+            # go through httpx, so proxy settings do not apply to it.
+            if self.transport in ("sse", "streamable_http"):
+                if not self.enable_proxy:
+                    conn["httpx_client_factory"] = _make_httpx_client_factory(
+                        proxy=None,
+                        trust_env=False,
+                    )
+                elif self.proxy is not None:
+                    conn["httpx_client_factory"] = _make_httpx_client_factory(
+                        proxy=self.proxy,
+                        trust_env=False,
+                    )
+                # else: default factory (trust_env=True) — environment
+                # proxies apply.
 
         return conn  # type: ignore[return-value]
 
@@ -294,6 +328,47 @@ class _CallToolInput(BaseModel):
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
+
+def _make_httpx_client_factory(
+    proxy: str | None,
+    *,
+    trust_env: bool,
+) -> Callable[..., httpx.AsyncClient]:
+    """Build an ``httpx.AsyncClient`` factory for MCP HTTP transports.
+
+    Matches the ``McpHttpClientFactory`` protocol signature
+    ``(headers, timeout, auth) -> AsyncClient`` used by both
+    ``mcp.client.sse.sse_client`` and
+    ``mcp.client.streamable_http.streamable_http_client``.  Keeps MCP
+    defaults (``follow_redirects=True``, 30s/300s timeouts) identical to
+    ``mcp.shared._httpx_utils.create_mcp_http_client``.
+    """
+    from mcp.shared._httpx_utils import (
+        MCP_DEFAULT_SSE_READ_TIMEOUT,
+        MCP_DEFAULT_TIMEOUT,
+    )
+
+    def _factory(
+        headers: dict[str, str] | None = None,
+        timeout: httpx.Timeout | None = None,
+        auth: httpx.Auth | None = None,
+    ) -> httpx.AsyncClient:
+        if timeout is None:
+            timeout = httpx.Timeout(
+                MCP_DEFAULT_TIMEOUT,
+                read=MCP_DEFAULT_SSE_READ_TIMEOUT,
+            )
+        return httpx.AsyncClient(
+            proxy=proxy,
+            trust_env=trust_env,
+            follow_redirects=True,
+            headers=headers,
+            timeout=timeout,
+            auth=auth,
+        )
+
+    return _factory
 
 
 def _format_exception(exc: BaseException) -> str:
