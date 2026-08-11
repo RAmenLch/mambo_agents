@@ -602,6 +602,36 @@ class TestBeforeAgent:
         mw.before_agent(state={}, runtime=MagicMock())
         assert mw._current_parent_cp["__default__"] == "__initial__"
 
+    def test_before_agent_skips_reset_in_subagent_run(self, monkeypatch):
+        """Nested subagent runs (ls_agent_type set) share the parent session
+        — before_agent must NOT reset dedup state, parent checkpoint or locks."""
+        backend = _make_mock_backend()
+        store = VersionStore()
+
+        mw = VersionControlMiddleware(
+            store=store,
+            backend=backend,
+            whitelist_folders=[VirtualPath("/workspace")],
+        )
+
+        # Simulate state already recorded by the parent invoke
+        mw._current_parent_cp["t_sub"] = "cp_parent"
+        mw._backed_up["t_sub"] = {"a.py"}
+
+        configurable = {
+            "thread_id": "t_sub",
+            "ls_agent_type": "subagent",
+        }
+        cfg = _FakeConfig(thread_id="t_sub", configurable=configurable)
+        monkeypatch.setattr(
+            "mambo_agents.middleware.version_control.get_config",
+            lambda: cfg,
+        )
+        mw.before_agent(state={}, runtime=MagicMock())
+
+        assert mw._current_parent_cp["t_sub"] == "cp_parent"
+        assert mw._backed_up["t_sub"] == {"a.py"}
+
 
 # ============================================================================
 # Config models

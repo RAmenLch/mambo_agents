@@ -72,6 +72,7 @@ Usage::
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 from datetime import datetime, timezone
 from typing import Any, Literal
@@ -554,6 +555,8 @@ class VersionControlMiddleware(AgentMiddleware[_AgentState, ContextT, Any]):
         """{thread_id: parent_cp} — the checkpoint this invoke started from."""
         self._backed_up: dict[str, set[str]] = {}
         """{thread_id: {path_normalized...}} — already backed-up in this invoke."""
+        self._locks: dict[str, dict[str, asyncio.Lock]] = {}
+        """{thread_id: {path_normalized: Lock}} — serialise concurrent backups of the same path."""
 
     # ------------------------------------------------------------------
     # before_agent — record parent checkpoint
@@ -565,10 +568,19 @@ class VersionControlMiddleware(AgentMiddleware[_AgentState, ContextT, Any]):
         runtime: Any,
     ) -> dict[str, Any] | None:
         config = get_config()
+
+        # Nested subagent graphs (sync/async) share this middleware instance
+        # and run inside the parent invoke — they must NOT open a new backup
+        # session.  Skipping keeps the parent's dedup set, parent checkpoint
+        # and locks intact, so subagent edits join the same session.
+        if "ls_agent_type" in config.get("configurable", {}):
+            return None
+
         tid = self._resolve_thread_id(config)
 
         self._current_parent_cp[tid] = self._resolve_parent_checkpoint_id(config)
         self._backed_up[tid] = set()
+        self._locks.pop(tid, None)
 
         return None
 
@@ -681,32 +693,41 @@ class VersionControlMiddleware(AgentMiddleware[_AgentState, ContextT, Any]):
         if normalized in self._backed_up.get(tid, set()):
             return  # already backed up in this invoke
 
-        result = await self._backend.aread_raw(path, limit=None)
-        if result.error or result.content is None:
-            return
+        # Serialise concurrent backups of the same path: the second caller
+        # waits for the first to finish, then re-checks — skipping if the
+        # first succeeded, retrying if it failed.
+        async with self._locks.setdefault(tid, {}).setdefault(
+            normalized, asyncio.Lock()
+        ):
+            if normalized in self._backed_up.get(tid, set()):
+                return  # backed up while we were waiting for the lock
 
-        sha = hashlib.sha256(result.content.encode("utf-8")).hexdigest()
+            result = await self._backend.aread_raw(path, limit=None)
+            if result.error or result.content is None:
+                return
 
-        # blob + index — async durable persistence
-        await self._store.asave_blob(tid, sha, result.content)
-        cp = self._current_parent_cp.get(tid, "") or self._resolve_parent_checkpoint_id(get_config())
-        if cp:
-            self._current_parent_cp.setdefault(tid, cp)
-            await self._store.aadd_file_to_snapshot(tid, cp, normalized, sha)
+            sha = hashlib.sha256(result.content.encode("utf-8")).hexdigest()
 
-        self._backed_up.setdefault(tid, set()).add(normalized)
+            # blob + index — async durable persistence
+            await self._store.asave_blob(tid, sha, result.content)
+            cp = self._current_parent_cp.get(tid, "") or self._resolve_parent_checkpoint_id(get_config())
+            if cp:
+                self._current_parent_cp.setdefault(tid, cp)
+                await self._store.aadd_file_to_snapshot(tid, cp, normalized, sha)
 
-        # ── emit custom stream event ──
-        writer = get_stream_writer()
-        if writer is not None:
-            writer(
-                BackupEvent(
-                    thread_id=tid,
-                    checkpoint_id=cp,
-                    file_path=normalized,
-                    sha256=sha,
-                ).model_dump()
-            )
+            self._backed_up.setdefault(tid, set()).add(normalized)
+
+            # ── emit custom stream event ──
+            writer = get_stream_writer()
+            if writer is not None:
+                writer(
+                    BackupEvent(
+                        thread_id=tid,
+                        checkpoint_id=cp,
+                        file_path=normalized,
+                        sha256=sha,
+                    ).model_dump()
+                )
 
     # ------------------------------------------------------------------
     # Rollback execution
