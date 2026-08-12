@@ -1,7 +1,11 @@
 """Tests for SubAgentMiddleware and subagent support in create_mambo_agent."""
 
+from typing import ClassVar
+
 import pytest
-from langchain_core.messages import HumanMessage
+from langchain_core.language_models.chat_models import BaseChatModel
+from langchain_core.messages import AIMessage, HumanMessage
+from langchain_core.outputs import ChatGeneration, ChatResult
 from langchain_core.runnables import Runnable
 from langchain_core.tools import StructuredTool
 from langgraph.store.memory import InMemoryStore
@@ -9,8 +13,10 @@ from langgraph.store.memory import InMemoryStore
 from mambo_agents import (
     CompiledSubAgent,
     EventGranularity,
+    MamboPlanMiddleware,
     SubAgent,
     SubAgentMiddleware,
+    create_mambo_agent,
 )
 from mambo_agents.backends.store import StoreBackend
 from mambo_agents.middleware.subagents import (
@@ -269,3 +275,120 @@ class TestEventGranularityType:
         assert "updates" in valid
         assert "values" in valid
         assert len(valid) == 3
+
+
+# ---------------------------------------------------------------------------
+# Integration tests – plans state isolation (parent / subagent)
+# ---------------------------------------------------------------------------
+
+
+class _PlansParentModel(BaseChatModel):
+    """Round 1: parallel ``write_plans`` + ``task``; round 2: wrap up."""
+
+    calls: ClassVar[int] = 0
+
+    @property
+    def _llm_type(self) -> str:
+        return "fake"
+
+    def bind_tools(self, tools, **kwargs):
+        return self
+
+    def _generate(self, messages, stop=None, run_manager=None, **kwargs) -> ChatResult:
+        type(self).calls += 1
+        if self.calls == 1:
+            msg = AIMessage(
+                content="",
+                tool_calls=[
+                    {
+                        "name": "write_plans",
+                        "args": {
+                            "plans": [
+                                {"content": "parent task", "status": "pending"}
+                            ]
+                        },
+                        "id": "wp1",
+                        "type": "tool_call",
+                    },
+                    {
+                        "name": "task",
+                        "args": {
+                            "description": "sub work",
+                            "subagent_type": "sub",
+                        },
+                        "id": "task1",
+                        "type": "tool_call",
+                    },
+                ],
+            )
+        else:
+            msg = AIMessage(content="all done")
+        return ChatResult(generations=[ChatGeneration(message=msg)])
+
+
+class _PlansSubModel(BaseChatModel):
+    """Sub agent: writes its own plans, then finishes."""
+
+    calls: ClassVar[int] = 0
+
+    @property
+    def _llm_type(self) -> str:
+        return "fake"
+
+    def bind_tools(self, tools, **kwargs):
+        return self
+
+    def _generate(self, messages, stop=None, run_manager=None, **kwargs) -> ChatResult:
+        type(self).calls += 1
+        if self.calls == 1:
+            msg = AIMessage(
+                content="",
+                tool_calls=[
+                    {
+                        "name": "write_plans",
+                        "args": {
+                            "plans": [
+                                {"content": "sub task", "status": "pending"}
+                            ]
+                        },
+                        "id": "swp1",
+                        "type": "tool_call",
+                    }
+                ],
+            )
+        else:
+            msg = AIMessage(content="subagent finished")
+        return ChatResult(generations=[ChatGeneration(message=msg)])
+
+
+class TestPlansStateIsolation:
+    """Regression: parallel ``write_plans`` + ``task`` double-writes parent ``plans``.
+
+    The subagent's ``plans`` must never be forwarded into the parent graph —
+    otherwise the parent's ``plans`` channel receives two writes in one
+    super-step and ``apply_writes`` raises ``InvalidUpdateError``.
+    """
+
+    @pytest.mark.asyncio
+    async def test_parallel_write_plans_and_task_keeps_parent_plans(self):
+        _PlansParentModel.calls = 0
+        _PlansSubModel.calls = 0
+
+        sub_agent = create_mambo_agent(
+            _PlansSubModel(), middleware=[MamboPlanMiddleware()]
+        )
+        parent = create_mambo_agent(
+            _PlansParentModel(),
+            middleware=[MamboPlanMiddleware()],
+            subagents=[
+                CompiledSubAgent(name="sub", description="sub", runnable=sub_agent)
+            ],
+        )
+        final = await parent.ainvoke(
+            {"messages": [HumanMessage("delegate and plan")]},
+            {"configurable": {"thread_id": "t-sub"}},
+        )
+
+        plans = final.get("plans")
+        assert plans is not None
+        assert [p.content for p in plans] == ["parent task"]

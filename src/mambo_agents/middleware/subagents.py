@@ -114,6 +114,7 @@ EventGranularity = Literal["messages", "updates", "values"]
 _EXCLUDED_STATE_KEYS = {
     "messages",
     "todos",
+    "plans",
     "structured_response",
     "skills_metadata",
     "skills_load_errors",

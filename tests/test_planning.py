@@ -735,6 +735,64 @@ class TestPlanningStateSchema:
             list(result)
 
     # ------------------------------------------------------------------
+    # plans channel — last-wins reducer (parallel write robustness)
+    # ------------------------------------------------------------------
+
+    def test_plans_field_has_callable_reducer(self):
+        """``plans`` annotation must carry a callable reducer.
+
+        Regression test: ``plans`` previously carried only ``OmitFromInput``
+        metadata (an input filter, not a reducer), so LangGraph compiled it
+        as a ``LastValue`` channel that crashes on parallel writes
+        (``InvalidUpdateError: At key 'plans'``).
+        """
+        from mambo_agents.middleware.planning import PlanningState
+
+        hints = get_type_hints(PlanningState, include_extras=True)
+        assert "plans" in hints
+
+        plans_type = hints["plans"]
+        metadata = _get_annotated_metadata(plans_type)
+
+        assert any(callable(m) for m in metadata), (
+            "plans must have a callable reducer (last-wins), "
+            f"got metadata: {metadata}"
+        )
+
+    def test_plans_channel_accepts_parallel_writes(self):
+        """Two parallel writes to ``plans`` in one super-step must not crash.
+
+        Without the last-wins reducer the ``plans`` channel is ``LastValue``
+        and ``apply_writes`` raises ``InvalidUpdateError`` when two nodes
+        write ``plans`` concurrently.
+        """
+        from langgraph.graph import END, START, StateGraph
+
+        from mambo_agents.middleware.planning import Plan, PlanningState
+
+        plan_a = Plan(content="A", status="pending")
+        plan_b = Plan(content="B", status="pending")
+
+        def node_a(state):
+            return {"plans": [plan_a]}
+
+        def node_b(state):
+            return {"plans": [plan_b]}
+
+        graph = StateGraph(PlanningState)
+        graph.add_node("a", node_a)
+        graph.add_node("b", node_b)
+        graph.add_edge(START, "a")
+        graph.add_edge(START, "b")
+        graph.add_edge("a", END)
+        graph.add_edge("b", END)
+
+        app = graph.compile()
+        result = app.invoke({})
+
+        assert result["plans"] in ([plan_a], [plan_b])
+
+    # ------------------------------------------------------------------
     # Defensive unwrap in summarization middleware
     # ------------------------------------------------------------------
 

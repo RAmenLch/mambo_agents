@@ -70,6 +70,19 @@ class WritePlansInput(BaseModel):
 # ---------------------------------------------------------------------------
 
 
+def _last_wins(
+    a: list[Plan] | None,
+    b: list[Plan] | None,
+) -> list[Plan] | None:
+    """Last-write-wins reducer for the ``plans`` channel.
+
+    ``write_plans`` replaces the whole list, and a single super-step must
+    never crash when multiple writers (e.g. ``write_plans`` + subagent
+    state forwarding) both emit ``plans`` — the last applied update wins.
+    """
+    return b
+
+
 class PlanningState(AgentState):
     """State schema for the planning middleware.
 
@@ -78,7 +91,7 @@ class PlanningState(AgentState):
     ``write_plans`` tool.
     """
 
-    plans: Annotated[NotRequired[list[Plan]], OmitFromInput]
+    plans: Annotated[NotRequired[list[Plan]], OmitFromInput, _last_wins]
     """Structured task list written by the agent via ``write_plans``."""
 
 
