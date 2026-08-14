@@ -16,3 +16,7 @@ build/
 # IDE
 .idea/
 .vscode/
+
+# 工具目录
+.codebuddy/
+.jbeval/

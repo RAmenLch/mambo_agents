@@ -1,5 +1,6 @@
 """Mambo Agents - A more robust agent framework built on top of langchain."""
 
+from mambo_agents._version import __version__
 from mambo_agents.backends.protocol import BackendProtocol
 from mambo_agents.backends.readonly import ReadOnlyBackend
 from mambo_agents.backends.store import StoreBackend
@@ -67,6 +68,7 @@ __all__ = [
     "SummaryHook",
     "SummaryHookContext",
     "WritePlansInput",
+    "__version__",
     "create_mambo_agent",
     "create_review_agent",
     "run_review_sync",
