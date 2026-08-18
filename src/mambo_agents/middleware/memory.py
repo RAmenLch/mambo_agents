@@ -55,6 +55,7 @@ from langchain.agents.middleware.types import (
 )
 from langchain_core.messages import SystemMessage
 from langgraph.prebuilt import ToolRuntime
+from pydantic import BaseModel, ConfigDict, Field
 
 from mambo_agents.backends.protocol import BackendProtocol
 from mambo_agents.backends.schemas import ErrorCode, VirtualPath
@@ -82,6 +83,30 @@ Args:
 Returns:
     A formatted string to inject into the system prompt.
 """
+
+
+class MemoryConfig(BaseModel):
+    """Top-level configuration for memory via ``create_mambo_agent``.
+
+    Accepts either this config object or a plain ``list[VirtualPath]``
+    of source paths.  Fields that are ``None`` fall back to the
+    middleware defaults.
+    """
+
+    model_config = ConfigDict(frozen=True, arbitrary_types_allowed=True)
+
+    sources: list[VirtualPath] = Field(
+        default_factory=list,
+        description="AGENTS.md file paths to load as agent memory.",
+    )
+    format_prompt: MemoryFormatHook | None = Field(
+        default=None,
+        description=(
+            "Custom formatter for memory contents.  ``None`` uses the "
+            "built-in default formatting."
+        ),
+    )
+
 
 # ---------------------------------------------------------------------------
 # State

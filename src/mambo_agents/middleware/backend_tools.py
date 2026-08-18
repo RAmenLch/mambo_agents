@@ -244,6 +244,7 @@ _CORE_TOOLS = [
             "By default interprets pattern as a Python regex (supports |, .*, ^, $, character classes, etc.). "
             "Set regex=False for exact substring matching (literal mode). "
             "Use the glob parameter to filter by file path pattern (e.g., '*.py' for top-level only, '**/*.py' for recursive). "
+            "Brace expansion is NOT supported in glob: '{a,b}' is treated as literal characters and matches nothing — write separate globs or use '*'. "
             "Results are capped at 1000 matches. Use offset and limit for pagination."
         ),
         "method": "grep",
@@ -261,6 +262,7 @@ _CORE_TOOLS = [
         "description": (
             "Find files and directories matching a glob pattern. "
             "Supports wildcards: *, ** (recursive), ?, [...]. "
+            "Brace expansion is NOT supported: '{a,b}' is treated as literal characters and matches nothing — write separate patterns or use '*'. "
         ),
         "method": "glob",
         "fields": {

@@ -32,7 +32,11 @@ from mambo_agents.middleware.backend_tools import (
     BackendToolsMiddleware,
     build_tool_descriptions,
 )
-from mambo_agents.middleware.memory import MamboMemoryMiddleware
+from mambo_agents.middleware.memory import (
+    MamboMemoryMiddleware,
+    MemoryConfig,
+    MemoryFormatHook,
+)
 from mambo_agents.middleware.patch_tool_calls import PatchToolCallsMiddleware
 from mambo_agents.middleware.reorder_tool_messages import ReorderToolMessagesMiddleware
 from mambo_agents.middleware.security_review import (
@@ -43,11 +47,15 @@ from mambo_agents.middleware.skills import (
     SkillSource,
     SkillsMiddleware,
 )
-from mambo_agents.middleware.async_subagents import AsyncSubAgentMiddleware
+from mambo_agents.middleware.async_subagents import (
+    AsyncSubAgentConfig,
+    AsyncSubAgentMiddleware,
+)
 from mambo_agents.middleware.subagents import (
     CompiledSubAgent,
     EventGranularity,
     SubAgent,
+    SubAgentConfig,
     SubAgentMiddleware,
     DEFAULT_GENERAL_PURPOSE_DESCRIPTION,
     DEFAULT_SUBAGENT_PROMPT,
@@ -88,15 +96,16 @@ def create_mambo_agent(
     *,
     backend: BackendProtocol | None = None,
     system_prompt: str | None = None,
-    subagents: Sequence[SubAgent | CompiledSubAgent] | None = None,
+    subagents: SubAgentConfig | Sequence[SubAgent | CompiledSubAgent] | None = None,
     include_general_purpose: bool = False,
-    async_subagents: Sequence[SubAgent | CompiledSubAgent] | None = None,
+    async_subagents: AsyncSubAgentConfig | Sequence[SubAgent | CompiledSubAgent] | None = None,
     async_subagent_timeout: float = 3600.0,
     subagent_event_granularity: EventGranularity = "updates",
+    tool_token_limit_before_evict: int | None = None,
     middleware: Sequence[AgentMiddleware] | None = None,
     summarization: SummarizationConfig | None = None,
     skills: Sequence[SkillSource] | None = None,
-    memory_sources: list[VirtualPath] | None = None,
+    memory_sources: MemoryConfig | list[VirtualPath] | None = None,
     tools: Sequence[BaseTool] | None = None,
     interrupt_on: dict[str, bool | InterruptOnConfig] | None = None,
     security_review: SecurityReviewConfig | None = None,
@@ -112,22 +121,46 @@ def create_mambo_agent(
         model: Chat model (string name or ``BaseChatModel`` instance).
         backend: File-system backend.  Defaults to ``StoreBackend()``.
         system_prompt: Custom system prompt (replaces the default).
-        subagents: Optional subagent specs.  Each can be a ``SubAgent``
-            dict or a pre-compiled ``CompiledSubAgent``.
+        subagents: Optional subagent specs — either a ``SubAgentConfig``
+            or a plain ``Sequence[SubAgent | CompiledSubAgent]``.  Each
+            spec can be a ``SubAgent`` dict or a pre-compiled
+            ``CompiledSubAgent``.  A ``SubAgentConfig`` additionally
+            exposes ``include_general_purpose``, ``event_granularity``,
+            ``task_system_prompt`` and ``task_description`` (fields left
+            ``None`` fall back to the matching parameters below).
+
+            **Example**::
+
+                subagents=SubAgentConfig(
+                    subagents=[SubAgent(name="researcher", ...)],
+                    task_system_prompt="You are a focused research agent...",
+                )
+
+            Default: ``None`` (no subagents).
         include_general_purpose: If ``True``, automatically add a
             ``"general-purpose"`` subagent (with the same model, backend
             tools, and system prompt as the main agent).  Default:
-            ``False``.
-        async_subagents: Optional async subagent specs.  Each runs in a
+            ``False``.  Can also be set via ``SubAgentConfig``.
+        async_subagents: Optional async subagent specs — either an
+            ``AsyncSubAgentConfig`` or a plain
+            ``Sequence[SubAgent | CompiledSubAgent]``.  Each runs in a
             background thread — ``async_task()`` returns immediately with
             a ``task_id``, and results are retrieved later via
             ``async_status(task_id)``.  Subagents receive a
             ``report_progress`` tool for intermediate progress reporting.
+            An ``AsyncSubAgentConfig`` additionally exposes ``timeout``
+            and ``system_prompt`` (``None`` fields fall back to the
+            matching parameters below).
         async_subagent_timeout: Maximum seconds an async subagent may run
             before being force-cancelled.  Default: ``3600`` (1 hour).
         subagent_event_granularity: Streaming detail level for subagent custom
             events. ``"messages"`` (finest, token-level), ``"updates"``
             (default, per-node), ``"values"`` (coarsest, per-step).
+        tool_token_limit_before_evict: Max estimated tokens for a backend
+            tool result (e.g. ``read``) before it is truncated/evicted
+            from the LLM context.  ``None`` (default) keeps the built-in
+            limit (20,000 tokens).  Pass a custom ``int`` to raise or
+            lower the threshold.
         middleware: Additional middleware to include.
         summarization: Optional summarization configuration.
 
@@ -159,12 +192,13 @@ def create_mambo_agent(
                 ]
 
             Default: ``None`` (skills disabled).
-        memory_sources: Optional list of AGENTS.md file paths to load
-            as agent memory.  When provided, a ``MamboMemoryMiddleware``
-            is added that loads persistent context from these files and
-            injects it into the system prompt.  The agent is also
-            instructed to **write back** new learnings using the ``edit``
-            / ``write`` tools.
+        memory_sources: Optional memory configuration — either a
+            ``MemoryConfig`` or a plain list of AGENTS.md file paths to
+            load as agent memory.  When provided, a
+            ``MamboMemoryMiddleware`` is added that loads persistent
+            context from these files and injects it into the system
+            prompt.  The agent is also instructed to **write back** new
+            learnings using the ``edit`` / ``write`` tools.
 
             Unlike skills (on-demand), memory is always loaded and
             provides persistent, evolving context.
@@ -173,6 +207,11 @@ def create_mambo_agent(
 
                 from mambo_agents.backends.schemas import VirtualPath
                 memory_sources=[VirtualPath("/.mambo/memory/AGENTS.md")]
+                # or with a custom formatter:
+                memory_sources=MemoryConfig(
+                    sources=[VirtualPath("/.mambo/memory/AGENTS.md")],
+                    format_prompt=lambda contents: "\\n".join(contents.values()),
+                )
 
             Default: ``None`` (memory disabled).
         tools: Additional (non-file-system) tools.
@@ -307,10 +346,15 @@ def create_mambo_agent(
         backend = StoreBackend(store=store)
 
     # Build middleware stack
+    _backend_tools_kwargs: dict[str, Any] = {}
+    if tool_token_limit_before_evict is not None:
+        _backend_tools_kwargs["tool_token_limit_before_evict"] = tool_token_limit_before_evict
+
     mw: list[AgentMiddleware] = [
         BackendToolsMiddleware(
             backend=backend,
             custom_system_prompt=system_prompt or DEFAULT_SYSTEM_PROMPT,
+            **_backend_tools_kwargs,
         ),
     ]
 
@@ -325,10 +369,17 @@ def create_mambo_agent(
 
     # ---- Memory (opt-in) ---------------------------------------------------
     if memory_sources is not None:
+        if isinstance(memory_sources, MemoryConfig):
+            _memory_sources = memory_sources.sources
+            _memory_format_prompt = memory_sources.format_prompt
+        else:
+            _memory_sources = memory_sources
+            _memory_format_prompt = None
         mw.append(
             MamboMemoryMiddleware(
                 backend=backend,
-                sources=memory_sources,
+                sources=_memory_sources,
+                format_prompt=_memory_format_prompt,
             )
         )
 
@@ -460,6 +511,7 @@ def create_mambo_agent(
                 agent_tools=_agent_tools_whitelist,
                 tool_descriptions=_tool_descriptions,
                 backend_tool_names=_backend_tool_names,
+                description_prefix=security_review.description_prefix,
                 tool_unpackers=security_review.tool_unpackers,
             )
         else:
@@ -471,13 +523,32 @@ def create_mambo_agent(
             )
 
     # ---- Subagents ----------------------------------------------------------
-    inline_subagents = list(subagents or [])
+    if isinstance(subagents, SubAgentConfig):
+        inline_subagents = list(subagents.subagents or [])
+        _gp_enabled = (
+            subagents.include_general_purpose
+            if subagents.include_general_purpose is not None
+            else include_general_purpose
+        )
+        _subagent_granularity = (
+            subagents.event_granularity or subagent_event_granularity
+        )
+        _subagent_task_prompt = subagents.task_system_prompt
+        _subagent_task_description = subagents.task_description
+    else:
+        inline_subagents = list(subagents or [])
+        _gp_enabled = include_general_purpose
+        _subagent_granularity = subagent_event_granularity
+        _subagent_task_prompt = None
+        _subagent_task_description = None
 
-    if include_general_purpose and not any(
+    if _gp_enabled and not any(
         s.name == GENERAL_PURPOSE_NAME
         for s in inline_subagents
     ):
-        gp_middleware: list[AgentMiddleware] = [BackendToolsMiddleware(backend)]
+        gp_middleware: list[AgentMiddleware] = [
+            BackendToolsMiddleware(backend, **_backend_tools_kwargs)
+        ]
         if _security_review_middleware is not None:
             gp_middleware.append(_security_review_middleware)
         if _vc_middleware is not None:
@@ -494,21 +565,43 @@ def create_mambo_agent(
         inline_subagents.insert(0, gp_spec)
 
     if inline_subagents:
+        _subagent_mw_kwargs: dict[str, Any] = {}
+        if _subagent_task_prompt is not None:
+            _subagent_mw_kwargs["system_prompt"] = _subagent_task_prompt
+        if _subagent_task_description is not None:
+            _subagent_mw_kwargs["task_description"] = _subagent_task_description
         mw.append(
             SubAgentMiddleware(
                 backend=backend,
                 subagents=inline_subagents,
-                event_granularity=subagent_event_granularity,
+                event_granularity=_subagent_granularity,
+                **_subagent_mw_kwargs,
             )
         )
 
     # ---- Async Subagents (opt-in) -----------------------------------------
     if async_subagents is not None:
+        if isinstance(async_subagents, AsyncSubAgentConfig):
+            _async_list = list(async_subagents.async_subagents or [])
+            _async_timeout = (
+                async_subagents.timeout
+                if async_subagents.timeout is not None
+                else async_subagent_timeout
+            )
+            _async_system_prompt = async_subagents.system_prompt
+        else:
+            _async_list = list(async_subagents)
+            _async_timeout = async_subagent_timeout
+            _async_system_prompt = None
+        _async_mw_kwargs: dict[str, Any] = {}
+        if _async_system_prompt is not None:
+            _async_mw_kwargs["system_prompt"] = _async_system_prompt
         mw.append(
             AsyncSubAgentMiddleware(
                 backend=backend,
-                async_subagents=list(async_subagents),
-                default_timeout=async_subagent_timeout,
+                async_subagents=_async_list,
+                default_timeout=_async_timeout,
+                **_async_mw_kwargs,
             )
         )
 

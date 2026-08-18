@@ -163,6 +163,13 @@ class HybridWorkspaceBackend(BackendProtocol):
             before delegating — the two can differ freely.
         custom_description:
             Extra text appended to the system-prompt description.
+        max_grep_matches:
+            Max matches returned by a single ``grep`` call (default 1000).
+            Applied by the hybrid backend itself and forwarded to the
+            default ``/.mambo/`` ``StoreBackend``.
+        max_grep_match_chars:
+            Max characters per grep match line; longer lines are
+            truncated around the matched substring (default 500).
         store:
             LangGraph ``BaseStore`` instance forwarded to the default
             ``StoreBackend`` at ``/.mambo/``.  When omitted, the store is
@@ -182,6 +189,8 @@ class HybridWorkspaceBackend(BackendProtocol):
         *,
         workspace_root: VirtualPath = VirtualPath("/workspace"),
         max_read_chars: int = 100_000,
+        max_grep_matches: int = 1000,
+        max_grep_match_chars: int = 500,
         summarizer: "ReadSummarizer | None" = None,
         tool_timeouts: ToolTimeouts | None = None,
         store: "BaseStore | None" = None,
@@ -189,7 +198,13 @@ class HybridWorkspaceBackend(BackendProtocol):
         # Merge backend-specific defaults with user overrides (user wins).
         _user = tool_timeouts.model_dump() if tool_timeouts else {}
         _merged = ToolTimeouts(**{**self._BACKEND_DEFAULT_TIMEOUTS.model_dump(), **_user})
-        super().__init__(max_read_chars=max_read_chars, summarizer=summarizer, tool_timeouts=_merged)
+        super().__init__(
+            max_read_chars=max_read_chars,
+            max_grep_matches=max_grep_matches,
+            max_grep_match_chars=max_grep_match_chars,
+            summarizer=summarizer,
+            tool_timeouts=_merged,
+        )
 
         self.workspace_root = VirtualPath(workspace_root)
         self._real = real_backend
@@ -206,7 +221,8 @@ class HybridWorkspaceBackend(BackendProtocol):
             self._default_mambo = StoreBackend(
                 store=store,
                 max_read_chars=max_read_chars,
-                max_grep_matches=1000,
+                max_grep_matches=max_grep_matches,
+                max_grep_match_chars=max_grep_match_chars,
                 summarizer=summarizer, tool_timeouts=_merged,
             )
 

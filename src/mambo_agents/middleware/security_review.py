@@ -175,6 +175,14 @@ class SecurityReviewConfig(BaseModel):
             "without injecting messages into the LLM context."
         ),
     )
+    description_prefix: str | None = Field(
+        default=None,
+        description=(
+            "Prefix text shown in the interrupt description when a tool call "
+            "needs human approval.  ``None`` uses the built-in default "
+            "(\"Tool execution requires approval\")."
+        ),
+    )
     review_mode: Literal["llm", "agent"] = Field(
         default="llm",
         description=(
@@ -564,7 +572,7 @@ class AutoSecurityReviewMiddleware(
             elif tool_config.get("allowed_decisions"):
                 resolved[tool_name] = tool_config
         self._interrupt_on: dict[str, InterruptOnConfig] = resolved
-        self._description_prefix = description_prefix
+        self._description_prefix = description_prefix or "Tool execution requires approval"
 
         # ---------- review model ----------
         if isinstance(model, str):

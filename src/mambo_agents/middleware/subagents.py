@@ -107,6 +107,48 @@ EventGranularity = Literal["messages", "updates", "values"]
 """
 
 
+class SubAgentConfig(BaseModel):
+    """Top-level configuration for subagents via ``create_mambo_agent``.
+
+    Accepts either this config object or a plain
+    ``Sequence[SubAgent | CompiledSubAgent]``.  Fields that are ``None``
+    fall back to the corresponding ``create_mambo_agent`` parameters
+    (``include_general_purpose``, ``subagent_event_granularity``).
+    """
+
+    model_config = ConfigDict(frozen=True, arbitrary_types_allowed=True)
+
+    subagents: Sequence[SubAgent | CompiledSubAgent] | None = Field(
+        default=None,
+        description="Subagent specs (``SubAgent`` dicts or compiled runnables).",
+    )
+    include_general_purpose: bool | None = Field(
+        default=None,
+        description=(
+            "Whether to add the ``\"general-purpose\"`` subagent.  ``None`` "
+            "falls back to the ``include_general_purpose`` parameter."
+        ),
+    )
+    event_granularity: EventGranularity | None = Field(
+        default=None,
+        description=(
+            "Streaming detail level for subagent custom events.  ``None`` "
+            "falls back to ``subagent_event_granularity``."
+        ),
+    )
+    task_system_prompt: str | None = Field(
+        default=None,
+        description=(
+            "System prompt for the ``task`` tool.  ``None`` uses the "
+            "middleware default ``TASK_SYSTEM_PROMPT``."
+        ),
+    )
+    task_description: str | None = Field(
+        default=None,
+        description="Optional description appended to the ``task`` tool.",
+    )
+
+
 # ---------------------------------------------------------------------------
 # State keys excluded when passing / returning subagent state
 # ---------------------------------------------------------------------------

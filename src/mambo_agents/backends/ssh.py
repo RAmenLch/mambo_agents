@@ -953,7 +953,9 @@ class SshBackend(BackendProtocol):
                     m for m in raw.matches
                     if not _in_ignored_dir(m.path, self._ignore_dirs, wr)
                 ]
-            return self._apply_grep_limit(raw.matches or [], offset, limit, pattern=pattern, regex=regex)
+            matches = raw.matches or []
+            matches.sort(key=lambda m: (str(m.path), m.line))
+            return self._apply_grep_limit(matches, offset, limit, pattern=pattern, regex=regex)
 
     def _grep_raw(
         self,

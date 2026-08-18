@@ -160,6 +160,10 @@ class LocalBackend(BackendProtocol):
 
         self.workspace_root = VirtualPath(workspace_root)
         self._cwd = Path(root_dir).resolve() if root_dir else Path.cwd()
+        if os.name == "nt":
+            # Normalize once so downstream lexical comparisons (relative_to)
+            # never see the extended-length (\\\\?\\) form.
+            self._cwd = self._strip_win_extended_prefix(self._cwd)
         self._default_timeout = timeout
         self._max_output_bytes = max_output_bytes
         self._enable_execute = enable_execute
@@ -299,6 +303,26 @@ class LocalBackend(BackendProtocol):
     # Core file operations
     # ------------------------------------------------------------------
 
+    @staticmethod
+    def _strip_win_extended_prefix(p: Path) -> Path:
+        """Return *p* in ordinary Windows path form.
+
+        ``os.path.realpath`` on Windows obtains the canonical path via
+        ``GetFinalPathNameByHandleW``, which always returns an extended-length
+        form (``\\\\?\\C:\\...`` or ``\\\\?\\UNC\\server\\share\\...``) and
+        normally strips the prefix itself.  Under concurrent directory
+        creation it can fail to strip the prefix, leaving a path that is
+        physically identical but lexically different from the ordinary form.
+        Stripping the prefix is a pure form conversion — it never changes
+        what the path points to — and lets ``relative_to`` comparisons work.
+        """
+        s = str(p)
+        if s.startswith("\\\\?\\UNC\\"):
+            s = "\\\\" + s[len("\\\\?\\UNC\\"):]
+        elif s.startswith("\\\\?\\"):
+            s = s[len("\\\\?\\"):]
+        return Path(s)
+
     def _resolve(self, path: VirtualPath) -> Path:
         """Resolve a virtual absolute path to a real filesystem path under ``_cwd``.
 
@@ -326,6 +350,8 @@ class LocalBackend(BackendProtocol):
             return self._cwd
 
         resolved = (self._cwd / rel).resolve()
+        if os.name == "nt":
+            resolved = self._strip_win_extended_prefix(resolved)
 
         # Prevent symlink escape from _cwd
         try:
@@ -1128,6 +1154,8 @@ class LocalBackend(BackendProtocol):
                     resolved.parent.mkdir(parents=True, exist_ok=True)
                     resolved.write_bytes(raw_content)
                 results.append(UploadFileResult(path=path))
+            except BackendError as e:
+                results.append(UploadFileResult(path=path, error=e))
             except OSError as e:
                 results.append(UploadFileResult(path=path, error=BackendError(code=ErrorCode.IO_ERROR, path=path, message=str(e))))
             except Exception as e:

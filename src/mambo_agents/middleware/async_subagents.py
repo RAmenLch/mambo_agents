@@ -75,6 +75,38 @@ class AsyncTaskData(BaseModel):
     cancelled_at: str | None = Field(default=None)
 
 
+class AsyncSubAgentConfig(BaseModel):
+    """Top-level configuration for async subagents via ``create_mambo_agent``.
+
+    Accepts either this config object or a plain
+    ``Sequence[SubAgent | CompiledSubAgent]``.  Fields that are ``None``
+    fall back to the corresponding ``create_mambo_agent`` parameters
+    (``async_subagent_timeout``).
+    """
+
+    model_config = ConfigDict(frozen=True, arbitrary_types_allowed=True)
+
+    async_subagents: Sequence[SubAgent | CompiledSubAgent] | None = Field(
+        default=None,
+        description="Async subagent specs.",
+    )
+    timeout: float | None = Field(
+        default=None,
+        description=(
+            "Maximum seconds an async subagent may run before being "
+            "force-cancelled.  ``None`` falls back to "
+            "``async_subagent_timeout``."
+        ),
+    )
+    system_prompt: str | None = Field(
+        default=None,
+        description=(
+            "System prompt for the async task tools.  ``None`` uses the "
+            "middleware default ``ASYNC_TASK_SYSTEM_PROMPT``."
+        ),
+    )
+
+
 # ---- Tool input schemas --------------------------------------------------
 
 

@@ -1,6 +1,7 @@
 """Middleware for Mambo Agents."""
 
 from mambo_agents.middleware.async_subagents import (
+    AsyncSubAgentConfig,
     AsyncSubAgentMiddleware,
     AsyncTaskData,
 )
@@ -12,6 +13,7 @@ from mambo_agents.middleware.mcp import (
 )
 from mambo_agents.middleware.memory import (
     MamboMemoryMiddleware,
+    MemoryConfig,
     MemoryFormatHook,
 )
 from mambo_agents.middleware.patch_tool_calls import PatchToolCallsMiddleware
@@ -41,6 +43,7 @@ from mambo_agents.middleware.subagents import (
     CompiledSubAgent,
     EventGranularity,
     SubAgent,
+    SubAgentConfig,
     SubAgentMiddleware,
 )
 from mambo_agents.middleware.summarization import (
@@ -63,6 +66,7 @@ from mambo_agents.middleware.version_control import (
 )
 
 __all__ = [
+    "AsyncSubAgentConfig",
     "AsyncSubAgentMiddleware",
     "AsyncTaskData",
     "AutoSecurityReviewMiddleware",
@@ -80,6 +84,7 @@ __all__ = [
     "MCPServerConfig",
     "mcp_tool_name",
     "MamboSummarizationMiddleware",
+    "MemoryConfig",
     "MemoryFormatHook",
     "PatchToolCallsMiddleware",
     "Plan",
@@ -91,6 +96,7 @@ __all__ = [
     "SkillsMiddleware",
     "Snapshot",
     "SubAgent",
+    "SubAgentConfig",
     "SubAgentMiddleware",
     "SummarizationConfig",
     "SummarizationMode",
