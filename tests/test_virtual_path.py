@@ -95,6 +95,19 @@ class TestVirtualPathRejection:
         with pytest.raises((BackendError, TypeError), match="Expected str or VirtualPath"):
             VirtualPath(123)  # type: ignore[arg-type]
 
+    def test_extra_fields_rejected_positional(self):
+        """Stray kwargs (e.g. limit/offset) alongside a path must fail loudly."""
+        with pytest.raises(ValidationError, match="does not accept extra fields"):
+            VirtualPath("/workspace/x", limit=8, offset=269)  # type: ignore[call-arg]
+
+    def test_extra_fields_rejected_keyword(self):
+        with pytest.raises(ValidationError, match="does not accept extra fields"):
+            VirtualPath(value="/workspace/x", limit=8)  # type: ignore[call-arg]
+
+    def test_extra_fields_rejected_reports_names(self):
+        with pytest.raises(ValidationError, match="limit, offset"):
+            VirtualPath(value="/workspace/x", limit=8, offset=269)  # type: ignore[call-arg]
+
 
 # ============================================================================
 # Business methods
@@ -257,6 +270,14 @@ class TestPydanticCoercion:
         schema = self.MySchema(file_path=vp, path=vp)
         assert schema.file_path == vp
         assert schema.file_path.value == "/workspace/file.txt"
+
+    def test_extra_fields_inside_file_path_dict_rejected(self):
+        """A dict for the VirtualPath field must not smuggle limit/offset."""
+        with pytest.raises(ValidationError, match="does not accept extra fields"):
+            self.MySchema(
+                file_path={"value": "/workspace/file.txt", "limit": 8, "offset": 269},
+                path="/workspace/subdir",
+            )
 
 
 # ============================================================================

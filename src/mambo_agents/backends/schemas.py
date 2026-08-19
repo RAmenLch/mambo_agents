@@ -122,7 +122,11 @@ class VirtualPath(BaseModel):
         normalized: Same path guaranteed without trailing slash.
     """
 
-    model_config = {"frozen": True}
+    # ``extra="forbid"`` ensures stray keyword arguments (e.g. ``limit`` /
+    # ``offset`` mistakenly passed alongside ``value``) fail loudly instead of
+    # being silently ignored — which previously caused read/write to run with
+    # default arguments after the extra fields vanished.
+    model_config = ConfigDict(frozen=True, extra="forbid")
 
     value: str = Field(
         default="",
@@ -156,6 +160,16 @@ class VirtualPath(BaseModel):
             return {"value": _normalize_path_str(data)}
         if isinstance(data, dict):
             # Keyword construction: VirtualPath(value="/path")
+            # Reject any stray keys — only ``value`` is allowed.  Silently
+            # dropping extras (the default pydantic behaviour combined with
+            # this validator) let caller errors like ``limit`` / ``offset``
+            # sneak through and degrade tool calls to their defaults.
+            extras = [k for k in data if k != "value"]
+            if extras:
+                raise ValueError(
+                    f"VirtualPath does not accept extra fields: {', '.join(map(str, extras))}. "
+                    f"Only 'value' is allowed (got keys: {', '.join(map(str, data))})."
+                )
             v = data.get("value", None)
             if v is None:
                 raise ValueError("VirtualPath requires a 'value' field")
