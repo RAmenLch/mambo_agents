@@ -37,7 +37,7 @@ from mambo_agents.backends.utils.multimodal import (
     get_mime_type,
     validate_multimodal_content,
 )
-from mambo_agents.backends.schemas import BackendError, ErrorCode, VirtualPath, human_size
+from mambo_agents.backends.schemas import BackendError, ErrorCode, VirtualPath, VirtualPathArg, human_size
 from mambo_agents.backends.utils import (
     TreeEntry,
     detect_trailing_newline_mismatch,
@@ -341,7 +341,7 @@ class StoreBackend(BackendProtocol):
                 ),
                 args_schema=create_model(
                     "TreeSchema",
-                    path=(VirtualPath, Field(description="Root directory to display")),
+                    path=(VirtualPathArg, Field(description="Root directory to display")),
                     depth=(int, Field(default=3, description="Maximum recursion depth")),
                 ),
                 func=lambda **kwargs: self.tree(**kwargs),

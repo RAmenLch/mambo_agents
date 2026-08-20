@@ -9,9 +9,9 @@ from __future__ import annotations
 
 from collections.abc import Callable
 from enum import Enum
-from typing import Literal, Self
+from typing import Annotated, Literal, Self
 
-from pydantic import BaseModel, ConfigDict, Field, model_serializer, model_validator
+from pydantic import BaseModel, ConfigDict, Field, WithJsonSchema, model_serializer, model_validator
 
 
 # ============================================================================
@@ -276,6 +276,28 @@ class VirtualPath(BaseModel):
             # "/workspace" → parent would be "/" → return self
             return self
         return VirtualPath(parent_str)
+
+
+VirtualPathArg = Annotated[
+    VirtualPath,
+    WithJsonSchema(
+        {
+            "type": "string",
+            "description": (
+                "Absolute virtual path, e.g. /workspace/src. "
+                "Pass a plain string — not an object."
+            ),
+        }
+    ),
+]
+"""Tool-argument type for ``VirtualPath`` fields exposed to LLMs.
+
+``VirtualPath`` is a Pydantic model, so using it directly as a tool
+argument type makes the JSON schema sent to the LLM describe ``path``
+as an object (``{"value": "..."}``), which confuses weaker models and
+produces malformed tool-call arguments.  This alias keeps the runtime
+validation (``str`` → ``VirtualPath`` coercion) while presenting the
+field as a plain ``string`` in the tool schema."""
 
 
 # ============================================================================

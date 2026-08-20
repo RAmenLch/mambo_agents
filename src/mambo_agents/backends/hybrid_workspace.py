@@ -49,7 +49,7 @@ from mambo_agents.backends.protocol import (
     UploadFileResult,
     WriteResult,
 )
-from mambo_agents.backends.schemas import BackendError, ErrorCode, ReversePathFn, check_no_path_traversal, GrepMatch, VirtualPath
+from mambo_agents.backends.schemas import BackendError, ErrorCode, ReversePathFn, check_no_path_traversal, GrepMatch, VirtualPath, VirtualPathArg
 from mambo_agents.backends.store import StoreBackend
 
 # ---------------------------------------------------------------------------
@@ -263,8 +263,8 @@ class HybridWorkspaceBackend(BackendProtocol):
                 ),
                 args_schema=create_model(
                     "CopySchema",
-                    source=(VirtualPath, Field(description="Absolute source file path")),
-                    destination=(VirtualPath, Field(description="Absolute destination file path")),
+                    source=(VirtualPathArg, Field(description="Absolute source file path")),
+                    destination=(VirtualPathArg, Field(description="Absolute destination file path")),
                 ),
                 func=self._safe_tool_func("copy", self.copy),
                 coroutine=self._safe_tool_coroutine("copy", self.acopy),

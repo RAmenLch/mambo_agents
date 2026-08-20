@@ -52,7 +52,7 @@ from mambo_agents.backends.utils import (
     format_validation_error,
     format_with_line_numbers,
 )
-from mambo_agents.backends.schemas import BackendError, DeleteResult, ErrorCode, VirtualPath, human_size
+from mambo_agents.backends.schemas import BackendError, DeleteResult, ErrorCode, VirtualPath, VirtualPathArg, human_size
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -438,7 +438,7 @@ class SshBackend(BackendProtocol):
                 ),
                 args_schema=create_model(
                     "TreeSchema",
-                    path=(VirtualPath, Field(default=VirtualPath(wr), description="Root directory to display")),
+                    path=(VirtualPathArg, Field(default=VirtualPath(wr), description="Root directory to display")),
                     depth=(int, Field(default=3, description="Maximum recursion depth")),
                 ),
                 func=self._safe_tool_func("tree", self.tree),
@@ -454,7 +454,7 @@ class SshBackend(BackendProtocol):
                 ),
                 args_schema=create_model(
                     "DeleteSchema",
-                    path=(VirtualPath, Field(description="Absolute file path to delete")),
+                    path=(VirtualPathArg, Field(description="Absolute file path to delete")),
                 ),
                 func=self._safe_tool_func("delete", self.delete),
                 coroutine=self._safe_tool_coroutine("delete", self.adelete),
