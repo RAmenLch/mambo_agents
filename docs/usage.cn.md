@@ -22,7 +22,8 @@
     - [安全审查集成](#12x-安全审查集成)
     - [`mcp_tool_name()` 参考](#12x-mcp_tool_name-参考)
 13. [多 Agent 协作](#13-多-agent-协作)
-14. [高级用法](#14-高级用法)
+14. [目标驱动循环](#14-目标驱动循环)
+15. [高级用法](#15-高级用法)
 
 ---
 
@@ -1507,9 +1508,99 @@ result = agent.invoke(
 
 ---
 
-## 14. 高级用法
+## 14. 目标驱动循环
 
-### 14.1 自定义系统提示词
+**目标驱动循环**（Goal Loop）强制 Agent 循环持续工作，直到目标达成、完成条件满足或轮数预算耗尽。没有它，LLM 可能在任务未完成时只跑一轮就停止。通过给 `create_mambo_agent()` 传入 `goal_loop=GoalLoopConfig(...)` 启用。
+
+两种形态共用同一个 `GoalLoopMiddleware` 核心：
+
+| 模式 | 控制方 | 注册的工具 | 典型场景 |
+|------|--------|------------|----------|
+| `"preset"` | 用户控制 | 仅 `get_goal` | 强制 LLM 在收尾前必须完成某事 —— 例如「最少调用一次 `show`」 |
+| `"llm"`（默认） | LLM 控制 | `create_goal` / `update_goal` / `get_goal` | LLM 自主创建并一路干到底的长程任务 |
+
+**工作原理：** 每轮结束后，中间件的 `after_agent` 钩子检查目标状态。只要目标仍是 `active` 且退出条件未满足，它就会向最后一条 AI 消息**原地注入**一个合成的 `get_goal()` 工具调用，并通过 `jump_to="tools"` 把图路由回工具循环。模型读取目标、当前轮数与指示后继续工作。循环在目标满足 / 完成 / 阻塞，或轮数耗尽（状态 `timeout`）时结束。
+
+### 14.1 preset 模式 —— 用户控制
+
+目标由配置预设（`objective`），完成与否由 `conditions` 回调判定。只注册 `get_goal`，预设目标在首轮自动注入：
+
+```python
+from mambo_agents import create_mambo_agent
+from mambo_agents.middleware import GoalLoopConfig, tool_called_at_least
+
+agent = create_mambo_agent(
+    model,
+    tools=[show_tool],
+    goal_loop=GoalLoopConfig(
+        mode="preset",
+        objective="必须调用 show 工具向用户展示工作成果",
+        conditions=[tool_called_at_least("show", 1)],
+        max_rounds=4,  # 最多到达 after_agent 4 次（即最多强制续跑 3 次）
+    ),
+)
+```
+
+- `conditions` 为 OR 语义 —— 任一条件满足即结束循环；为空列表时只有轮数耗尽才结束。
+- `tool_called_at_least(name, times=1, args_subset=None)` 统计当前轮窗口内**模型主动**调用 `name` 的次数（自动注入的 `get_goal` 永远不会满足条件）。它的动态进度会出现在 `get_goal` 返回中，例如 `工具 "show" 已调用 0/1 次(未满足)`。
+- **轮数按「用户消息窗口」计数**：只有最近一条 `HumanMessage` 之后自动注入的 `get_goal` 才计入 `max_rounds`。新用户消息会自然重置下一轮的预算。
+
+### 14.2 llm 模式 —— LLM 自主长程任务
+
+LLM 用 `create_goal` 自主创建目标，并一路驱动到完成。三个工具全部注册：
+
+```python
+agent = create_mambo_agent(
+    model,
+    goal_loop=GoalLoopConfig(
+        mode="llm",   # 注册 create_goal / update_goal / get_goal
+        max_rounds=3, # 最高轮数上限（create_goal 的轮数上限不超过此值）
+    ),
+)
+```
+
+典型生命周期：
+
+1. `create_goal(objective, max_goal_rounds=None)` —— 进入长程模式，轮数上限不超过中间件 `max_rounds`。简单任务（< 3 步）不要创建目标。
+2. 每轮结束系统自动注入 `get_goal`，返回目标、当前轮数与指示 —— 模型继续工作。
+3. `update_goal(goal_id, revision, action, ...)` 结束或调整循环：
+   - `action="complete"` —— 声明完成，循环结束，模型给出收尾总结（只基于会话中实际验证过的事实）。
+   - `action="blocked"` —— 声明阻塞，`blocked_reason` 必填，且需先工作满 `blocked_threshold` 轮（默认 3）才被接受，随后循环终止。
+   - `action="edit"` —— 就地修改 `objective` 或 `max_goal_rounds`。
+   - **先读后写保护：** 必须传入 `get_goal` 返回的精确 `goal_id` 与 `revision`，不匹配的写入会被拒绝并返回错误。
+4. 若 `rounds >= max_rounds` 仍未完成，目标被标记为 `timeout`，系统会要求模型总结进展与未完成部分。
+
+### 14.3 配置参考与结果读取
+
+`GoalLoopConfig` 参数：
+
+| 参数 | 默认值 | 说明 |
+|------|--------|------|
+| `mode` | `"llm"` | `"preset"`（需 `objective` + `conditions`）或 `"llm"` |
+| `max_rounds` | `256` | 轮数预算（`after_agent` 访问次数），耗尽后强制停止循环 |
+| `objective` | `None` | 预设目标 —— preset 模式必填，llm 模式禁用 |
+| `conditions` | `None` | 完成条件（仅 preset 模式，OR 语义） |
+| `blocked_threshold` | `3` | 声明一次 `blocked` 前必须工作满的轮数（仅 llm 模式） |
+| `tool_prefix` | `""` | 目标工具名的可选前缀，避免与用户工具冲突 |
+| `system_prompt` | `None` | 自定义系统提示词（`None` = 按模式使用内置，`""` = 禁用注入） |
+
+目标状态通过 `result.get("goal")` 从 invoke 结果读取：
+
+```python
+goal = result.get("goal")
+# {id, objective, status: "active"|"complete"|"blocked"|"timeout",
+#  rounds, max_rounds, revision, blocked_reason, created_by: "preset"|"llm"}
+```
+
+`goal` 通道完全由中间件（`GoalLoopState`）管理，并排除在用户输入之外 —— 调用方无需也不应通过 `.invoke()` 传入。
+
+> **完整可运行示例：** `python example/18_goal_loop.py` 同时演示两种形态，并打印完整执行时间线，自动注入的 `get_goal` 标记为 `[自动注入]`、模型主动的标记为 `[模型主动]`。
+
+---
+
+## 15. 高级用法
+
+### 15.1 自定义系统提示词
 
 ```python
 agent = create_mambo_agent(
@@ -1524,7 +1615,7 @@ agent = create_mambo_agent(
 )
 ```
 
-### 14.2 添加自定义工具
+### 15.2 添加自定义工具
 
 ```python
 from langchain_core.tools import tool
@@ -1540,7 +1631,7 @@ agent = create_mambo_agent(
 )
 ```
 
-### 14.3 预填充文件
+### 15.3 预填充文件
 
 ```python
 agent = create_mambo_agent(
@@ -1553,7 +1644,7 @@ agent = create_mambo_agent(
 )
 ```
 
-### 14.4 自定义摘要配置
+### 15.4 自定义摘要配置
 
 ```python
 agent = create_mambo_agent(
@@ -1569,7 +1660,7 @@ agent = create_mambo_agent(
 )
 ```
 
-### 14.5 检查点持久化
+### 15.5 检查点持久化
 
 ```python
 from langgraph.checkpoint.sqlite import SqliteSaver
@@ -1580,7 +1671,7 @@ agent = create_mambo_agent(
 )
 ```
 
-### 14.6 技能 + 子代理组合
+### 15.6 技能 + 子代理组合
 
 ```python
 from mambo_agents.middleware.subagents import SubAgent
@@ -1606,7 +1697,7 @@ agent = create_mambo_agent(
 )
 ```
 
-### 14.7 版本控制 + 记忆 + HITL 组合
+### 15.7 版本控制 + 记忆 + HITL 组合
 
 ```python
 from mambo_agents.backends.schemas import VirtualPath

@@ -6,6 +6,14 @@ from mambo_agents.middleware.async_subagents import (
     AsyncTaskData,
 )
 from mambo_agents.middleware.backend_tools import BackendToolsMiddleware
+from mambo_agents.middleware.goal_loop import (
+    Condition,
+    GoalLoopConfig,
+    GoalLoopMiddleware,
+    GoalLoopState,
+    GoalState,
+    tool_called_at_least,
+)
 from mambo_agents.middleware.mcp import (
     MCPMiddleware,
     MCPServerConfig,
@@ -78,6 +86,11 @@ __all__ = [
     "DEFAULT_SECURITY_REVIEW_SYSTEM_PROMPT",
     "EventGranularity",
     "FinalReviewResult",
+    "GoalLoopConfig",
+    "GoalLoopMiddleware",
+    "GoalLoopState",
+    "GoalState",
+    "Condition",
     "MamboMemoryMiddleware",
     "MamboPlanMiddleware",
     "MCPMiddleware",

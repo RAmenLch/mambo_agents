@@ -161,6 +161,7 @@ _EXCLUDED_STATE_KEYS = {
     "skills_metadata",
     "skills_load_errors",
     "memory_contents",
+    "goal",
 }
 
 

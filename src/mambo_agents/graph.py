@@ -38,6 +38,7 @@ from mambo_agents.middleware.memory import (
     MemoryFormatHook,
 )
 from mambo_agents.middleware.patch_tool_calls import PatchToolCallsMiddleware
+from mambo_agents.middleware.goal_loop import GoalLoopConfig, GoalLoopMiddleware
 from mambo_agents.middleware.reorder_tool_messages import ReorderToolMessagesMiddleware
 from mambo_agents.middleware.security_review import (
     AutoSecurityReviewMiddleware,
@@ -106,6 +107,7 @@ def create_mambo_agent(
     summarization: SummarizationConfig | None = None,
     skills: Sequence[SkillSource] | None = None,
     memory_sources: MemoryConfig | list[VirtualPath] | None = None,
+    goal_loop: GoalLoopConfig | None = None,
     tools: Sequence[BaseTool] | None = None,
     interrupt_on: dict[str, bool | InterruptOnConfig] | None = None,
     security_review: SecurityReviewConfig | None = None,
@@ -214,6 +216,41 @@ def create_mambo_agent(
                 )
 
             Default: ``None`` (memory disabled).
+        goal_loop: Optional goal-driven loop control configuration.
+
+            When provided, a ``GoalLoopMiddleware`` is added that forces
+            the agent loop to continue from ``after_agent`` until a goal
+            is satisfied, a completion condition is met, or the round
+            budget (``max_rounds``) is exhausted.
+
+            Two modes:
+
+            - **Preset** (``mode="preset"`` + ``objective`` +
+              ``conditions``): only ``get_goal`` is registered; the loop
+              repeats until the conditions (e.g. "call ``show`` at least
+              once") are met.
+            - **LLM** (``mode="llm"``, default): ``create_goal`` /
+              ``update_goal`` / ``get_goal`` are registered and the LLM
+              autonomously drives a long-running goal to completion.
+
+            **Example** (preset — force at least one ``show`` call)::
+
+                from mambo_agents.middleware import (
+                    GoalLoopConfig, tool_called_at_least,
+                )
+
+                goal_loop=GoalLoopConfig(
+                    mode="preset",
+                    objective="必须调用 show 工具展示工作成果",
+                    conditions=[tool_called_at_least("show", 1)],
+                    max_rounds=3,
+                )
+
+            **Example** (LLM — autonomous long-running task)::
+
+                goal_loop=GoalLoopConfig(max_rounds=64)
+
+            Default: ``None`` (goal loop disabled).
         tools: Additional (non-file-system) tools.
         interrupt_on: Mapping of ``tool_name → bool or InterruptOnConfig``.
             When set, adds human-in-the-loop so that calls to the specified
@@ -450,6 +487,10 @@ def create_mambo_agent(
 
     if middleware:
         mw.extend(middleware)
+
+    # ---- Goal-driven loop control (opt-in) -------------------------------
+    if goal_loop is not None:
+        mw.append(goal_loop.build_middleware())
 
     # ---- Default checkpointer (always on) ----------------------------------
     # Without a checkpointer, LangGraph state (files, plans, messages, etc.)

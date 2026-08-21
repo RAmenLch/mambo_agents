@@ -22,7 +22,8 @@
     - [Security Review Integration](#12x-security-review-integration)
     - [`mcp_tool_name()` Reference](#12x-mcp_tool_name-reference)
 13. [Multi-Agent Collaboration](#13-multi-agent-collaboration)
-14. [Advanced Usage](#14-advanced-usage)
+14. [Goal-Driven Loop Control](#14-goal-driven-loop-control)
+15. [Advanced Usage](#15-advanced-usage)
 
 ---
 
@@ -1543,9 +1544,99 @@ whose threads have been lost, marking them as `crashed`. The agent can then deci
 
 ---
 
-## 14. Advanced Usage
+## 14. Goal-Driven Loop Control
 
-### 14.1 Custom System Prompt
+**Goal-driven loop control** forces the agent loop to keep working until a goal is satisfied, a completion condition is met, or the round budget is exhausted. Without it, an LLM may stop after a single turn even when the task is unfinished. Enable it by passing `goal_loop=GoalLoopConfig(...)` to `create_mambo_agent()`.
+
+Two modes share the same `GoalLoopMiddleware` core:
+
+| Mode | Control | Registered tools | Typical use |
+|------|---------|------------------|-------------|
+| `"preset"` | User-controlled | `get_goal` only | Force the LLM to do something before finishing — e.g. "must call `show` at least once" |
+| `"llm"` (default) | LLM-controlled | `create_goal` / `update_goal` / `get_goal` | Long-running tasks the LLM creates itself and drives to completion |
+
+**How it works:** after every turn, the middleware's `after_agent` hook inspects the goal state. While the goal is `active` and no exit condition is met, it injects a synthetic `get_goal()` tool call into the last AI message and routes the graph back into the tool loop (`jump_to="tools"`). The model reads the goal, the current round and the instructions, then keeps working. The loop ends when the goal is satisfied / completed / blocked, or when the round budget runs out (status `timeout`).
+
+### 14.1 Preset Mode — User-controlled
+
+The goal is preset in the config (`objective`); completion is decided by `conditions` callbacks. Only `get_goal` is registered, and the preset goal is injected on the first turn:
+
+```python
+from mambo_agents import create_mambo_agent
+from mambo_agents.middleware import GoalLoopConfig, tool_called_at_least
+
+agent = create_mambo_agent(
+    model,
+    tools=[show_tool],
+    goal_loop=GoalLoopConfig(
+        mode="preset",
+        objective="必须调用 show 工具向用户展示工作成果",
+        conditions=[tool_called_at_least("show", 1)],
+        max_rounds=4,  # at most 4 after_agent visits → at most 3 forced continuations
+    ),
+)
+```
+
+- `conditions` are OR-ed — any satisfied condition ends the loop. An empty list ends only when the round budget is exhausted.
+- `tool_called_at_least(name, times=1, args_subset=None)` counts **model-initiated** calls of `name` in the current turn window; injected `get_goal` calls never satisfy a condition. Its dynamic progress is reported inside `get_goal` results, e.g. `工具 "show" 已调用 0/1 次(未满足)`.
+- **Rounds are counted per user-turn window**: only injected `get_goal` calls after the latest `HumanMessage` count toward `max_rounds`. A new user message naturally resets the budget for the next turn.
+
+### 14.2 LLM Mode — Autonomous Long-running Tasks
+
+The LLM autonomously creates a goal with `create_goal` and drives it to completion. All three tools are registered:
+
+```python
+agent = create_mambo_agent(
+    model,
+    goal_loop=GoalLoopConfig(
+        mode="llm",    # registers create_goal / update_goal / get_goal
+        max_rounds=3,  # hard cap; create_goal's own round number never exceeds this
+    ),
+)
+```
+
+Typical lifecycle:
+
+1. `create_goal(objective, max_goal_rounds=None)` — enter long-run mode. The round number never exceeds the middleware `max_rounds`. Simple tasks (< 3 steps) should not create a goal.
+2. At the end of every round the system auto-injects `get_goal`, which returns the goal, the current round and instructions — the model keeps working.
+3. `update_goal(goal_id, revision, action, ...)` ends or adjusts the loop:
+   - `action="complete"` — declare completion; the loop ends and the model gives a wrap-up summary based only on facts verified in the session.
+   - `action="blocked"` — declare blockage; `blocked_reason` is required, and it is accepted only after the model has worked at least `blocked_threshold` rounds (default 3). The loop then ends.
+   - `action="edit"` — modify `objective` or `max_goal_rounds` in place.
+   - **Read-then-write guard:** you must pass the exact `goal_id` and `revision` returned by `get_goal`; mismatched writes are rejected with an error.
+4. If `rounds >= max_rounds` without completion, the goal is marked `timeout` and the model is asked to summarize progress and the unfinished parts.
+
+### 14.3 Config Reference & Result
+
+`GoalLoopConfig` parameters:
+
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| `mode` | `"llm"` | `"preset"` (requires `objective` + `conditions`) or `"llm"` |
+| `max_rounds` | `256` | Round budget (number of `after_agent` visits) before the loop is force-stopped |
+| `objective` | `None` | Preset objective — required in preset mode, forbidden in llm mode |
+| `conditions` | `None` | Completion conditions (preset mode only, OR semantics) |
+| `blocked_threshold` | `3` | Worked rounds required before one `blocked` declaration is accepted (llm mode only) |
+| `tool_prefix` | `""` | Optional prefix for goal tool names, to avoid collisions |
+| `system_prompt` | `None` | Custom system prompt (`None` = built-in per mode, `""` = disable injection) |
+
+The goal state is exposed on the invoke result via `result.get("goal")`:
+
+```python
+goal = result.get("goal")
+# {id, objective, status: "active"|"complete"|"blocked"|"timeout",
+#  rounds, max_rounds, revision, blocked_reason, created_by: "preset"|"llm"}
+```
+
+The `goal` channel is managed entirely by the middleware (`GoalLoopState`) and excluded from user input — callers never pass it via `.invoke()`.
+
+> **Full runnable demo:** `python example/18_goal_loop.py` shows both modes and prints the complete execution timeline, marking middleware-injected `get_goal` calls as `[自动注入]` and model-initiated ones as `[模型主动]`.
+
+---
+
+## 15. Advanced Usage
+
+### 15.1 Custom System Prompt
 
 ```python
 agent = create_mambo_agent(
@@ -1560,7 +1651,7 @@ agent = create_mambo_agent(
 )
 ```
 
-### 14.2 Adding Custom Tools
+### 15.2 Adding Custom Tools
 
 ```python
 from langchain_core.tools import tool
@@ -1576,7 +1667,7 @@ agent = create_mambo_agent(
 )
 ```
 
-### 14.3 Pre-populated Files
+### 15.3 Pre-populated Files
 
 ```python
 agent = create_mambo_agent(
@@ -1589,7 +1680,7 @@ agent = create_mambo_agent(
 )
 ```
 
-### 14.4 Custom Summarization Config
+### 15.4 Custom Summarization Config
 
 ```python
 agent = create_mambo_agent(
@@ -1605,7 +1696,7 @@ agent = create_mambo_agent(
 )
 ```
 
-### 14.5 Checkpoint Persistence
+### 15.5 Checkpoint Persistence
 
 ```python
 from langgraph.checkpoint.sqlite import SqliteSaver
@@ -1616,7 +1707,7 @@ agent = create_mambo_agent(
 )
 ```
 
-### 14.6 Skills + Sub-agents Combined
+### 15.6 Skills + Sub-agents Combined
 
 ```python
 from mambo_agents.middleware.subagents import SubAgent
@@ -1642,7 +1733,7 @@ agent = create_mambo_agent(
 )
 ```
 
-### 14.7 Version Control + Memory + HITL Combined
+### 15.7 Version Control + Memory + HITL Combined
 
 ```python
 from mambo_agents.backends.schemas import VirtualPath

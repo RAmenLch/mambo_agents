@@ -19,6 +19,7 @@
 - **[File Change History & Rollback](docs/usage.md#11-file-change-history--rollback)** — checkpoint-level incremental snapshots, manual rollback
 - **[Integrating External MCP Tools](docs/usage.md#12-integrating-external-mcp-tools)** — disclosure-based design, on-demand lookup
 - **[Multi-Agent Collaboration](docs/usage.md#13-multi-agent-collaboration)** — sync/async sub-agents, parallel scheduling, isolated context windows
+- **[Goal-Driven Loop Control](docs/usage.md#14-goal-driven-loop-control)** — preset goals with completion conditions, or LLM-autonomous long-running tasks with auto-continuation
 ## Quick Start
 
 ```bash
