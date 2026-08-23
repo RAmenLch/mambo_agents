@@ -654,6 +654,36 @@ class TestGetGoalTool:
         assert "第 3/5 轮" in payload["message"]
         assert "update_goal" in payload["message"]
 
+    def test_marks_injected_vs_active_call_source(self):
+        """返回中明确标注调用来源:系统注入 vs 模型主动。"""
+        mw = GoalLoopMiddleware(
+            mode="preset",
+            objective="必须调用 show 工具",
+            conditions=[tool_called_at_least("show", 1)],
+            max_rounds=3,
+        )
+        get_goal = mw.tools[0]
+        state = {
+            "goal": _preset_goal(),
+            "messages": [
+                HumanMessage(content="hi"),
+                AIMessage(
+                    content="",
+                    tool_calls=[{"name": "get_goal", "args": {}, "id": f"{_INJECT_PREFIX}a"}],
+                ),
+            ],
+        }
+        # 注入调用(id 带前缀)标注「系统注入·自动续跑」,并点明"已结束本轮生成"
+        cmd = get_goal.func(tool_call_id=f"{_INJECT_PREFIX}abc", state=state)
+        msg = json.loads(cmd.update["messages"][0].content)["message"]
+        assert "【系统注入·自动续跑】" in msg
+        assert "结束本轮生成" in msg
+        # 主动调用(id 无前缀)标注「主动查询」,澄清不会推进轮次
+        cmd = get_goal.func(tool_call_id="model-1", state=state)
+        msg = json.loads(cmd.update["messages"][0].content)["message"]
+        assert "【主动查询】" in msg
+        assert "不会推进轮次" in msg
+
 
 class TestCreateGoalTool:
     def test_creates_goal(self):

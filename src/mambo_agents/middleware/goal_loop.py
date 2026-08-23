@@ -72,9 +72,15 @@ _INJECT_PREFIX = "goal-loop-"
 _PRESET_GOAL_ID = "preset-goal"
 
 #: Tool description for get_goal (both modes).
-GET_GOAL_TOOL_DESCRIPTION = """读取当前循环目标与进度。
+GET_GOAL_TOOL_DESCRIPTION = """读取当前循环目标与进度(只读查询,不推进轮次)。
 
-每轮结束时系统可能自动调用本工具来驱动你继续工作;你也可以主动调用它查看当前目标、轮数与完成条件。"""
+每轮结束(即你结束本次生成、停止输出时),若目标尚未达成,系统会向你自动注入一个
+本工具的调用(返回标注「系统注入·自动续跑」)来驱动你继续工作——这是唯一的续跑
+机制,你无需也不应通过主动调用本工具来"进入下一轮"。
+
+你也可以主动调用它查看当前目标、轮数与完成条件(返回标注「主动查询」,不会推进
+轮次、不会结束循环)。LLM 模式下,调用 update_goal 前必须先调用本工具获取精确的
+goal_id 与 revision。"""
 
 #: Tool description for create_goal (LLM-controlled mode only).
 CREATE_GOAL_TOOL_DESCRIPTION = """创建长程任务目标,进入自动续跑模式。
@@ -100,7 +106,10 @@ _PRESET_SYSTEM_PROMPT = """## 预设目标
 
 本次会话存在一个预设目标,通过 `get_goal` 查看详情。
 
-每轮结束后,如果目标尚未达成,系统会强制你继续工作(自动注入 `get_goal` 调用)。
+每轮结束(即你结束本次生成、停止输出时),如果目标尚未达成,系统会强制你继续工作:
+自动向你注入一个 `get_goal` 调用(返回标注「系统注入·自动续跑」),你读取目标与轮数后
+继续工作。你主动调用 `get_goal` 只是只读查询,不会推进轮次、不会触发续跑。
+
 请持续工作直到完成条件满足——条件满足后循环会自动结束,无需你额外操作。"""
 
 #: System prompt appended to the model call in LLM-controlled mode.
@@ -108,7 +117,9 @@ _LLM_SYSTEM_PROMPT = """## 长程任务模式
 
 你可以在任务复杂、需要多轮持续工作时调用 `create_goal` 创建目标,进入自动续跑模式:
 
-- 创建后,每轮结束系统会自动让你继续(自动注入 `get_goal` 调用,返回目标与轮数);
+- 创建后,每轮结束(即你结束本次生成、停止输出时)系统会自动让你继续:
+  自动注入 `get_goal` 调用(返回标注「系统注入·自动续跑」),返回目标与轮数;
+- 你主动调用 `get_goal` 只是只读查询,不会推进轮次、不会触发续跑;
 - 全部完成后,先调用 `get_goal` 获取精确的 goal_id / revision,再调用
   `update_goal(action='complete')` 声明完成并结束循环;
 - 工作满 3 轮(默认,可配置)后仍无法推进时,调用
@@ -468,6 +479,9 @@ class GoalLoopMiddleware(AgentMiddleware[GoalLoopState, ContextT, Any]):
         def _get_goal(tool_call_id: str, state: dict[str, Any]) -> Command:
             goal = state.get("goal")
             messages = state.get("messages") or []
+            # 区分调用来源:系统自动注入(id 带 _INJECT_PREFIX)还是模型主动调用,
+            # 用于在返回中明确标注,避免模型把"主动查询"误认为"进入下一轮"。
+            injected_call = str(tool_call_id).startswith(_INJECT_PREFIX)
             if goal is None:
                 payload = {
                     "goal": None,
@@ -493,7 +507,15 @@ class GoalLoopMiddleware(AgentMiddleware[GoalLoopState, ContextT, Any]):
                     if self._conditions
                     else False
                 )
-                goal_out = dict(goal)
+                # 精简输出:通道中 id/status/rounds/revision/blocked_reason
+                # 对 preset 恒为固定值或默认值(preset 无 update_goal,状态从不
+                # 变化),且 rounds 恒 0 会误导;只保留动态与必要字段。
+                goal_out: dict[str, Any] = {
+                    "objective": goal["objective"],
+                    "max_rounds": goal["max_rounds"],
+                    "current_round": rounds,
+                    "created_by": goal["created_by"],
+                }
                 if self._conditions:
                     goal_out["objective"] = (
                         f"{self._objective}"
@@ -514,10 +536,22 @@ class GoalLoopMiddleware(AgentMiddleware[GoalLoopState, ContextT, Any]):
                 progress_body = "\n".join(
                     f"  - {line}" for line in progress_lines
                 ) or "  (无附加条件,达到轮数上限后自动结束)"
+                if injected_call:
+                    source = (
+                        "【系统注入·自动续跑】你已结束本轮生成,目标尚未达成,系统"
+                        "自动注入本调用驱动你继续工作。\n"
+                    )
+                else:
+                    source = (
+                        "【主动查询】本调用为只读查询,不会推进轮次、不会结束循环、"
+                        "不会触发续跑;请继续完成当前轮工作,系统会在你结束生成时"
+                        "自动续跑。\n"
+                    )
                 payload = {
                     "goal": goal_out,
                     "message": (
-                        f"【预设目标·第 {rounds}/{self._max_rounds} 轮】\n"
+                        f"{source}"
+                        f"【预设目标·第 {goal_out['current_round']}/{self._max_rounds} 轮】\n"
                         f"目标: {goal_out['objective']}\n"
                         f"条件进度:\n{progress_body}\n"
                         "提示: 以当前工作区与工具结果为准,早前叙述可能已过时,"
@@ -535,9 +569,21 @@ class GoalLoopMiddleware(AgentMiddleware[GoalLoopState, ContextT, Any]):
                     if rounds >= max_rounds
                     else ""
                 )
+                if injected_call:
+                    source = (
+                        "【系统注入·自动续跑】你已结束本轮生成,目标尚未达成,系统"
+                        "自动注入本调用驱动你继续工作。\n"
+                    )
+                else:
+                    source = (
+                        "【主动查询】本调用为只读查询,不会推进轮次、不会结束循环、"
+                        "不会触发续跑;请继续完成当前轮工作,系统会在你结束生成(不调用任何工具,包括 get_goal)时"
+                        "自动续跑。\n"
+                    )
                 payload = {
                     "goal": goal,
                     "message": (
+                        f"{source}"
                         f"【目标循环·第 {rounds}/{max_rounds} 轮】\n"
                         f"目标: {goal['objective']}\n"
                         "指令: 请继续执行。以当前工作区与工具结果为准,行动前先检查"
