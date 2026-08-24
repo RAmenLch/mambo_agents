@@ -33,6 +33,7 @@ from mambo_agents.backends.protocol import (
     GrepMatch,
     GrepResult,
     LsResult,
+    MultimodalDescriber,
     ReadResult,
     ReadSummarizer,
     ToolTimeouts,
@@ -136,6 +137,7 @@ class LocalBackend(BackendProtocol):
         max_grep_matches: int = 1000,
         max_grep_match_chars: int = 500,
         summarizer: "ReadSummarizer | None" = None,
+        multimodal_describer: "MultimodalDescriber | None" = None,
         tool_timeouts: ToolTimeouts | None = None,
     ) -> None:
         # Merge backend-specific timeout defaults with user overrides.
@@ -146,6 +148,7 @@ class LocalBackend(BackendProtocol):
             max_grep_matches=max_grep_matches,
             max_grep_match_chars=max_grep_match_chars,
             summarizer=summarizer,
+            multimodal_describer=multimodal_describer,
             tool_timeouts=_merged,
         )
         if timeout <= 0:

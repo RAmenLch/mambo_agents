@@ -42,6 +42,7 @@ from mambo_agents.backends.protocol import (
     GlobResult,
     GrepResult,
     LsResult,
+    MultimodalDescriber,
     ReadResult,
     ReadSummarizer,
     Result,
@@ -192,6 +193,7 @@ class HybridWorkspaceBackend(BackendProtocol):
         max_grep_matches: int = 1000,
         max_grep_match_chars: int = 500,
         summarizer: "ReadSummarizer | None" = None,
+        multimodal_describer: "MultimodalDescriber | None" = None,
         tool_timeouts: ToolTimeouts | None = None,
         store: "BaseStore | None" = None,
     ) -> None:
@@ -203,6 +205,7 @@ class HybridWorkspaceBackend(BackendProtocol):
             max_grep_matches=max_grep_matches,
             max_grep_match_chars=max_grep_match_chars,
             summarizer=summarizer,
+            multimodal_describer=multimodal_describer,
             tool_timeouts=_merged,
         )
 
@@ -223,7 +226,7 @@ class HybridWorkspaceBackend(BackendProtocol):
                 max_read_chars=max_read_chars,
                 max_grep_matches=max_grep_matches,
                 max_grep_match_chars=max_grep_match_chars,
-                summarizer=summarizer, tool_timeouts=_merged,
+                summarizer=summarizer, multimodal_describer=multimodal_describer, tool_timeouts=_merged,
             )
 
         # Remaining entries → /.mambo/<name>/ namespaces
@@ -568,6 +571,7 @@ class HybridWorkspaceBackend(BackendProtocol):
         except BackendError as e:
             return ReadResult(error=e)
         result = target.read(p, offset, limit, include_line_numbers)
+        result = self._maybe_describe(result, file_path)
         return result.apply_reverse_translation(
             self._reverse_path, target.workspace_root, self._get_virtual_prefix(file_path),
         )

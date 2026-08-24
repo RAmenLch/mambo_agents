@@ -518,7 +518,8 @@ def build_tool_descriptions(
 
     # Core tools
     for spec in _CORE_TOOLS:
-        descriptions[spec["name"]] = spec["description"]
+        name = str(spec["name"])
+        descriptions[name] = spec["description"]
 
     # Extra tools from backend
     for tool in backend.tools:

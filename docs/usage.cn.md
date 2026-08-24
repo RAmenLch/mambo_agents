@@ -515,7 +515,35 @@ backend = LocalBackend(summarizer=composite_summarizer([
 ]))
 ```
 
-### 5.8 后端对比
+### 5.8 多模态文件描述器（MultimodalDescriber）
+
+`read()` 对图片、视频、音频和文档（PDF / PPT / PPTX）会生成原始的 base64 多模态内容块，纯文本模型无法直接理解。
+0.4.0 新增的 `multimodal_describers` 子包提供了可插拔的 `MultimodalDescriber` 回调，用纯文本替换多模态内容块——
+既可以由多模态模型生成自然语言描述，也可以返回明确的拒绝提示。
+
+通过任意后端的 `multimodal_describer` 构造参数配置（与 `summarizer` 用法一致）：
+
+```python
+from mambo_agents.multimodal_describers import multimodal_describer
+from mambo_agents.backends.local import LocalBackend
+from langchain_openai import ChatOpenAI
+
+vision = ChatOpenAI(model="gpt-4o")
+backend = LocalBackend(multimodal_describer=multimodal_describer(vision))
+```
+
+子包内置以下工厂函数：
+
+| 工厂函数 | 行为 |
+|---------|------|
+| `multimodal_describer(model)` | 通过多模态聊天模型描述图片 / 视频 / 音频 / 文档 |
+| `image_describer(model)` / `video_describer(model)` / `audio_describer(model)` / `document_describer(model)` | 按类型定制的便捷工厂（其他类型直接放行） |
+| `reject_multimodal_describer(allow=...)` | 对非文本文件返回错误文本，可通过 `allow` 指定放行的块类型 |
+| `composite_multimodal_describer([...])` | 按顺序依次尝试多个描述器（取第一个非 `None` 且非空的结果） |
+
+描述器**不会默认注入** — 用户按需选择。返回 `None` 表示“不属于我处理的类型”，保持原始多模态结果不变。
+
+### 5.9 后端对比
 
 | 特性 | StoreBackend | LocalBackend | SshBackend | HybridWorkspaceBackend |
 |------|:---:|:---:|:---:|:---:|

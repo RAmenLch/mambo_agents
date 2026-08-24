@@ -54,6 +54,7 @@ class ReadOnlyBackend(BackendProtocol):
         super().__init__(
             max_read_chars=backend._max_read_chars,
             summarizer=backend._summarizer,
+            multimodal_describer=getattr(backend, "_multimodal_describer", None),
             tool_timeouts=backend._tool_timeouts,
         )
         self._backend = backend

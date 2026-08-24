@@ -26,6 +26,7 @@ from mambo_agents.backends.protocol import (
     GrepMatch,
     GrepResult,
     LsResult,
+    MultimodalDescriber,
     ReadResult,
     ReadSummarizer,
     ToolTimeouts,
@@ -87,6 +88,7 @@ class StoreBackend(BackendProtocol):
         max_grep_matches: int = 1000,
         max_grep_match_chars: int = 500,
         summarizer: "ReadSummarizer | None" = None,
+        multimodal_describer: "MultimodalDescriber | None" = None,
         tool_timeouts: ToolTimeouts | None = None,
     ) -> None:
         super().__init__(
@@ -94,6 +96,7 @@ class StoreBackend(BackendProtocol):
             max_grep_matches=max_grep_matches,
             max_grep_match_chars=max_grep_match_chars,
             summarizer=summarizer,
+            multimodal_describer=multimodal_describer,
             tool_timeouts=tool_timeouts,
         )
         self._thread_id = thread_id
@@ -699,7 +702,9 @@ class StoreBackend(BackendProtocol):
             ))
         result = await self.aread_raw(file_path, offset, limit, include_line_numbers)
         result = self._apply_read_limit(result, file_path)
-        return validate_multimodal_content(result, file_path)
+        result = validate_multimodal_content(result, file_path)
+        result = self._maybe_describe(result, file_path)
+        return result
 
     async def awrite(
         self, file_path: VirtualPath, content: str, overwrite: bool = False,
