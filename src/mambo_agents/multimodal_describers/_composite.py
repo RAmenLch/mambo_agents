@@ -25,20 +25,31 @@ def composite_multimodal_describer(
     Each describer is called with the same ``(file_path, base64_content,
     mime_type)`` arguments.  The first describer that does not raise, does
     not return ``None``, and yields a non-empty, non-fallback description
-    wins.  If all fail, *fallback* is returned.
+    wins.
+
+    If **every** describer returns ``None`` (all opted out — "not my type"),
+    the composite returns ``None`` as well so the caller passes the
+    multimodal result through unchanged.  ``fallback`` is only returned when
+    at least one describer actually attempted to describe the file but
+    failed (raised, or yielded an empty / ``DESCRIBE_FAILED`` result).
     """
 
-    def _describe(file_path: VirtualPath, base64_content: str, mime_type: str) -> str:
+    def _describe(
+        file_path: VirtualPath, base64_content: str, mime_type: str,
+    ) -> str | None:
+        attempted = False
         for describer in describers:
             try:
                 desc = describer(file_path, base64_content, mime_type)
             except Exception:
+                attempted = True
                 continue
             if desc is None:
                 continue
             desc = desc.strip()
             if desc and desc != DESCRIBE_FAILED:
                 return desc
-        return fallback
+            attempted = True
+        return fallback if attempted else None
 
     return _describe

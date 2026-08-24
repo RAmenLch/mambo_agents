@@ -1,5 +1,10 @@
 """Mambo Agents - A more robust agent framework built on top of langchain."""
 
+# Apply runtime compatibility patches first (e.g. extend LangGraph's
+# TOOL_MESSAGE_BLOCK_TYPES with "audio"/"video" so multimodal blocks are
+# not stringified by ToolNode).  Must run before any tool execution.
+from mambo_agents import _compat  # noqa: F401
+
 from mambo_agents._version import __version__
 from mambo_agents.backends.protocol import BackendProtocol
 from mambo_agents.backends.readonly import ReadOnlyBackend
