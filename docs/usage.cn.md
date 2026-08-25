@@ -543,6 +543,15 @@ backend = LocalBackend(multimodal_describer=multimodal_describer(vision))
 
 描述器**不会默认注入** — 用户按需选择。返回 `None` 表示“不属于我处理的类型”，保持原始多模态结果不变。
 
+成功的模型描述会以 `[自动识别文本]`（`DESCRIBED_PREFIX`）前缀标记，明确告知模型这是**自动识别生成的文本、并非文件原始内容**，
+避免模型将描述误认为文件原文而重复读取原始多模态文件（重复触发描述器会产生额外费用）。
+失败兜底（`DESCRIBE_FAILED`）与拒绝提示**不**带此标记。
+
+当识别文本过大（超过 `tool_token_limit_before_evict` 阈值，默认 20,000 tokens）时，
+`BackendToolsMiddleware` 会将其转存至 `/.mambo/large_tool_results/<tool_call_id>`，
+并在结果中给出文件位置与预览，同时提示不要重复读取原始多模态文件。
+普通文本 `read` 结果仍不参与转存（保持分页语义）；`tool_token_limit_before_evict=None` 时全局关闭转存。
+
 ### 5.9 后端对比
 
 | 特性 | StoreBackend | LocalBackend | SshBackend | HybridWorkspaceBackend |

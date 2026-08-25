@@ -31,6 +31,21 @@ LC_SOURCE = "multimodal_describer"
 """Marker attached to describer model calls so they are not mis-consumed by
 user-facing traces / history logic (mirrors ``summarization``'s ``lc_source``)."""
 
+DESCRIBED_PREFIX = "[自动识别文本]"
+"""Prefix marking a describer's output as auto-generated recognition text.
+
+Injected into every successful model-based description so text-only models
+never mistake it for the original file content — and so the middleware can
+identify describer results for large-result eviction (see
+``BackendToolsMiddleware``).  Failure fallbacks (``DESCRIBE_FAILED``) and
+rejection texts are intentionally NOT marked.
+"""
+
+_DESCRIBED_HEADER = (
+    "{prefix} 以下内容是对多模态文件 {path} 的自动识别描述，"
+    "并非文件原始内容。请勿据此重复读取该文件，以免产生额外费用。"
+)
+
 _DEFAULT_PROMPT = (
     "请精确描述这个多模态文件的内容：如实说明主体、场景、关键细节以及出现的文字；"
     "不要臆测，不要概括。如果内容模糊或无法辨认，请如实说明。"
@@ -53,8 +68,9 @@ _DOCUMENT_PROMPT = (
 )
 
 _DEFAULT_REJECT_TEMPLATE = (
-    "[无法读取：{path} 是一个多模态/二进制文件（{mime_type}），"
-    "纯文本模型无法理解其内容。如需处理请改用支持多模态的模型，或忽略该文件。]"
+    "[读取失败：{path} 是一个多模态/二进制文件（{mime_type}），"
+    "识别到当前模型无法理解其内容。如需处理请改用支持本模态的模型，或忽略该文件。]"
+    "若你确实有能力读取此文件,请要求用户修改配置。"
 )
 
 
@@ -99,7 +115,11 @@ def _make_describer(
         text = _coerce_text(message.content)
         if len(text) > max_chars:
             text = text[:max_chars] + "…"
-        return text.strip() or DESCRIBE_FAILED
+        text = text.strip() or DESCRIBE_FAILED
+        if text == DESCRIBE_FAILED:
+            return text
+        header = _DESCRIBED_HEADER.format(prefix=DESCRIBED_PREFIX, path=file_path.value)
+        return f"{header}\n\n{text}"
 
     return _describe
 

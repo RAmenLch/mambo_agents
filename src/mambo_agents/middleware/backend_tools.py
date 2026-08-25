@@ -14,6 +14,10 @@ backends (local, SSH, store, hybrid).
 It also intercepts tool results and evicts oversized content to the
 filesystem (``/.mambo/large_tool_results/<tool_call_id>``), replacing
 it with a truncated preview to prevent context-window saturation.
+``read`` results are normally exempt (pagination), but oversized
+multimodal-describer outputs (marked ``[自动识别文本]``) are evicted too —
+the replacement message points to the stored file and warns against
+re-reading the original multimodal file.
 """
 
 import re
@@ -38,6 +42,7 @@ from pydantic import BaseModel, Field
 from mambo_agents.backends.protocol import BackendProtocol, ReadResult, ToolTimeoutError
 from mambo_agents.backends.schemas import BackendError, VirtualPath, VirtualPathArg
 from mambo_agents.backends.utils import format_validation_error
+from mambo_agents.multimodal_describers import DESCRIBED_PREFIX
 
 
 # ---------------------------------------------------------------------------
@@ -76,6 +81,16 @@ Preview (head and tail of content):
 You can read the full result using `read(file_path="{file_path}", offset=0, limit=200)`.
 For very large results, use pagination with offset/limit."""
 
+_DESCRIBED_RESULT_EVICTED_MSG = """多模态文件的自动识别文本过大，完整识别文本已转存至：{file_path}
+
+预览（开头与结尾）：
+
+{preview}
+
+完整识别文本请用 read(file_path="{file_path}", offset=0, limit=200) 读取（必要时分页）。
+注意：该文件是 AI 自动识别生成的文本，并非原始多模态文件；
+请勿重复读取原始多模态文件来核对内容，以免产生额外的识别费用。"""
+
 # ---------------------------------------------------------------------------
 # Large result eviction — helpers
 # ---------------------------------------------------------------------------
@@ -112,6 +127,16 @@ def _extract_text_from_tool_message(msg: ToolMessage) -> str:
                 parts.append(block)
         return "\n".join(parts)
     return str(content)
+
+
+def _is_described_text(text: str) -> bool:
+    """Return True if the text is a multimodal describer's auto-generated result.
+
+    Successful model-based descriptions are prefixed with ``DESCRIBED_PREFIX``
+    (``[自动识别文本]``) by :mod:`mambo_agents.multimodal_describers`; failure
+    fallbacks and rejection texts are not marked, so they never match here.
+    """
+    return text.startswith(DESCRIBED_PREFIX)
 
 
 def _build_evicted_content(
@@ -659,11 +684,24 @@ class BackendToolsMiddleware(AgentMiddleware[AgentState, ContextT, ResponseT]):
     # Eviction logic
     # ------------------------------------------------------------------
 
-    def _should_evict(self, tool_name: str) -> bool:
-        """Return True if eviction is enabled and applicable to this tool."""
+    def _should_evict(self, tool_name: str, message: ToolMessage) -> bool:
+        """Return True if eviction is enabled and applicable to this tool.
+
+        ``read`` is normally excluded (truncation would confuse pagination),
+        with one exception: results carrying the multimodal describer's
+        ``[自动识别文本]`` marker are auto-generated recognition text — a
+        one-shot description, not paginated file content — so oversized ones
+        are evicted like any other large tool result.
+        """
         if self._evict_limit is None:
             return False
-        return tool_name not in _TOOLS_EXCLUDED_FROM_EVICTION
+        if tool_name not in _TOOLS_EXCLUDED_FROM_EVICTION:
+            return True
+        if tool_name == "read" and _is_described_text(
+            _extract_text_from_tool_message(message)
+        ):
+            return True
+        return False
 
     def _evict(
         self,
@@ -692,7 +730,11 @@ class BackendToolsMiddleware(AgentMiddleware[AgentState, ContextT, ResponseT]):
             return message
 
         preview = _build_preview(text)
-        replacement = _TOOL_RESULT_EVICTED_MSG.format(
+        template = (
+            _DESCRIBED_RESULT_EVICTED_MSG if _is_described_text(text)
+            else _TOOL_RESULT_EVICTED_MSG
+        )
+        replacement = template.format(
             file_path=file_path,
             preview=preview,
         )
@@ -723,7 +765,11 @@ class BackendToolsMiddleware(AgentMiddleware[AgentState, ContextT, ResponseT]):
             return message
 
         preview = _build_preview(text)
-        replacement = _TOOL_RESULT_EVICTED_MSG.format(
+        template = (
+            _DESCRIBED_RESULT_EVICTED_MSG if _is_described_text(text)
+            else _TOOL_RESULT_EVICTED_MSG
+        )
+        replacement = template.format(
             file_path=file_path,
             preview=preview,
         )
@@ -744,7 +790,7 @@ class BackendToolsMiddleware(AgentMiddleware[AgentState, ContextT, ResponseT]):
         if isinstance(result, Command):
             return self._maybe_evict_command(result)
         tool_name = request.tool_call.get("name", "")
-        if not self._should_evict(tool_name):
+        if not self._should_evict(tool_name, result):
             return result
         sane_id = _sanitize_tool_call_id(request.tool_call["id"])
         return self._evict(result, sane_id)
@@ -799,7 +845,7 @@ class BackendToolsMiddleware(AgentMiddleware[AgentState, ContextT, ResponseT]):
         if isinstance(result, Command):
             return await self._amaybe_evict_command(result)
         tool_name = request.tool_call.get("name", "")
-        if not self._should_evict(tool_name):
+        if not self._should_evict(tool_name, result):
             return result
         sane_id = _sanitize_tool_call_id(request.tool_call["id"])
         return await self._aevict(result, sane_id)

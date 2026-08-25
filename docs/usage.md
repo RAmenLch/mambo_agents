@@ -552,6 +552,20 @@ The sub-package ships the following factories:
 Describers are **never injected by default** — users opt in per use case. A describer
 returns `None` to signal "not my type" and leave the multimodal result unchanged.
 
+Successful model descriptions are prefixed with the `[自动识别文本]` marker
+(`DESCRIBED_PREFIX`) so the model always knows the text is **auto-generated
+recognition text, not the original file content** — preventing it from
+mistaking the description for the file and re-reading the original multimodal
+file (which would re-trigger the describer and incur extra cost). Failure
+fallbacks (`DESCRIBE_FAILED`) and rejection texts are **not** marked.
+
+When a recognition text is too large (above the `tool_token_limit_before_evict`
+threshold, default 20,000 tokens), `BackendToolsMiddleware` evicts it to
+`/.mambo/large_tool_results/<tool_call_id>` and replies with the file location,
+a preview, and a warning not to re-read the original multimodal file. Plain
+text `read` results are still exempt from eviction (pagination semantics);
+`tool_token_limit_before_evict=None` disables eviction entirely.
+
 ### 5.9 Backend Comparison
 
 | Feature | StoreBackend | LocalBackend | SshBackend | HybridWorkspaceBackend |

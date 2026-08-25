@@ -12,6 +12,7 @@ from langgraph.store.memory import InMemoryStore
 
 from mambo_agents.backends.store import StoreBackend
 from mambo_agents.backends.schemas import BackendError, ErrorCode, VirtualPath
+from mambo_agents.multimodal_describers import DESCRIBED_PREFIX
 from tests.test_store_backend import _simulate_graph
 from mambo_agents.middleware.backend_tools import (
     BackendToolsMiddleware,
@@ -210,7 +211,7 @@ class TestEviction:
         assert final is result
 
     def test_excluded_tool_read_not_evicted(self):
-        """read tool results are never evicted."""
+        """Plain read tool results are never evicted (pagination intact)."""
         mw = _make_middleware(threshold=10)
         huge = "x" * 100
         result = ToolMessage(content=huge, tool_call_id="call_read", name="read")
@@ -218,6 +219,53 @@ class TestEviction:
 
         final = mw._maybe_evict(result, request)
         assert final is result
+
+    def test_described_read_under_threshold_not_evicted(self):
+        """A described read result below the threshold stays unchanged."""
+        mw = _make_middleware(threshold=200)
+        content = f"{DESCRIBED_PREFIX} 自动识别描述\n\nshort description"
+        result = ToolMessage(content=content, tool_call_id="call_read_desc", name="read")
+        request = _make_request("read", tool_call_id="call_read_desc")
+
+        final = mw._maybe_evict(result, request)
+        assert final is result
+
+    def test_described_read_evicted(self):
+        """An oversized described read result IS evicted (read exception).
+
+        The replacement message uses the described-specific template: it
+        points to the stored file and warns against re-reading the original
+        multimodal file.
+        """
+        mw = _make_middleware(threshold=100)
+        huge = f"{DESCRIBED_PREFIX} 以下是对多模态文件的自动识别描述\n\n" + "x" * 1000
+        result = ToolMessage(content=huge, tool_call_id="call_read_desc", name="read")
+        request = _make_request("read", tool_call_id="call_read_desc")
+
+        with _simulate_graph(mw.backend):
+            final = mw._maybe_evict(result, request)
+        assert final is not result
+        assert _EVICTION_PREFIX in final.content  # points to the stored file
+        assert "自动识别" in final.content  # described-specific template
+        assert "请勿重复读取原始多模态文件" in final.content  # anti-cost warning
+
+    def test_described_read_eviction_writes_to_backend(self):
+        """The full described text is retrievable from the backend."""
+        mw = _make_middleware(threshold=100)
+        body = "DESCRIBED_FULL_CONTENT_" * 30
+        huge = f"{DESCRIBED_PREFIX} 描述头部\n\n{body}"
+        result = ToolMessage(content=huge, tool_call_id="call_read_desc2", name="read")
+        request = _make_request("read", tool_call_id="call_read_desc2")
+
+        with _simulate_graph(mw.backend):
+            mw._maybe_evict(result, request)
+
+        sane_id = _sanitize_tool_call_id("call_read_desc2")
+        with _simulate_graph(mw.backend):
+            read_result = mw.backend.read(VirtualPath(f"{_EVICTION_PREFIX}/{sane_id}"))
+        assert read_result.error is None
+        assert "DESCRIBED_FULL_CONTENT_" in (read_result.content or "")
+        assert read_result.content.startswith(DESCRIBED_PREFIX)
 
     def test_excluded_tool_write_not_evicted(self):
         """write tool results are never evicted."""
@@ -383,3 +431,17 @@ class TestEvictionAsync:
 
         final = await mw._amaybe_evict(result, request)
         assert final is result
+
+    @pytest.mark.asyncio
+    async def test_described_read_evicted_async(self):
+        """Async path: oversized described read result is evicted."""
+        mw = _make_middleware(threshold=100)
+        huge = f"{DESCRIBED_PREFIX} 自动识别描述\n\n" + "y" * 1000
+        result = ToolMessage(content=huge, tool_call_id="call_read_desc_async", name="read")
+        request = _make_request("read", tool_call_id="call_read_desc_async")
+
+        with _simulate_graph(mw.backend):
+            final = await mw._amaybe_evict(result, request)
+        assert final is not result
+        assert _EVICTION_PREFIX in final.content
+        assert "请勿重复读取原始多模态文件" in final.content

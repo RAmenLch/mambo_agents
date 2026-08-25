@@ -17,6 +17,11 @@ argument (mirroring ``summarizer``).
   API (or want to reject only some media types).
 - :func:`composite_multimodal_describer` — tries several describers in order.
 
+Successful descriptions are prefixed with ``DESCRIBED_PREFIX``
+(``[自动识别文本]``) so text-only models never mistake them for the original
+file content; the middleware uses the same prefix to evict oversized
+describer results to ``/.mambo/large_tool_results``.
+
 Usage::
 
     from mambo_agents.multimodal_describers import multimodal_describer
@@ -31,6 +36,7 @@ None of these are injected by default — the user selects which to use.
 
 from mambo_agents.multimodal_describers._base import (
     DESCRIBE_FAILED,
+    DESCRIBED_PREFIX,
     LC_SOURCE,
     audio_describer,
     document_describer,
@@ -43,6 +49,7 @@ from mambo_agents.multimodal_describers._composite import composite_multimodal_d
 
 __all__ = [
     "DESCRIBE_FAILED",
+    "DESCRIBED_PREFIX",
     "LC_SOURCE",
     "multimodal_describer",
     "image_describer",
