@@ -39,6 +39,7 @@ from mambo_agents.backends.protocol import (
     ToolTimeouts,
     UploadFileResult,
     WriteResult,
+    guard_tool_errors,
 )
 from mambo_agents.backends.utils.multimodal import (
     get_file_type,
@@ -534,6 +535,7 @@ class SshBackend(BackendProtocol):
             f"{py3_note}"
         )
 
+    @guard_tool_errors(LsResult)
     def ls(self, path: VirtualPath) -> LsResult:
         """List files and directories under *path* (non-recursive).
 
@@ -585,6 +587,7 @@ class SshBackend(BackendProtocol):
     # Core: read
     # ------------------------------------------------------------------
 
+    @guard_tool_errors(ReadResult)
     def read_raw(
         self,
         file_path: VirtualPath,
@@ -678,6 +681,7 @@ class SshBackend(BackendProtocol):
     # Core: write
     # ------------------------------------------------------------------
 
+    @guard_tool_errors(WriteResult)
     def write(
         self, file_path: VirtualPath, content: str, overwrite: bool = False,
     ) -> WriteResult:
@@ -757,6 +761,7 @@ class SshBackend(BackendProtocol):
     # Core: edit
     # ------------------------------------------------------------------
 
+    @guard_tool_errors(EditResult)
     def edit(
         self,
         file_path: VirtualPath,
@@ -925,6 +930,7 @@ class SshBackend(BackendProtocol):
     # Core: grep
     # ------------------------------------------------------------------
 
+    @guard_tool_errors(GrepResult)
     def grep(
         self,
         pattern: str,
@@ -1252,6 +1258,7 @@ class SshBackend(BackendProtocol):
     # Core: glob
     # ------------------------------------------------------------------
 
+    @guard_tool_errors(GlobResult)
     def glob(self, pattern: str, path: VirtualPath = VirtualPath("/workspace")) -> GlobResult:
         """Find files and directories matching *pattern* under *path*.
 
@@ -1262,6 +1269,20 @@ class SshBackend(BackendProtocol):
         with self._sync_lock:
             if not pattern:
                 return GlobResult(error=BackendError(code=ErrorCode.INVALID, message="搜索模式不能为空"))
+            # Reject absolute / drive-rooted patterns up-front with an
+            # actionable message (the remote python fallback would otherwise
+            # report a generic "resolves outside base directory" error).
+            normalized_pattern = pattern.replace("\\", "/")
+            if normalized_pattern.startswith("/") or re.match(r"^[A-Za-z]:", normalized_pattern):
+                return GlobResult(error=BackendError(
+                    code=ErrorCode.INVALID,
+                    path=path,
+                    message=(
+                        f"glob 不支持绝对路径模式: {pattern!r}。"
+                        "pattern 必须是相对于 path 参数(默认 /workspace)的相对模式，"
+                        "例如 '**/*.py'、'src/**/*.py' 或 'backends/*.py'"
+                    ),
+                ))
             try:
                 remote = self._resolve(path)
             except BackendError as e:
@@ -1430,6 +1451,7 @@ class SshBackend(BackendProtocol):
     # Extra: tree
     # ------------------------------------------------------------------
 
+    @guard_tool_errors(None)
     def tree(self, path: VirtualPath = VirtualPath("/workspace"), depth: int = 3) -> str:
         """Render a directory tree.
 
@@ -1665,6 +1687,7 @@ class SshBackend(BackendProtocol):
     # Extra: delete
     # ------------------------------------------------------------------
 
+    @guard_tool_errors(DeleteResult)
     def delete(self, path: VirtualPath) -> DeleteResult:
         """Delete a single **file** on the remote server.
 

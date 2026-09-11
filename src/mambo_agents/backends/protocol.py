@@ -8,7 +8,9 @@ and may freely add backend-specific operations beyond the core six.
 import abc
 import asyncio
 import base64
+import inspect
 import threading
+from functools import wraps
 from typing import Any, Awaitable, Callable, ClassVar, TypeVar
 
 from langchain_core.tools import StructuredTool
@@ -145,6 +147,63 @@ class ToolTimeoutError(Exception):
             f"Try narrowing the scope — use a more specific path, glob "
             f"pattern, or read limit."
         )
+
+
+# ============================================================================
+# Tool-boundary error guard
+# ============================================================================
+
+
+def guard_tool_errors(result_cls):
+    """Decorate an LLM-facing tool method so it can never crash the agent run.
+
+    Any exception escaping the wrapped method — ``OSError``, ``NotImplementedError``
+    (e.g. absolute glob patterns rejected by ``pathlib``), ``ValueError``,
+    ``re.error``, network failures (``paramiko.SSHException``, ``socket.error``),
+    or anything else — is converted into an error result
+    (``result_cls(error=...)``) so the LLM receives an actionable error text.
+    For plain-text tools pass ``result_cls=None``; the exception is then
+    rendered as a ``"[CODE] message"`` string (matching ``tree()``'s format).
+
+    The method's own fine-grained error returns are preserved — this guard
+    only catches exceptions that would otherwise escape the method.
+    Sync-only guard: backends whose async variants delegate to their sync
+    methods (``asyncio.to_thread``) need only decorate the sync methods.
+    """
+    def deco(fn):
+        sig = inspect.signature(fn)
+
+        @wraps(fn)
+        def wrapper(self, *args, **kwargs):
+            try:
+                return fn(self, *args, **kwargs)
+            except Exception as exc:  # noqa: BLE001 — tool boundary must never crash
+                path = None
+                try:
+                    # Bind ``self`` too so positional calls (e.g. the protocol's
+                    # ``asyncio.to_thread(self.glob, pattern, p)``) map arguments
+                    # onto the right parameter names.
+                    bound = sig.bind(self, *args, **kwargs)
+                    for name in ("path", "file_path"):
+                        arg = bound.arguments.get(name)
+                        if isinstance(arg, VirtualPath):
+                            path = arg
+                            break
+                except TypeError:
+                    pass
+                if not isinstance(exc, BackendError):
+                    exc = BackendError(
+                        code=ErrorCode.IO_ERROR,
+                        path=path,
+                        message=f"{type(exc).__name__}: {exc}",
+                    )
+                if result_cls is None:
+                    return str(exc)
+                return result_cls(error=exc)
+
+        return wrapper
+
+    return deco
 
 
 # ============================================================================

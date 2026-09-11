@@ -39,6 +39,7 @@ from mambo_agents.backends.protocol import (
     ToolTimeouts,
     UploadFileResult,
     WriteResult,
+    guard_tool_errors,
 )
 from mambo_agents.backends.utils.multimodal import (
     get_file_type,
@@ -401,6 +402,7 @@ class LocalBackend(BackendProtocol):
         finally:
             lock.release()
 
+    @guard_tool_errors(LsResult)
     def ls(self, path: VirtualPath) -> LsResult:
         try:
             resolved = self._resolve(path)
@@ -448,6 +450,7 @@ class LocalBackend(BackendProtocol):
         error_msg = BackendError(code=ErrorCode.IO_ERROR, message="\n".join(errors)) if errors else None
         return LsResult(error=error_msg, entries=infos)
 
+    @guard_tool_errors(ReadResult)
     def read_raw(
         self,
         file_path: VirtualPath,
@@ -528,6 +531,7 @@ class LocalBackend(BackendProtocol):
             encoding="utf-8",
         )
 
+    @guard_tool_errors(WriteResult)
     def write(
         self, file_path: VirtualPath, content: str, overwrite: bool = False,
     ) -> WriteResult:
@@ -584,6 +588,7 @@ class LocalBackend(BackendProtocol):
 
             return WriteResult(path=file_path)
 
+    @guard_tool_errors(EditResult)
     def edit(
         self,
         file_path: VirtualPath,
@@ -668,6 +673,7 @@ class LocalBackend(BackendProtocol):
     # grep — ripgrep-first with Python fallback and file-size guard
     # ------------------------------------------------------------------
 
+    @guard_tool_errors(GrepResult)
     def grep(
         self,
         pattern: str,
@@ -887,9 +893,25 @@ class LocalBackend(BackendProtocol):
 
         return results
 
+    @guard_tool_errors(GlobResult)
     def glob(self, pattern: str, path: VirtualPath = VirtualPath("/workspace")) -> GlobResult:
         if not pattern:
             return GlobResult(error=BackendError(code=ErrorCode.INVALID, message="搜索模式不能为空"))
+        # ``pathlib.Path.glob()`` rejects absolute / drive-rooted patterns
+        # (e.g. ``"/workspace/**/*.py"`` or ``"C:/x/*"``) with
+        # ``NotImplementedError``.  Validate up-front so the agent gets an
+        # actionable message instead of a crashed run.
+        normalized_pattern = pattern.replace("\\", "/")
+        if normalized_pattern.startswith("/") or re.match(r"^[A-Za-z]:", normalized_pattern):
+            return GlobResult(error=BackendError(
+                code=ErrorCode.INVALID,
+                path=path,
+                message=(
+                    f"glob 不支持绝对路径模式: {pattern!r}。"
+                    "pattern 必须是相对于 path 参数(默认 /workspace)的相对模式，"
+                    "例如 '**/*.py'、'src/**/*.py' 或 'backends/*.py'"
+                ),
+            ))
         try:
             resolved = self._resolve(path)
         except BackendError as e:
@@ -934,6 +956,7 @@ class LocalBackend(BackendProtocol):
     # Extra operations: tree, delete, execute
     # ------------------------------------------------------------------
 
+    @guard_tool_errors(None)
     def tree(self, path: VirtualPath = VirtualPath("/workspace"), depth: int = 3) -> str:
         """Render a directory tree.
 
@@ -964,6 +987,7 @@ class LocalBackend(BackendProtocol):
         )
         return format_tree_entries(entries)
 
+    @guard_tool_errors(DeleteResult)
     def delete(self, path: VirtualPath) -> DeleteResult:
         """Delete a single **file**.
 
