@@ -359,6 +359,15 @@ class SummarizationConfig(BaseModel):
         default=None,
         description="Characters-per-token ratio. None = auto-detect from content.",
     )
+    include_reasoning: bool = Field(
+        default=False,
+        description=(
+            "Fold reasoning text (additional_kwargs['reasoning_content'] / "
+            "['reasoning']) into the token estimate. Enable for reasoning models "
+            "that re-send the chain-of-thought to the provider (e.g. DeepSeek/GLM); "
+            "leave disabled for models that do not, to avoid over-counting."
+        ),
+    )
     offload_to_backend: bool = Field(
         default=False,
         description="Enable persisting evicted messages to the backend.",
@@ -419,6 +428,11 @@ class MamboSummarizationMiddleware(AgentMiddleware[SummarizationState, ContextT,
         chars_per_token: Explicit characters-per-token ratio.
             ``None`` (default) auto-detects CJK ratio from content.
             Lower = more conservative.  Ignored when ``token_counter`` is set.
+        include_reasoning: Fold ``additional_kwargs`` reasoning text
+            (``reasoning_content`` / ``reasoning``) into the token estimate.
+            Enable for reasoning models that re-send the chain-of-thought to
+            the provider (e.g. DeepSeek/GLM); leave disabled otherwise.
+            Ignored when ``token_counter`` is set.
         backend: Optional ``BackendProtocol`` for offloading evicted messages.
             Default: ``None`` (no offload — evicted messages are lost).
         summary_hooks: Optional ``SummaryHook`` callables for injecting
@@ -439,6 +453,7 @@ class MamboSummarizationMiddleware(AgentMiddleware[SummarizationState, ContextT,
         trim_tokens_to_summarize: int | None = _DEFAULT_TRIM_TOKEN_LIMIT,
         token_counter: TokenCounter | None = None,
         chars_per_token: float | None = None,
+        include_reasoning: bool = False,
         offload_to_backend: bool = False,
         backend: BackendProtocol | None = None,
         summary_hooks: list[SummaryHook] | None = None,
@@ -457,7 +472,10 @@ class MamboSummarizationMiddleware(AgentMiddleware[SummarizationState, ContextT,
 
         # Resolve token_counter: explicit > chars_per_token > auto-detect
         if token_counter is None:
-            token_counter = _build_default_token_counter(chars_per_token=chars_per_token)
+            token_counter = _build_default_token_counter(
+                chars_per_token=chars_per_token,
+                include_reasoning=include_reasoning,
+            )
 
         self._lc_helper = LCSummarizationMiddleware(
             model=model,

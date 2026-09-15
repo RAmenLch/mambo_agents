@@ -6,6 +6,7 @@ from collections.abc import Iterable
 from functools import partial
 
 from langchain.agents.middleware.summarization import TokenCounter
+from langchain_core.messages import BaseMessage
 from langchain_core.messages.utils import (
     convert_to_messages,
     count_tokens_approximately,
@@ -38,6 +39,12 @@ _CJK_BLOCKS: list[tuple[int, int]] = [
 # Cap on characters scanned for language-ratio estimation so we don't
 # linearly scan an entire massive conversation on every token-count call.
 _MAX_RATIO_SCAN_CHARS: int = 50_000
+
+# ``additional_kwargs`` keys whose text some reasoning-capable adapters
+# (e.g. DeepSeek/GLM) re-send to the provider on every turn.  When present
+# they must be folded into the estimate, otherwise the trigger threshold
+# underestimates the real prompt.
+_REASONING_FIELDS: tuple[str, ...] = ("reasoning_content", "reasoning")
 
 
 # ---------------------------------------------------------------------------
@@ -90,8 +97,52 @@ def _is_cjk_char(ch: str) -> bool:
     return any(lo <= cp <= hi for lo, hi in _CJK_BLOCKS)
 
 
+def _extract_reasoning_text(msg: BaseMessage) -> str:
+    """Collect re-sent reasoning text from ``msg.additional_kwargs``.
+
+    Returns the concatenation of every non-empty string stored under
+    :data:`_REASONING_FIELDS` (``reasoning_content`` / ``reasoning``), or an
+    empty string when the message carries none.
+    """
+    parts = []
+    for key in _REASONING_FIELDS:
+        value = msg.additional_kwargs.get(key)
+        if isinstance(value, str) and value:
+            parts.append(value)
+    return "\n".join(parts)
+
+
+def _with_reasoning_in_content(messages: Iterable) -> list[BaseMessage]:
+    """Fold reasoning text into ``content`` so the estimate matches the prompt.
+
+    ``count_tokens_approximately`` only reads ``message.content`` (plus tool
+    calls / role / name), so reasoning stored under ``additional_kwargs`` is
+    invisible to it even though adapters such as DeepSeek re-send it.  This
+    returns copies of *messages* whose reasoning text is merged into
+    ``content`` (string content is appended to; list content gains a text
+    block).  Messages without reasoning are passed through unchanged.
+    """
+    augmented: list[BaseMessage] = []
+    for msg in convert_to_messages(messages):
+        reasoning = _extract_reasoning_text(msg)
+        if not reasoning:
+            augmented.append(msg)
+            continue
+        content = msg.content
+        if isinstance(content, str):
+            merged: str | list = f"{content}\n{reasoning}" if content else reasoning
+        elif isinstance(content, list):
+            merged = [*content, {"type": "text", "text": reasoning}]
+        else:
+            merged = reasoning
+        augmented.append(msg.model_copy(update={"content": merged}))
+    return augmented
+
+
 def _build_default_token_counter(
     chars_per_token: float | None = None,
+    *,
+    include_reasoning: bool = False,
 ) -> TokenCounter:
     """Build a model-agnostic token counter.
 
@@ -102,24 +153,44 @@ def _build_default_token_counter(
     - When ``chars_per_token`` is ``None``, auto-detects the CJK ratio
       from message content and blends ``_DEFAULT_EN_CHARS_PER_TOKEN`` with
       ``_DEFAULT_CJK_CHARS_PER_TOKEN`` accordingly.
+    - When ``include_reasoning`` is ``True``, folds the reasoning text
+      (``additional_kwargs["reasoning_content"]`` / ``["reasoning"]``) into
+      the estimate so it tracks the real prompt for models that re-send the
+      chain-of-thought (e.g. DeepSeek).  Leave disabled for models whose
+      reasoning is not re-sent, to avoid over-counting.
 
     Args:
         chars_per_token: Explicit characters-per-token ratio.
             ``None`` means auto-detect from content.
+        include_reasoning: Fold ``additional_kwargs`` reasoning text into the
+            estimate.  Defaults to ``False`` (reasoning excluded).
 
     Returns:
         A ``TokenCounter`` callable suitable for passing to
         ``LCSummarizationMiddleware``.
     """
     if chars_per_token is not None:
-        return partial(
-            count_tokens_approximately,
-            chars_per_token=float(chars_per_token),
-            use_usage_metadata_scaling=True,
-        )
+        cpt = float(chars_per_token)
+        if not include_reasoning:
+            return partial(
+                count_tokens_approximately,
+                chars_per_token=cpt,
+                use_usage_metadata_scaling=True,
+            )
+
+        def _fixed(token_iterable) -> int:
+            return count_tokens_approximately(
+                _with_reasoning_in_content(token_iterable),
+                chars_per_token=cpt,
+                use_usage_metadata_scaling=True,
+            )
+
+        return _fixed
 
     def _auto(token_iterable) -> int:
         messages = list(token_iterable)
+        if include_reasoning:
+            messages = _with_reasoning_in_content(messages)
         cjk_ratio = _detect_cjk_ratio(messages)
         effective_cpt = (
             _DEFAULT_EN_CHARS_PER_TOKEN * (1.0 - cjk_ratio)

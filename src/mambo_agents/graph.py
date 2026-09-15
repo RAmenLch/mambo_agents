@@ -479,6 +479,7 @@ def create_mambo_agent(
                 trim_tokens_to_summarize=summarization.trim_tokens_to_summarize,
                 token_counter=summarization.token_counter,
                 chars_per_token=summarization.chars_per_token,
+                include_reasoning=summarization.include_reasoning,
                 offload_to_backend=summarization.offload_to_backend,
                 backend=_summary_backend,
                 summary_hooks=_summary_hooks or None,
@@ -554,6 +555,7 @@ def create_mambo_agent(
                 backend_tool_names=_backend_tool_names,
                 description_prefix=security_review.description_prefix,
                 tool_unpackers=security_review.tool_unpackers,
+                language=security_review.language,
             )
         else:
             # ---- Classic HITL (no AI review) ----

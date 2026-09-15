@@ -222,6 +222,15 @@ class SecurityReviewConfig(BaseModel):
             "and ``example/10_mcp_security_review.py``."
         ),
     )
+    language: Literal["zh", "en"] | None = Field(
+        default=None,
+        description=(
+            "Language for the reviewer's human-facing ``reason`` and analysis. "
+            "``None`` (default) leaves the built-in prompt language untouched. "
+            "``'zh'`` forces Simplified Chinese and ``'en'`` forces English, "
+            "preventing randomly mixed Chinese/English explanations."
+        ),
+    )
 
 
 class SecurityReviewPassedEvent(BaseModel):
@@ -428,6 +437,23 @@ Your job is to review tool calls the agent wants to make and determine if they p
 Respond with your structured assessment."""
 
 
+# Appended to the reviewer system prompt when ``language`` is explicitly set,
+# so the ``reason`` field is always emitted in a single, deterministic language.
+_LANGUAGE_DIRECTIVES: dict[str, str] = {
+    "zh": (
+        "\n\n## 输出语言要求\n"
+        "你**必须始终**使用**简体中文**撰写 ``reason`` 字段及所有分析文字，"
+        "禁止使用英文，即使用户的问题、工具参数或上下文包含英文。"
+    ),
+    "en": (
+        "\n\n## Output language requirement\n"
+        "You MUST write the ``reason`` field and all analysis in "
+        "**English only**, never Chinese — even when the user's request, "
+        "tool arguments or context contain Chinese."
+    ),
+}
+
+
 # ---------------------------------------------------------------------------
 # Helper — build review messages
 # ---------------------------------------------------------------------------
@@ -539,6 +565,10 @@ class AutoSecurityReviewMiddleware(
     description_prefix:
         Prefix used when constructing human-facing action-request
         descriptions.
+    language:
+        Optional output language for the reviewer's ``reason`` /
+        analysis.  ``None`` (default) keeps the built-in prompt language;
+        ``'zh'`` / ``'en'`` forces Simplified Chinese / English.
     """
 
     # ------------------------------------------------------------------
@@ -558,6 +588,7 @@ class AutoSecurityReviewMiddleware(
         tool_descriptions: dict[str, str] | None = None,
         backend_tool_names: frozenset[str] = frozenset(),
         tool_unpackers: list[object] | None = None,
+        language: Literal["zh", "en"] | None = None,
     ) -> None:
         super().__init__()
 
@@ -584,6 +615,14 @@ class AutoSecurityReviewMiddleware(
 
         self._review_system_prompt = (
             security_review_system_prompt or DEFAULT_SECURITY_REVIEW_SYSTEM_PROMPT
+        )
+
+        # ---------- output language (opt-in) ----------
+        # When unset, the built-in prompt language is left untouched.  The
+        # directive is appended at the point of use so this field keeps
+        # matching the built-in default (used to detect a custom prompt).
+        self._language_directive: str = (
+            _LANGUAGE_DIRECTIVES[language] if language is not None else ""
         )
 
         # ---------- which tools get AI-reviewed ----------
@@ -674,6 +713,7 @@ class AutoSecurityReviewMiddleware(
             _prompt += (
                 f"\n\n## 工作区信息\n\n{self._agent_backend.description}"
             )
+        _prompt += self._language_directive
 
         self._cached_review_agent = create_review_agent(
             model=self._review_model,
@@ -728,7 +768,7 @@ class AutoSecurityReviewMiddleware(
         effective_name, effective_args, unpacked_desc = self._try_unpack(tool_call)
         tool_desc = unpacked_desc or self._tool_descriptions.get(tool_call["name"])
         messages = _build_review_messages(
-            self._review_system_prompt, tool_call,
+            self._review_system_prompt + self._language_directive, tool_call,
             tool_description=tool_desc,
             effective_tool_name=effective_name if effective_name != tool_call["name"] else None,
             effective_args=effective_args if effective_name != tool_call["name"] else None,
@@ -826,7 +866,7 @@ class AutoSecurityReviewMiddleware(
         effective_name, effective_args, unpacked_desc = self._try_unpack(tool_call)
         tool_desc = unpacked_desc or self._tool_descriptions.get(tool_call["name"])
         messages = _build_review_messages(
-            self._review_system_prompt, tool_call,
+            self._review_system_prompt + self._language_directive, tool_call,
             tool_description=tool_desc,
             effective_tool_name=effective_name if effective_name != tool_call["name"] else None,
             effective_args=effective_args if effective_name != tool_call["name"] else None,
