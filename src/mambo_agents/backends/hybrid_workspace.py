@@ -39,6 +39,7 @@ from mambo_agents.backends.protocol import (
     DownloadFileResult,
     EditResult,
     FileInfo,
+    FileUploader,
     GlobResult,
     GrepResult,
     LsResult,
@@ -194,6 +195,7 @@ class HybridWorkspaceBackend(BackendProtocol):
         max_grep_match_chars: int = 500,
         summarizer: "ReadSummarizer | None" = None,
         multimodal_describer: "MultimodalDescriber | None" = None,
+        file_uploader: "FileUploader | None" = None,
         tool_timeouts: ToolTimeouts | None = None,
         store: "BaseStore | None" = None,
     ) -> None:
@@ -206,6 +208,7 @@ class HybridWorkspaceBackend(BackendProtocol):
             max_grep_match_chars=max_grep_match_chars,
             summarizer=summarizer,
             multimodal_describer=multimodal_describer,
+            file_uploader=file_uploader,
             tool_timeouts=_merged,
         )
 

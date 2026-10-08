@@ -29,6 +29,7 @@ from mambo_agents.backends.protocol import (
     DownloadFileResult,
     EditResult,
     FileInfo,
+    FileUploader,
     GlobResult,
     GrepMatch,
     GrepResult,
@@ -154,6 +155,7 @@ class SshBackend(BackendProtocol):
         max_grep_match_chars: int = 500,
         summarizer: "ReadSummarizer | None" = None,
         multimodal_describer: "MultimodalDescriber | None" = None,
+        file_uploader: "FileUploader | None" = None,
         tool_timeouts: ToolTimeouts | None = None,
     ) -> None:
         # Merge backend-specific timeout defaults with user overrides.
@@ -165,6 +167,7 @@ class SshBackend(BackendProtocol):
             max_grep_match_chars=max_grep_match_chars,
             summarizer=summarizer,
             multimodal_describer=multimodal_describer,
+            file_uploader=file_uploader,
             tool_timeouts=_merged,
         )
         if password is None and key_filename is None:

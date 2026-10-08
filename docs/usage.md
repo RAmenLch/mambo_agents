@@ -566,7 +566,72 @@ a preview, and a warning not to re-read the original multimodal file. Plain
 text `read` results are still exempt from eviction (pagination semantics);
 `tool_token_limit_before_evict=None` disables eviction entirely.
 
-### 5.9 Backend Comparison
+### 5.9 File Pre-Upload Hook (FileUploader)
+
+`read()` delivers images, video, audio and documents as **inline base64 content
+blocks**. That base64 ends up in the LangGraph checkpoint *and* in every model
+request — large files bloat checkpoints and can hit provider inline-size limits
+(e.g. DeepSeek's 32 MiB per-image limit).
+
+The `file_uploader` constructor argument (available on every backend) lets you
+pre-upload the file and replace the inline block with a lightweight reference
+(e.g. `{"type": "file", "file_id": ...}`) before the `read` `ToolMessage` is created:
+
+```python
+from langgraph.store.memory import InMemoryStore
+from mambo_agents.backends.local import LocalBackend
+from mambo_agents.file_uploaders import deepseek_file_uploader
+
+backend = LocalBackend(
+    root_dir="/data",
+    file_uploader=deepseek_file_uploader(store=InMemoryStore()),
+)
+```
+
+The hook contract (`FileUploader`): a plain function **or** an `async def` callback
+that receives `(file_path, base64_content, mime_type)` and returns the replacement
+content block(s) — a single dict or a list — or `None` to keep the default inline
+base64 block. Exceptions, timeouts and `None` all fall back to the inline block, so
+a broken uploader never fails the read (a warning is logged instead). The hook is
+**never enabled implicitly**.
+
+Dispatch rules:
+
+| `read` path | sync callback | async callback |
+|-------------|---------------|----------------|
+| async tool | runs via `asyncio.to_thread` (shares the default thread pool — prefer async callbacks) | awaited directly on the event loop (no worker thread) |
+| sync tool | called directly | run via `asyncio.run` when no event loop is running in the current thread; otherwise falls back to inline |
+
+The call is governed by the `file_upload` tool timeout (default 120 s, configurable
+via `tool_timeouts=ToolTimeouts(file_upload=...)`).
+
+Built-in implementation — `deepseek_file_uploader`:
+
+| Feature | Behavior |
+|---------|----------|
+| Upload | `POST /files` on the DeepSeek Files API (`purpose="user_data"`, TTL 1 h – 30 days; `ttl_seconds=None` = never expires) |
+| Cache | Content hash → upload record (`file_id`, expiry, mime, filename, size) kept in a LangGraph store plus a process-memory memo, so repeated reads reuse the same `file_id` |
+| Result block | `[{"type": "file", "file_id": ...}]` — replaces the inline base64 block |
+| Scope | Images only (DeepSeek Files API limitation); other file types stay inline (the hook returns `None`) |
+| Options | `api_key` / `api_base` / `client` (reuse your own `openai.AsyncOpenAI` — recommended for long-lived apps), `store`, `namespace`, `ttl_seconds`, `request_timeout`, `max_retries` |
+
+Requires the `openai` package (or pass your own `client=`). The resulting block is
+the standard LangChain `file` block with `file_id`; model integrations that speak
+that format consume it directly, and providers that require a flat
+`{"type": "file", "file_id": ...}` block (DeepSeek) can flatten it in the model
+wrapper's payload normalization step.
+
+Custom uploaders are just callables:
+
+```python
+async def my_uploader(file_path, base64_content, mime_type):
+    file_id = await my_files_api.upload(base64_content, mime_type)
+    return [{"type": "file", "file_id": file_id}]
+
+backend = LocalBackend(root_dir="/data", file_uploader=my_uploader)
+```
+
+### 5.10 Backend Comparison
 
 | Feature | StoreBackend | LocalBackend | SshBackend | HybridWorkspaceBackend |
 |---------|:---:|:---:|:---:|:---:|

@@ -20,9 +20,13 @@ the replacement message points to the stored file and warns against
 re-reading the original multimodal file.
 """
 
+import asyncio
+import inspect
+import logging
 import re
+import weakref
 from collections.abc import Awaitable, Callable, Sequence
-from typing import Annotated
+from typing import Annotated, Any
 
 from langchain.agents.middleware.types import (
     AgentMiddleware,
@@ -43,6 +47,9 @@ from mambo_agents.backends.protocol import BackendProtocol, ReadResult, ToolTime
 from mambo_agents.backends.schemas import BackendError, VirtualPath, VirtualPathArg
 from mambo_agents.backends.utils import format_validation_error
 from mambo_agents.multimodal_describers import DESCRIBED_PREFIX
+
+
+logger = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
@@ -331,6 +338,116 @@ class _ReadSchema(BaseModel):
     ]
 
 
+# ---------------------------------------------------------------------------
+# read tool — file uploader hook (pre-upload of multimodal files)
+# ---------------------------------------------------------------------------
+
+_SYNC_UPLOADER_WARNED: weakref.WeakSet = weakref.WeakSet()
+"""Sync uploaders already warned about thread-pool execution (warn once each)."""
+
+
+def _is_async_callable(obj: Any) -> bool:
+    """Return ``True`` when *obj* is a coroutine function (or has an async ``__call__``)."""
+    if inspect.iscoroutinefunction(obj):
+        return True
+    return inspect.iscoroutinefunction(getattr(obj, "__call__", None))
+
+
+def _warn_sync_uploader_once(uploader: Any) -> None:
+    """Warn once per sync uploader that it runs in the shared thread pool."""
+    try:
+        if uploader in _SYNC_UPLOADER_WARNED:
+            return
+        _SYNC_UPLOADER_WARNED.add(uploader)
+    except TypeError:  # not weak-referenceable → warn every time
+        pass
+    logger.warning(
+        "file_uploader 是同步回调，异步 read 将在共享线程池（asyncio.to_thread）中执行它；"
+        "如不希望占用线程池，请改用 async 回调。",
+    )
+
+
+def _normalize_uploaded_blocks(value: Any, file_path: VirtualPath) -> list[dict] | None:
+    """Normalize a ``FileUploader`` result into a content-block list (or ``None``)."""
+    if value is None:
+        return None
+    if isinstance(value, dict):
+        return [value]
+    if isinstance(value, list) and value and all(isinstance(block, dict) for block in value):
+        return list(value)
+    logger.warning(
+        "file_uploader 返回了不受支持的类型 %s（应为 dict / list[dict] / None），已回退内联 base64：%s",
+        type(value).__name__, file_path.value,
+    )
+    return None
+
+
+def _resolve_uploaded_blocks(
+    backend: BackendProtocol, file_path: VirtualPath, result: ReadResult,
+) -> list[dict] | None:
+    """Run the backend's ``file_uploader`` hook for a multimodal read (sync path).
+
+    Returns the replacement content blocks, or ``None`` to keep the default
+    inline base64 block (no uploader configured, hook returned ``None``, or
+    the hook failed / timed out).
+    """
+    uploader = getattr(backend, "_file_uploader", None)
+    if uploader is None:
+        return None
+    try:
+        if _is_async_callable(uploader):
+            try:
+                asyncio.get_running_loop()
+            except RuntimeError:
+                raw = asyncio.run(asyncio.wait_for(
+                    uploader(file_path, result.content, result.mime_type),
+                    timeout=backend._timeout_for("file_upload"),
+                ))
+            else:
+                logger.warning(
+                    "file_uploader 是异步回调，但同步 read 在运行中的事件循环内被调用，无法 await，"
+                    "已回退内联 base64：%s", file_path.value,
+                )
+                return None
+        else:
+            wrapped = backend._wrap_sync_with_timeout("file_upload", uploader)
+            raw = wrapped(file_path, result.content, result.mime_type)
+    except Exception as exc:  # noqa: BLE001 — a broken uploader must never fail the read
+        logger.warning(
+            "file_uploader 执行失败，已回退内联 base64（%s）：%s: %s",
+            file_path.value, type(exc).__name__, exc,
+        )
+        return None
+    return _normalize_uploaded_blocks(raw, file_path)
+
+
+async def _aresolve_uploaded_blocks(
+    backend: BackendProtocol, file_path: VirtualPath, result: ReadResult,
+) -> list[dict] | None:
+    """Run the backend's ``file_uploader`` hook for a multimodal read (async path).
+
+    Async uploaders are awaited directly on the event loop; sync uploaders run
+    in a worker thread (``asyncio.to_thread``) to avoid blocking the loop.
+    """
+    uploader = getattr(backend, "_file_uploader", None)
+    if uploader is None:
+        return None
+    try:
+        if _is_async_callable(uploader):
+            coro: Awaitable[Any] = uploader(file_path, result.content, result.mime_type)
+        else:
+            _warn_sync_uploader_once(uploader)
+            coro = asyncio.to_thread(uploader, file_path, result.content, result.mime_type)
+        raw = await backend._await_with_timeout("file_upload", coro)
+    except Exception as exc:  # noqa: BLE001 — a broken uploader must never fail the read
+        logger.warning(
+            "file_uploader 执行失败，已回退内联 base64（%s）：%s: %s",
+            file_path.value, type(exc).__name__, exc,
+        )
+        return None
+    return _normalize_uploaded_blocks(raw, file_path)
+
+
 def _build_sync_read_tool(backend: BackendProtocol) -> StructuredTool:
     """Build the read tool with proper tool_call_id support.
 
@@ -368,14 +485,15 @@ def _build_sync_read_tool(backend: BackendProtocol) -> StructuredTool:
             return str(e)
         if result.is_multimodal and result.content is not None:
             tool_call_id = (runtime.tool_call_id or "") if runtime is not None else ""
+            blocks = _resolve_uploaded_blocks(backend, file_path, result)
+            if blocks is None:
+                blocks = [{
+                    "type": result.file_type,
+                    "base64": result.content,
+                    "mime_type": result.mime_type,
+                }]
             return ToolMessage(
-                content_blocks=[
-                    {
-                        "type": result.file_type,
-                        "base64": result.content,
-                        "mime_type": result.mime_type,
-                    }
-                ],
+                content_blocks=blocks,
                 name="read",
                 tool_call_id=tool_call_id,
                 additional_kwargs={
@@ -415,14 +533,15 @@ def _build_sync_read_tool(backend: BackendProtocol) -> StructuredTool:
             return str(e)
         if result.is_multimodal and result.content is not None:
             tool_call_id = (runtime.tool_call_id or "") if runtime is not None else ""
+            blocks = await _aresolve_uploaded_blocks(backend, file_path, result)
+            if blocks is None:
+                blocks = [{
+                    "type": result.file_type,
+                    "base64": result.content,
+                    "mime_type": result.mime_type,
+                }]
             return ToolMessage(
-                content_blocks=[
-                    {
-                        "type": result.file_type,
-                        "base64": result.content,
-                        "mime_type": result.mime_type,
-                    }
-                ],
+                content_blocks=blocks,
                 name="read",
                 tool_call_id=tool_call_id,
                 additional_kwargs={
@@ -433,18 +552,25 @@ def _build_sync_read_tool(backend: BackendProtocol) -> StructuredTool:
             )
         return str(result)
 
+    description = (
+        "Read the contents of a file. "
+        "For text files, returns plain content by default (no line numbers). "
+        "Set include_line_numbers=True to get cat -n style output with "
+        "each line prefixed by its 1-indexed line number – recommended "
+        "when you need to reference specific lines for editing or patching. "
+        "For image, audio, video, and PDF files, returns multimodal "
+        "content blocks that the model can understand directly. "
+        "Supports offset and limit for pagination (text only)."
+    )
+    if getattr(backend, "_file_uploader", None) is not None:
+        description += (
+            " Multimodal files are pre-uploaded by the backend and returned as "
+            "reference blocks (e.g. file_id) instead of inline data."
+        )
+
     return StructuredTool.from_function(
         name="read",
-        description=(
-            "Read the contents of a file. "
-            "For text files, returns plain content by default (no line numbers). "
-            "Set include_line_numbers=True to get cat -n style output with "
-            "each line prefixed by its 1-indexed line number – recommended "
-            "when you need to reference specific lines for editing or patching. "
-            "For image, audio, video, and PDF files, returns multimodal "
-            "content blocks that the model can understand directly. "
-            "Supports offset and limit for pagination (text only)."
-        ),
+        description=description,
         func=sync_read,
         coroutine=async_read,
         args_schema=_ReadSchema,

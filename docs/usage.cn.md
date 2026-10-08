@@ -552,7 +552,66 @@ backend = LocalBackend(multimodal_describer=multimodal_describer(vision))
 并在结果中给出文件位置与预览，同时提示不要重复读取原始多模态文件。
 普通文本 `read` 结果仍不参与转存（保持分页语义）；`tool_token_limit_before_evict=None` 时全局关闭转存。
 
-### 5.9 后端对比
+### 5.9 文件预上传钩子（FileUploader）
+
+`read()` 对图片、视频、音频和文档返回**内联 base64 内容块**。这些 base64 会同时进入
+LangGraph 检查点（checkpoint）和每次的模型请求——大文件会导致检查点急剧膨胀，
+也可能触及模型服务的内联大小上限（如 DeepSeek 的单图 32 MiB 限制）。
+
+任意后端都支持 `file_uploader` 构造参数：在 `read` 工具生成 `ToolMessage` 之前
+预先上传文件，并把内联 base64 块替换为轻量引用（如 `{"type": "file", "file_id": ...}`）：
+
+```python
+from langgraph.store.memory import InMemoryStore
+from mambo_agents.backends.local import LocalBackend
+from mambo_agents.file_uploaders import deepseek_file_uploader
+
+backend = LocalBackend(
+    root_dir="/data",
+    file_uploader=deepseek_file_uploader(store=InMemoryStore()),
+)
+```
+
+钩子契约（`FileUploader`）：普通函数**或** `async def` 回调，入参为
+`(file_path, base64_content, mime_type)`，返回替换用的内容块（单个 dict 或 dict 列表），
+返回 `None` 表示保留默认的内联 base64 块。异常、超时、`None` 都会回退到内联块，
+钩子故障不会导致读取失败（仅记录 warning）。该钩子**永远不默认启用**，必须显式传入。
+
+调用规则：
+
+| read 路径 | 同步回调 | 异步回调 |
+|-----------|----------|----------|
+| 异步工具 | 经 `asyncio.to_thread` 执行（占用共享线程池，建议改用异步回调） | 直接在事件循环上 await（零线程） |
+| 同步工具 | 直接调用 | 当前线程无事件循环时用 `asyncio.run` 执行；否则回退内联 |
+
+调用受 `file_upload` 超时约束（默认 120 秒，可通过 `tool_timeouts=ToolTimeouts(file_upload=...)` 调整）。
+
+内置实现 `deepseek_file_uploader`：
+
+| 特性 | 行为 |
+|------|------|
+| 上传 | DeepSeek Files API `POST /files`（`purpose="user_data"`，有效期 1 小时 ~ 30 天；`ttl_seconds=None` 表示永久） |
+| 缓存 | 内容哈希 → 上传记录（`file_id`、过期时间、mime、文件名、大小），存入 LangGraph store + 进程内存 memo，同一文件重复读取不会重复上传 |
+| 返回块 | `[{"type": "file", "file_id": ...}]`，替换内联 base64 块 |
+| 适用范围 | 仅图片（DeepSeek Files API 限制）；其他类型返回 `None`，保持内联 |
+| 常用参数 | `api_key` / `api_base` / `client`（复用你自己的 `openai.AsyncOpenAI`，长驻应用推荐）、`store`、`namespace`、`ttl_seconds`、`request_timeout`、`max_retries` |
+
+需要安装 `openai` 包（或通过 `client=` 传入你自己的 `AsyncOpenAI` 实例）。
+返回块是标准的 LangChain `file` 块（带 `file_id`）：支持该格式的模型集成可直接消费；
+要求扁平的 `{"type": "file", "file_id": ...}` 块的服务端（DeepSeek）可在模型封装的
+请求体归一化步骤中拍平（参见下游 ChatDeepSeek 的 `_normalize_media_blocks`）。
+
+自定义钩子就是一个普通回调：
+
+```python
+async def my_uploader(file_path, base64_content, mime_type):
+    file_id = await my_files_api.upload(base64_content, mime_type)
+    return [{"type": "file", "file_id": file_id}]
+
+backend = LocalBackend(root_dir="/data", file_uploader=my_uploader)
+```
+
+### 5.10 后端对比
 
 | 特性 | StoreBackend | LocalBackend | SshBackend | HybridWorkspaceBackend |
 |------|:---:|:---:|:---:|:---:|

@@ -87,6 +87,39 @@ Returns:
 """
 
 
+FileUploader = Callable[
+    [VirtualPath, str, str],
+    "list[dict] | dict | None | Awaitable[list[dict] | dict | None]",
+]
+"""Callback that pre-uploads a multimodal file and replaces its inline block.
+
+When the ``read`` tool is about to emit a multimodal ``ToolMessage`` (image,
+audio, video, document), the configured uploader is called with the file's
+raw base64 content.  Whatever it returns replaces the inline base64 block in
+the message — typically a lightweight reference such as
+``[{"type": "file", "file_id": "file-api-…"}]`` — so neither the LangGraph
+checkpoint nor the model request carries the full file body.
+
+Args:
+    file_path: The virtual path of the file being read.
+    base64_content: The base64-encoded file bytes.
+    mime_type: The IANA media type (e.g. ``"image/png"``).
+
+Returns:
+    Replacement content block(s) for the ``read`` ``ToolMessage`` — a single
+    block dict or a list of blocks — or ``None`` to fall back to the default
+    inline base64 block.
+
+The callback may be a plain function or an ``async def`` coroutine function:
+async tools ``await`` an async callback directly (no worker thread) and run
+sync callbacks through ``asyncio.to_thread``; sync tools call sync callbacks
+directly and run async callbacks through ``asyncio.run`` when no event loop
+is running in the current thread.  Exceptions (or ``None``) fall back to the
+default inline block, so a broken uploader degrades gracefully instead of
+failing the read.
+"""
+
+
 # ============================================================================
 # Tool timeout configuration
 # ============================================================================
@@ -108,6 +141,7 @@ class ToolTimeouts(BaseModel):
 
     ls: float = Field(default=20.0, description="directory listing (synchronous SFTP / filesystem call).")
     read: float = Field(default=60.0, description="single-file read (SFTP transfer with optional line-number formatting).")
+    file_upload: float = Field(default=120.0, description="pre-upload of a multimodal file by the ``file_uploader`` hook (network transfer to the provider).")
     write: float = Field(default=60.0, description="single-file create / overwrite.")
     edit: float = Field(default=60.0, description="text replacement in an existing file.")
     grep: float = Field(default=120.0, description="recursive text search.")
@@ -319,6 +353,7 @@ class BackendProtocol(abc.ABC):
         max_grep_match_chars: int = 500,
         summarizer: ReadSummarizer | None = None,
         multimodal_describer: MultimodalDescriber | None = None,
+        file_uploader: FileUploader | None = None,
         tool_timeouts: ToolTimeouts | None = None,
     ) -> None:
         if max_read_chars < 1:
@@ -332,6 +367,7 @@ class BackendProtocol(abc.ABC):
         self._max_grep_match_chars = max_grep_match_chars
         self._summarizer: ReadSummarizer = summarizer or self._default_summarizer
         self._multimodal_describer: MultimodalDescriber | None = multimodal_describer
+        self._file_uploader: FileUploader | None = file_uploader
         self._tool_timeouts = tool_timeouts or ToolTimeouts()
 
     def _timeout_for(self, tool_name: str) -> float:

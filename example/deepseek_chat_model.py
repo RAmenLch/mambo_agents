@@ -1,4 +1,5 @@
-from typing import Any, Dict, List, Optional, Union
+import base64
+from typing import Any, Dict, List, Optional, Tuple, Union
 
 from langchain_core.messages import (
     AIMessage,
@@ -21,6 +22,10 @@ class ChatDeepSeek(ChatOpenAI):
     3. 不对 tool/assistant 消息的 content 做扁平化：DeepSeek 现版本已接受 list content
        （含纯文本块与 image_url 图片块，实测通过），扁平化会剥离 tool 消息中的
        image_url 块，导致 vision 模型（deepseek-v4-flash-vision-exp）无法识图。
+    4. 规整媒体块：把 langchain 包装出的嵌套 file 块（{"type":"file","file":{...}}）
+       拍平为 DeepSeek 只认的扁平 file_id / file_data 形态；video / audio 等不支持的
+       媒体块降级为文本占位。配合 mambo_agents 的 file_uploader 钩子使用 ——
+       read 工具消息里只保留 {"type": "file", "file_id": ...} 轻量引用块。
     """
 
     # 默认配置
@@ -59,8 +64,10 @@ class ChatDeepSeek(ChatOpenAI):
         """
         重写构建请求体的方法。
         """
-        # 1. 获取 OpenAI 格式的标准 payload
-        payload = super()._get_request_payload(input_, *args, **kwargs)
+        # 1. 先降级 DeepSeek 不支持、且 langchain 转换阶段会直接抛错的内容块（如 video），
+        #    再获取 OpenAI 格式的标准 payload。索引与消息类型保持不变，故下方仍可用 input_[i]。
+        messages = self._sanitize_messages(input_)
+        payload = super()._get_request_payload(messages, *args, **kwargs)
 
         # 2. 注入 DeepSeek V4 思考模式参数
         # reasoning_effort 是 OpenAI SDK 支持的标准参数（o1/o3 系列也使用）
@@ -101,7 +108,136 @@ class ChatDeepSeek(ChatOpenAI):
                         # 显式将 reasoning_content 加回发送给 API 的字典中
                         payload_msg["reasoning_content"] = reasoning
 
+        # 5. 规整媒体块：嵌套 file 块 -> 扁平 file_id / file_data；不支持的媒体块 -> 文本占位
+        self._normalize_media_blocks(payload)
+
         return payload
+
+    # ------------------------------------------------------------------
+    # 媒体块规整（配合 mambo_agents 的 file_uploader 钩子）
+    #
+    # read 工具产出 {"type": "file", "file_id": ...} 轻量引用块后，langchain 的
+    # _format_message_content 会把它包装成嵌套 {"type": "file", "file": {...}}；
+    # 而 DeepSeek 只认**扁平**的 file_id / file_data。此处把嵌套块拍平，
+    # 并把 DeepSeek 不支持的媒体块（非图片 file、音频等）降级为文本占位，
+    # 避免整个请求失败。注意：只能替换 payload 列表中的元素，不要原地修改块 dict，
+    # 否则会污染原始消息对象 / checkpoint。
+    # ------------------------------------------------------------------
+
+    def _sanitize_messages(self, messages: List[BaseMessage]) -> List[BaseMessage]:
+        """把 DeepSeek 无法处理的内容块降级为文本占位，返回（必要时新建的）消息列表。
+
+        langchain 的 ``_format_message_content`` 对 ``video`` 块会直接抛 ``ValueError``；
+        ``text-plain`` 等其它不支持类型同样在这里统一降级。
+        """
+        raising_types = {"video", "text-plain"}
+        out: List[BaseMessage] = []
+        changed = False
+        for msg in messages or []:
+            content = getattr(msg, "content", None)
+            if not isinstance(content, list):
+                out.append(msg)
+                continue
+            new_content = []
+            modified = False
+            for block in content:
+                if isinstance(block, dict) and block.get("type") in raising_types:
+                    mime = block.get("mime_type") or "未知类型"
+                    new_content.append(
+                        {"type": "text", "text": f"[附件文件（{mime}）不受当前模型支持，已省略]"}
+                    )
+                    modified = True
+                else:
+                    new_content.append(block)
+            if modified:
+                changed = True
+                out.append(msg.model_copy(update={"content": new_content}))
+            else:
+                out.append(msg)
+        return out if changed else messages
+
+    @staticmethod
+    def _iter_content_lists(payload: Dict[str, Any]):
+        """产出 payload 中每条消息的 content 列表（可原地替换其元素）。"""
+        for msg in (payload or {}).get("messages", []) or []:
+            if isinstance(msg, dict) and isinstance(msg.get("content"), list):
+                yield msg["content"]
+
+    def _normalize_media_blocks(self, payload: Dict[str, Any]) -> None:
+        """把 payload 中的媒体块规整为 DeepSeek 可接受的形态。"""
+        for content in self._iter_content_lists(payload):
+            for idx, block in enumerate(content):
+                if not isinstance(block, dict):
+                    continue
+                new_block = self._rewrite_media_block(block)
+                if new_block is not None:
+                    content[idx] = new_block
+
+    def _rewrite_media_block(self, block: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        """返回替换后的块；None 表示保持原样。"""
+        block_type = block.get("type")
+
+        if block_type == "input_audio":
+            fmt = (block.get("input_audio") or {}).get("format") or "音频"
+            return {"type": "text", "text": f"[附件音频（{fmt}）不受当前模型支持，已省略]"}
+
+        if block_type != "file":
+            return None
+
+        # 已是扁平 file_id：保持（mambo_agents 的 file_uploader 产出的就是这种块）
+        if block.get("file_id"):
+            return None
+        file_data = block.get("file_data")
+        filename = block.get("filename")
+        if file_data is None:
+            inner = block.get("file")
+            if not isinstance(inner, dict):
+                return None
+            if inner.get("file_id"):
+                return {"type": "file", "file_id": inner["file_id"]}
+            file_data = inner.get("file_data")
+            filename = filename or inner.get("filename")
+        if file_data is None:
+            return None
+        return self._flat_file_block(file_data, filename)
+
+    def _flat_file_block(
+        self, file_data: str, filename: Optional[str]
+    ) -> Optional[Dict[str, Any]]:
+        """扁平 file_data：图片保持内联；非图片转文本占位。"""
+        if self._decode_image_data_url(file_data) is None:
+            mime = self._mime_from_data_url(file_data) or "未知类型"
+            return {"type": "text", "text": f"[附件文件（{mime}）不受当前模型支持，已省略]"}
+        flat: Dict[str, Any] = {"type": "file", "file_data": file_data}
+        if filename:
+            flat["filename"] = filename
+        return flat
+
+    @staticmethod
+    def _decode_image_data_url(url: Any) -> Optional[Tuple[str, bytes]]:
+        """将 ``data:image/...;base64,...`` 解码为 ``(mime, raw_bytes)``，非图片返回 None。"""
+        if not isinstance(url, str) or not url.startswith("data:image/"):
+            return None
+        try:
+            header, b64 = url.split(",", 1)
+        except ValueError:
+            return None
+        if ";base64" not in header:
+            return None
+        mime = header[len("data:"):].split(";", 1)[0]
+        try:
+            raw = base64.b64decode(b64)
+        except Exception:
+            return None
+        return mime, raw
+
+    @staticmethod
+    def _mime_from_data_url(data_url: Any) -> Optional[str]:
+        """从 ``data:<mime>;base64,...`` 提取 MIME 类型。"""
+        if not isinstance(data_url, str) or not data_url.startswith("data:"):
+            return None
+        header = data_url.split(",", 1)[0]
+        return header[len("data:"):].split(";", 1)[0] or None
 
     def _create_chat_result(
             self, response: Union[Dict, Any], generation_info: Optional[Dict] = None

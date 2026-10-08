@@ -55,6 +55,7 @@ class ReadOnlyBackend(BackendProtocol):
             max_read_chars=backend._max_read_chars,
             summarizer=backend._summarizer,
             multimodal_describer=getattr(backend, "_multimodal_describer", None),
+            file_uploader=getattr(backend, "_file_uploader", None),
             tool_timeouts=backend._tool_timeouts,
         )
         self._backend = backend
