@@ -306,6 +306,102 @@ class SummarizationState(AgentState):
 
 
 # ---------------------------------------------------------------------------
+# Cutoff index anchoring
+# ---------------------------------------------------------------------------
+# ``cutoff_index`` is a positional snapshot of ``state["messages"]``.  Between
+# the moment an event is created and the moment it is applied, other middleware
+# (notably ``PatchToolCallsMiddleware``) may **insert** messages, which shifts
+# every index after the insertion point.  Applying such a stale index can slice
+# the preserved zone so that it starts on a ``ToolMessage`` whose parent
+# ``AIMessage`` was summarized away — an orphan tool message that
+# OpenAI-compatible endpoints reject with HTTP 400.
+#
+# To stay robust, the boundary is re-derived from the event's anchor message
+# (``last_summarized_message``) instead of trusting the raw index, and the
+# resulting boundary is then repaired so it can never sit on an unpaired
+# ``ToolMessage``.
+
+
+def _locate_anchor_index(
+    messages: list[AnyMessage],
+    anchor: AnyMessage,
+    hint: int,
+) -> int | None:
+    """Locate ``anchor`` in ``messages``, preferring identity then message id.
+
+    Args:
+        messages: Current message list (state coordinates).
+        anchor: The message that was the boundary of the summarized zone.
+        hint: Expected index, used to disambiguate duplicates.
+
+    Returns:
+        Index of ``anchor`` in ``messages``, or ``None`` if it disappeared.
+    """
+    candidates = [i for i, msg in enumerate(messages) if msg is anchor]
+    if not candidates:
+        anchor_id = getattr(anchor, "id", None)
+        if anchor_id:
+            candidates = [
+                i for i, msg in enumerate(messages)
+                if getattr(msg, "id", None) == anchor_id
+            ]
+    if not candidates:
+        return None
+    return min(candidates, key=lambda i: (abs(i - hint), i))
+
+
+def _repair_tool_boundary(messages: list[AnyMessage], cutoff: int) -> int:
+    """Move ``cutoff`` so the preserved zone never starts on an unpaired tool message.
+
+    If the message at ``cutoff`` is a ``ToolMessage``, its parent ``AIMessage``
+    is pulled into the preserved zone; when no such parent exists, the leading
+    orphan tool messages are skipped instead.
+    """
+    return LCSummarizationMiddleware._find_safe_cutoff_point(messages, cutoff)
+
+
+def _resolve_application_cutoff(
+    messages: list[AnyMessage],
+    event: SummarizationEvent,
+    stored_cutoff: int,
+) -> int:
+    """Re-derive a safe cutoff for ``messages`` at event-application time.
+
+    Args:
+        messages: Current message list from state.
+        event: The summarization event being applied.
+        stored_cutoff: The ``cutoff_index`` recorded when the event was created.
+
+    Returns:
+        A cutoff index that is consistent with the current message list and
+        never separates an ``AIMessage.tool_calls`` from its ``ToolMessage``.
+    """
+    cutoff = stored_cutoff
+    anchor = event.get("last_summarized_message")
+    if anchor is not None:
+        located = _locate_anchor_index(messages, anchor, stored_cutoff - 1)
+        if located is not None:
+            cutoff = located + 1
+        else:
+            logger.warning(
+                "Summarization anchor missing from history; falling back to "
+                "stored cutoff_index %d",
+                stored_cutoff,
+            )
+
+    cutoff = max(0, min(cutoff, len(messages)))
+
+    repaired = _repair_tool_boundary(messages, cutoff)
+    if repaired != cutoff:
+        logger.warning(
+            "Summarization cutoff repaired %d -> %d to keep AI/Tool pairs intact",
+            cutoff,
+            repaired,
+        )
+    return repaired
+
+
+# ---------------------------------------------------------------------------
 # Configuration Pydantic model
 # ---------------------------------------------------------------------------
 
@@ -843,6 +939,11 @@ class MamboSummarizationMiddleware(AgentMiddleware[SummarizationState, ContextT,
     ) -> list[AnyMessage]:
         """Reconstruct effective messages from raw state + summarization event.
 
+        The recorded ``cutoff_index`` is only a snapshot taken when the event
+        was created; other middleware may have inserted messages since then.
+        The boundary is therefore re-derived from the event's anchor message and
+        repaired against the current list before slicing.
+
         Args:
             messages: Full message list from state.
             event: The ``_summarization_event`` dict, or ``None``.
@@ -865,7 +966,9 @@ class MamboSummarizationMiddleware(AgentMiddleware[SummarizationState, ContextT,
             logger.warning("Malformed _summarization_event (missing keys): %s", exc)
             return list(messages)
 
-        if cutoff_idx > len(messages):
+        cutoff_idx = _resolve_application_cutoff(messages, event, cutoff_idx)
+
+        if cutoff_idx >= len(messages):
             logger.warning(
                 "Summarization cutoff_index %d exceeds message count %d",
                 cutoff_idx,
@@ -900,6 +1003,38 @@ class MamboSummarizationMiddleware(AgentMiddleware[SummarizationState, ContextT,
             logger.warning("Malformed _summarization_event: missing cutoff_index")
             return effective_cutoff
         return prior_cutoff + effective_cutoff - 1
+
+    @staticmethod
+    def _resolve_state_cutoff(
+        messages: list[AnyMessage],
+        anchor: AnyMessage | None,
+        fallback: int,
+    ) -> int:
+        """Anchor the new event's absolute cutoff to a real message index.
+
+        ``fallback`` is the purely arithmetic translation of the effective
+        cutoff, which drifts whenever the message list was mutated after the
+        previous event recorded its index.  Locating the anchor message in
+        ``messages`` yields an exact boundary instead.
+
+        Args:
+            messages: Current ``state["messages"]``.
+            anchor: The last real message of the summarized zone.
+            fallback: Cutoff to use when the anchor cannot be located.
+
+        Returns:
+            The absolute cutoff index for ``state["messages"]``.
+        """
+        if anchor is not None:
+            located = _locate_anchor_index(messages, anchor, fallback - 1)
+            if located is not None:
+                return located + 1
+            logger.warning(
+                "Could not locate summarized-zone anchor in state messages; "
+                "falling back to computed cutoff_index %d",
+                fallback,
+            )
+        return fallback
 
     # ------------------------------------------------------------------
     # Chained summarization (preserves previous summaries)
@@ -1219,8 +1354,12 @@ class MamboSummarizationMiddleware(AgentMiddleware[SummarizationState, ContextT,
                 )
             ]
 
-        state_cutoff_index = self._compute_state_cutoff(previous_event, cutoff_index)
         last_msg = self._extract_last_summarized_message(messages_to_summarize)
+        state_cutoff_index = self._resolve_state_cutoff(
+            messages=_unwrap_overwrite(state.get("messages") or []),
+            anchor=last_msg,
+            fallback=self._compute_state_cutoff(previous_event, cutoff_index),
+        )
 
         new_event: SummarizationEvent = {
             "cutoff_index": state_cutoff_index,
