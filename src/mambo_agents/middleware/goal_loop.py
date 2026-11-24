@@ -148,8 +148,18 @@ class GoalState(TypedDict):
 
 
 def _goal_last_wins(a: GoalState | None, b: GoalState | None) -> GoalState | None:
-    """Last-write-wins reducer for the ``goal`` channel (whole-dict replace)."""
-    return b
+    """Last-write-wins reducer for the ``goal`` channel (whole-dict replace).
+
+    An empty mapping is normalised to ``None``: langgraph >= 1.2 seeds reducer
+    channels with the annotation's empty value (``{}``) instead of leaving them
+    unset, which would otherwise look like an active but field-less goal.
+    """
+    return b or None
+
+
+def _read_goal(state: dict[str, Any]) -> GoalState | None:
+    """Return the active goal, treating an empty channel value as absent."""
+    return state.get("goal") or None
 
 
 class GoalLoopState(AgentState):
@@ -160,8 +170,14 @@ class GoalLoopState(AgentState):
     and the goal tools.
     """
 
-    goal: Annotated[NotRequired[GoalState], OmitFromInput, _goal_last_wins]
-    """Current goal state (``None`` when no goal is active)."""
+    goal: Annotated[NotRequired[GoalState | None], OmitFromInput, _goal_last_wins]
+    """Current goal state (``None`` when no goal is active).
+
+    The optional union is load-bearing: langgraph >= 1.2 seeds reducer channels
+    with ``typ()``, so a bare ``GoalState`` annotation would start the channel
+    as ``{}`` and surface an empty goal in state and graph output. A union has
+    no empty value, so the channel starts unset (langgraph 1.1 behaviour).
+    """
 
 
 # ---------------------------------------------------------------------------
@@ -477,7 +493,7 @@ class GoalLoopMiddleware(AgentMiddleware[GoalLoopState, ContextT, Any]):
         """Build the ``get_goal`` tool function (bound to this instance)."""
 
         def _get_goal(tool_call_id: str, state: dict[str, Any]) -> Command:
-            goal = state.get("goal")
+            goal = _read_goal(state)
             messages = state.get("messages") or []
             # 区分调用来源:系统自动注入(id 带 _INJECT_PREFIX)还是模型主动调用,
             # 用于在返回中明确标注,避免模型把"主动查询"误认为"进入下一轮"。
@@ -630,7 +646,7 @@ class GoalLoopMiddleware(AgentMiddleware[GoalLoopState, ContextT, Any]):
             tool_call_id: str,
             state: dict[str, Any],
         ) -> Command:
-            goal = state.get("goal")
+            goal = _read_goal(state)
             if goal is not None and goal.get("status") == "active":
                 return Command(
                     update={
@@ -724,7 +740,7 @@ class GoalLoopMiddleware(AgentMiddleware[GoalLoopState, ContextT, Any]):
             tool_call_id: str,
             state: dict[str, Any],
         ) -> Command:
-            goal = state.get("goal")
+            goal = _read_goal(state)
             if goal is None:
                 return Command(
                     update={
@@ -900,7 +916,7 @@ class GoalLoopMiddleware(AgentMiddleware[GoalLoopState, ContextT, Any]):
         self, state: GoalLoopState, runtime: Runtime,
     ) -> dict[str, Any] | None:
         """Inject the preset goal on the first turn (user-controlled mode)."""
-        if self._mode == "preset" and state.get("goal") is None:
+        if self._mode == "preset" and _read_goal(state) is None:
             return {
                 "goal": {
                     "id": _PRESET_GOAL_ID,
@@ -1005,7 +1021,7 @@ class GoalLoopMiddleware(AgentMiddleware[GoalLoopState, ContextT, Any]):
         - LLM-created goal: end when ``complete`` / ``blocked`` or when
           ``rounds >= max_rounds`` (timeout); otherwise inject.
         """
-        goal = state.get("goal")
+        goal = _read_goal(state)
         if goal is None:
             return None
 
