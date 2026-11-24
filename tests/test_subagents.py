@@ -224,7 +224,12 @@ class TestTaskToolInvocation:
         assert "`known`" in result
 
     def test_task_requires_tool_call_id(self):
-        """task tool raises ValueError without tool_call_id."""
+        """task tool refuses to run without tool_call_id (returns a message).
+
+        Changed from raising ``ValueError``: an exception here would just be
+        re-wrapped into an error ``ToolMessage`` by ``ToolCallErrorMiddleware``,
+        so the tool states the problem directly instead.
+        """
         specs: list[_SubagentSpec] = [
             _SubagentSpec(
                 name="agent",
@@ -235,12 +240,13 @@ class TestTaskToolInvocation:
         tool = _build_task_tool(specs, event_granularity="updates")
 
         runtime = _make_tool_runtime(tool_call_id="")  # empty / falsy
-        with pytest.raises(ValueError, match="Tool call ID"):
-            tool.func(
-                description="do",
-                subagent_type="agent",
-                runtime=runtime,
-            )
+        result = tool.func(
+            description="do",
+            subagent_type="agent",
+            runtime=runtime,
+        )
+        assert isinstance(result, str)
+        assert "tool_call_id" in result
 
 
 # ---------------------------------------------------------------------------

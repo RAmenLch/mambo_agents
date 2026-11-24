@@ -15,6 +15,7 @@ from mambo_agents.middleware.async_subagents import (
     AsyncSubAgentMiddleware,
     AsyncTaskData,
 )
+from mambo_agents.middleware.tool_call_error import ToolCallErrorMiddleware
 from mambo_agents.middleware.memory import (
     MamboMemoryMiddleware,
     MemoryFormatHook,
@@ -39,6 +40,16 @@ from mambo_agents.middleware.subagents import (
     EventGranularity,
     SubAgent,
     SubAgentMiddleware,
+)
+from mambo_agents.middleware.subagent_snapshot import (
+    SUBAGENT_HISTORY_KEY,
+    SubAgentSnapshotNode,
+    aget_chain,
+    aget_node,
+    alist_nodes,
+    get_chain,
+    get_node,
+    list_nodes,
 )
 from mambo_agents.middleware.summarization import (
     MamboSummarizationMiddleware,
@@ -68,10 +79,19 @@ __all__ = [
     "HybridWorkspaceBackend",
     "SubAgent",
     "SubAgentMiddleware",
+    "SubAgentSnapshotNode",
+    "SUBAGENT_HISTORY_KEY",
+    "aget_chain",
+    "aget_node",
+    "alist_nodes",
+    "get_chain",
+    "get_node",
+    "list_nodes",
     "SummarizationConfig",
     "SummarizationMode",
     "SummaryHook",
     "SummaryHookContext",
+    "ToolCallErrorMiddleware",
     "WritePlansInput",
     "__version__",
     "create_mambo_agent",

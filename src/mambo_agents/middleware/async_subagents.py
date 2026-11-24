@@ -54,6 +54,7 @@ from pydantic import BaseModel, ConfigDict, Field
 
 from mambo_agents.backends.protocol import BackendProtocol
 from mambo_agents.middleware.subagents import CompiledSubAgent, SubAgent, _EXCLUDED_STATE_KEYS, _SubagentSpec
+from mambo_agents.middleware.tool_call_error import ToolCallErrorMiddleware
 
 # ---------------------------------------------------------------------------
 # Pydantic models
@@ -946,7 +947,12 @@ def _build_subagent_specs(
         if spec.model is None:
             raise ValueError(f"SubAgent '{spec.name}' must specify 'model'")
 
-        middleware: list[Any] = list(spec.middleware)
+        middleware: list[Any] = [
+            # A subagent tool failure must not abort the subagent's superstep
+            # (interrupts still bubble up untouched).
+            ToolCallErrorMiddleware(),
+            *spec.middleware,
+        ]
         if spec.interrupt_on:
             middleware.append(HumanInTheLoopMiddleware(interrupt_on=spec.interrupt_on))
 

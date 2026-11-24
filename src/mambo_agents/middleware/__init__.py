@@ -54,6 +54,16 @@ from mambo_agents.middleware.subagents import (
     SubAgentConfig,
     SubAgentMiddleware,
 )
+from mambo_agents.middleware.subagent_snapshot import (
+    SUBAGENT_HISTORY_KEY,
+    SubAgentSnapshotNode,
+    aget_chain,
+    aget_node,
+    alist_nodes,
+    get_chain,
+    get_node,
+    list_nodes,
+)
 from mambo_agents.middleware.summarization import (
     DEFAULT_MAMBO_CHAINED_SUMMARY_PROMPT,
     DEFAULT_MAMBO_SUMMARY_PROMPT,
@@ -64,6 +74,7 @@ from mambo_agents.middleware.summarization import (
     SummaryHookContext,
 )
 from mambo_agents.middleware.tool_unpack import ToolUnpackResult
+from mambo_agents.middleware.tool_call_error import ToolCallErrorMiddleware
 from mambo_agents.middleware.version_control import (
     BackupEvent,
     Snapshot,
@@ -111,10 +122,19 @@ __all__ = [
     "SubAgent",
     "SubAgentConfig",
     "SubAgentMiddleware",
+    "SubAgentSnapshotNode",
+    "SUBAGENT_HISTORY_KEY",
+    "aget_chain",
+    "aget_node",
+    "alist_nodes",
+    "get_chain",
+    "get_node",
+    "list_nodes",
     "SummarizationConfig",
     "SummarizationMode",
     "SummaryHook",
     "SummaryHookContext",
+    "ToolCallErrorMiddleware",
     "ToolUnpackResult",
     "VersionControlConfig",
     "VersionControlMiddleware",

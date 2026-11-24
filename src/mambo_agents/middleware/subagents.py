@@ -22,8 +22,11 @@ be distinguished by the consumer.
 
 from __future__ import annotations
 
+import logging
+import threading
 import time
 from collections.abc import Awaitable, Callable, Sequence
+from dataclasses import dataclass
 from typing import Any, Literal, cast
 
 from langchain.agents.factory import create_agent as _langchain_create_agent
@@ -38,14 +41,47 @@ from langchain.agents.middleware.types import (
 )
 from langchain.tools import BaseTool, ToolRuntime
 from langchain_core.language_models import BaseChatModel
-from langchain_core.messages import HumanMessage, ToolMessage
+from langchain_core.messages import BaseMessage, HumanMessage, ToolMessage
 from langchain_core.runnables import Runnable, RunnableConfig
 from langchain_core.tools import StructuredTool
 from langgraph.config import get_stream_writer
+from langgraph.errors import GraphBubbleUp
 from langgraph.types import Command, Overwrite
 from pydantic import BaseModel, ConfigDict, Field
 
 from mambo_agents.backends.protocol import BackendProtocol
+from mambo_agents.middleware.subagent_snapshot import (
+    SubAgentSnapshotNode,
+    adelete_node,
+    aget_node,
+    alist_nodes,
+    aput_node,
+    build_continuation_prompt,
+    build_delta,
+    build_failure_content,
+    classify_failure,
+    continuation_metadata,
+    count_root_failures,
+    delete_node,
+    get_node,
+    list_nodes,
+    now_iso,
+    put_node,
+    to_serialized,
+    validate_continuation,
+)
+from mambo_agents.middleware.tool_call_error import ToolCallErrorMiddleware
+from mambo_agents.utils.cancellation import is_cancellation_related
+
+logger = logging.getLogger(__name__)
+
+#: Returned when a ``task`` call has no ``tool_call_id`` — without it no
+#: continuation id can be issued, and raising would just be re-wrapped by
+#: ``ToolCallErrorMiddleware``.
+_NO_TOOL_CALL_ID = (
+    "Subagent invocation requires a tool_call_id; this call cannot be "
+    "recorded or continued."
+)
 
 # ---------------------------------------------------------------------------
 # Pydantic models for subagent specification
@@ -147,6 +183,29 @@ class SubAgentConfig(BaseModel):
         default=None,
         description="Optional description appended to the ``task`` tool.",
     )
+    catch_errors: bool | None = Field(
+        default=None,
+        description=(
+            "Whether a failing subagent is turned into an error ``ToolMessage`` "
+            "instead of aborting the main turn.  ``None`` uses the middleware "
+            "default (``True``)."
+        ),
+    )
+    max_continue_attempts: int | None = Field(
+        default=None,
+        description="Maximum chain depth a ``continue_id`` may reach.",
+    )
+    max_children: int | None = Field(
+        default=None,
+        description="Maximum number of continuations started from one breakpoint.",
+    )
+    max_root_failures_per_thread: int | None = Field(
+        default=None,
+        description=(
+            "Maximum number of failed chain roots kept per conversation. "
+            "Only affects snapshot bookkeeping, never task execution."
+        ),
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -181,17 +240,27 @@ class TaskToolSchema(BaseModel):
     model_config = ConfigDict(extra="allow")
 
     description: str = Field(
+        default="",
         description=(
             "A detailed description of the task for the subagent to perform "
             "autonomously. Include all necessary context and specify the "
-            "expected output format."
-        )
+            "expected output format. Required for a new task; optional when "
+            "``continue_id`` is given (then it is the extra instruction)."
+        ),
     )
     subagent_type: str = Field(
         description=(
             "The type of subagent to use. Must be one of the available agent "
             "types listed in the tool description."
-        )
+        ),
+    )
+    continue_id: str | None = Field(
+        default=None,
+        description=(
+            "Optional breakpoint id returned by a previous failure "
+            "(`Continuation saved: node_id=...`). Use it to resume without "
+            "redoing completed steps."
+        ),
     )
 
 
@@ -205,7 +274,7 @@ When using the Task tool, you must specify a subagent_type parameter to select w
 ## Usage notes:
 1. Launch multiple agents concurrently whenever possible, to maximize performance; to do that, use a single message with multiple tool uses
 2. When the agent is done, it will return a single message back to you. The result returned by the agent is not visible to the user. To show the user the result, you should send a text message back to the user with a concise summary of the result.
-3. Each agent invocation is stateless. You will not be able to send additional messages to the agent, nor will the agent be able to communicate with you outside of its final report. Therefore, your prompt should contain a highly detailed task description for the agent to perform autonomously and you should specify exactly what information the agent should return back to you in its final and only message to you.
+3. Each agent invocation starts a fresh context window. You cannot send additional messages mid-run, nor can the agent talk back outside of its final report. Therefore your prompt must contain a highly detailed task description and specify exactly what the agent should return. If a run fails, the result carries a `continue_id`: pass it back as `continue_id` to resume from that breakpoint (completed steps are not redone) instead of starting over.
 4. The agent's outputs should generally be trusted
 5. Clearly tell the agent whether you expect it to create content, perform analysis, or just do research (search, file reads, web fetches, etc.), since it is not aware of the user's intent
 6. If the agent description mentions that it should be used proactively, then you should try your best to use it without the user having to ask for it first. Use your judgement.
@@ -332,7 +401,19 @@ When NOT to use the task tool:
 ## Important Task Tool Usage Notes to Remember
 - Whenever possible, parallelize the work that you do. This is true for both tool_calls, and for tasks. Whenever you have independent steps to complete - make tool_calls, or kick off tasks (subagents) in parallel to accomplish them faster. This saves time for the user, which is incredibly important.
 - Remember to use the `task` tool to silo independent tasks within a multi-part objective.
-- You should use the `task` tool whenever you have a complex task that will take multiple steps, and is independent from other tasks that the agent needs to complete. These agents are highly competent and efficient."""  # noqa: E501
+- You should use the `task` tool whenever you have a complex task that will take multiple steps, and is independent from other tasks that the agent needs to complete. These agents are highly competent and efficient.
+
+## Error recovery & continuing
+A failing task returns a normal tool result with `status="error"`; the rest of your turn keeps working. Read the message:
+
+- If it says `Continuation saved: node_id="<id>"`, you may resume with
+  `task(subagent_type="...", continue_id="<id>")` — the subagent picks up where it
+  stopped and does **not** redo completed steps. Add a `description` when you want to
+  correct course (e.g. "skip the web search, use the files you already read").
+- If the result says the error is **not retryable**, or `available=false` (continuation
+  exhausted / too many attempts), do **not** retry the same call: change strategy,
+  pick another subagent type, or report the failure to the user.
+- Never fabricate a `continue_id`; only use the one returned by a previous failure."""  # noqa: E501
 
 
 DEFAULT_GENERAL_PURPOSE_DESCRIPTION = (
@@ -409,6 +490,38 @@ def _return_command_with_state_update(
     )
 
 
+def _return_command_with_message(result: dict, message: ToolMessage) -> Command:
+    """Pass through non-excluded state channels and attach *message*.
+
+    Mirrors :func:`_return_command_with_state_update` so a failed run updates
+    exactly the same channels a successful one would.
+    """
+    state_update = {
+        k: v for k, v in (result or {}).items() if k not in _EXCLUDED_STATE_KEYS
+    }
+    return Command(update={**state_update, "messages": [message]})
+
+
+@dataclass
+class _TaskRun:
+    """Everything a ``task`` call needs from validation through to reporting."""
+
+    tool_call_id: str
+    subagent_type: str
+    instruction: str
+    subagent: Runnable
+    state: dict
+    config: RunnableConfig
+    injected: list[BaseMessage]
+    injected_ids: set[str]
+    parent: SubAgentSnapshotNode | None = None
+    parent_nodes: tuple[SubAgentSnapshotNode, ...] = ()
+    store: Any = None
+    thread_id: str | None = None
+    cleanup_pending: bool = False
+    steps: int = 0
+
+
 def _merge_updates_state(final: dict, chunk: dict) -> dict:
     """Merge a streaming chunk (from ``stream_mode='updates'``) into accumulated state."""
     for _node_name, state_update in chunk.items():
@@ -444,6 +557,11 @@ def _build_task_tool(
     subagents: list[_SubagentSpec],
     event_granularity: EventGranularity = "updates",
     task_description: str | None = None,
+    *,
+    catch_errors: bool = True,
+    max_continue_attempts: int = 3,
+    max_children: int = 2,
+    max_root_failures_per_thread: int = 10,
 ) -> BaseTool:
     """Create a ``task`` tool that invokes subagents with streaming events.
 
@@ -491,35 +609,21 @@ def _build_task_tool(
             _deduped.append(m)
     _stream_modes = _deduped
 
-    def _validate_and_prepare_state(
-        subagent_type: str,
-        description: str,
-        runtime: ToolRuntime,
-    ) -> tuple[Runnable, dict, RunnableConfig]:
-        """Validate subagent type and prepare the initial state."""
-        subagent = subagent_graphs[subagent_type]
-        subagent_state = {
-            k: v
-            for k, v in runtime.state.items()
-            if k not in _EXCLUDED_STATE_KEYS
-        }
-        subagent_state["messages"] = [HumanMessage(content=description)]
-        subagent_config: RunnableConfig = {
-            "configurable": {
-                **runtime.config.get("configurable", {}),
-                "ls_agent_type": "subagent",
-            }
-        }
-
-        return subagent, subagent_state, subagent_config
-
     def _emit_custom_event(
         tool_call_id: str,
         subagent_type: str,
         chunk: object,
     ) -> None:
-        """Emit a custom event via the stream writer if available."""
-        writer = get_stream_writer()
+        """Emit a custom event via the stream writer if available.
+
+        ``get_stream_writer()`` raises when there is no runnable context (unit
+        tests, direct tool invocation).  Event emission is best-effort: a missing
+        stream writer must never turn into a subagent failure.
+        """
+        try:
+            writer = get_stream_writer()
+        except Exception:  # pragma: no cover - outside a runnable context
+            return
         if writer is not None:
             writer(
                 {
@@ -532,12 +636,255 @@ def _build_task_tool(
                 }
             )
 
+    # ---- continuation helpers ------------------------------------------------
+
+    _in_flight: set[str] = set()
+    _in_flight_lock = threading.Lock()
+
+    def _claim_breakpoint(continue_id: str | None) -> bool:
+        """Reserve a breakpoint atomically (check-and-add under one lock)."""
+        if not continue_id:
+            return True
+        with _in_flight_lock:
+            if continue_id in _in_flight:
+                return False
+            _in_flight.add(continue_id)
+        return True
+
+    def _release_breakpoint(continue_id: str | None) -> None:
+        if not continue_id:
+            return
+        with _in_flight_lock:
+            _in_flight.discard(continue_id)
+
+    def _snapshot_target(runtime: ToolRuntime) -> tuple[Any, str | None]:
+        """``(store, thread_id)`` — both ``None``/missing disables continuation."""
+        store = getattr(runtime, "store", None)
+        configurable = (runtime.config or {}).get("configurable") or {}
+        thread_id = configurable.get("thread_id")
+        return store, (str(thread_id) if thread_id else None)
+
+    def _begin(
+        description: str,
+        subagent_type: str,
+        continue_id: str | None,
+        runtime: ToolRuntime,
+    ) -> _TaskRun | str:
+        """Validate the request and prepare the run; a ``str`` means rejected."""
+        store, thread_id = _snapshot_target(runtime)
+        continuation_enabled = store is not None and thread_id is not None
+
+        parent: SubAgentSnapshotNode | None = None
+        parent_nodes: tuple[SubAgentSnapshotNode, ...] = ()
+        history: list[BaseMessage] = []
+
+        if continue_id:
+            if not continuation_enabled:
+                return (
+                    "Continuation is unavailable (no store configured). "
+                    "Start a new task instead."
+                )
+            check = validate_continuation(
+                store,
+                thread_id,  # type: ignore[arg-type]
+                continue_id,
+                subagent_type,
+                max_continue_attempts=max_continue_attempts,
+                max_children=max_children,
+                in_flight=_in_flight,
+            )
+            if not check.ok:
+                return check.message
+            parent = check.node
+            parent_nodes = check.nodes
+            history = check.history()
+            if not _claim_breakpoint(continue_id):
+                return "该任务正在执行中，拒绝并发续连。"
+
+        instruction = description or (
+            parent.description if parent is not None else ""
+        )
+        if not instruction:
+            _release_breakpoint(continue_id)
+            return (
+                "Provide a `description` for a new task, or a valid "
+                "`continue_id` to resume a previous one."
+            )
+
+        messages: list[BaseMessage] = list(history)
+        if parent is not None:
+            messages.append(
+                HumanMessage(
+                    content=build_continuation_prompt(parent.error_type, description)
+                )
+            )
+        else:
+            messages.append(HumanMessage(content=instruction))
+
+        subagent = subagent_graphs[subagent_type]
+        state = {
+            k: v
+            for k, v in runtime.state.items()
+            if k not in _EXCLUDED_STATE_KEYS
+        }
+        state["messages"] = messages
+        config: RunnableConfig = {
+            "configurable": {
+                **((runtime.config or {}).get("configurable") or {}),
+                "ls_agent_type": "subagent",
+            }
+        }
+
+        # Entry cleanup is performed by the caller (sync vs async store API) —
+        # see ``_TaskRun.cleanup_pending``.
+
+        return _TaskRun(
+            tool_call_id=runtime.tool_call_id,
+            subagent_type=subagent_type,
+            instruction=instruction,
+            subagent=subagent,
+            state=state,
+            config=config,
+            injected=messages,
+            injected_ids={m.id for m in messages if getattr(m, "id", None)},
+            parent=parent,
+            parent_nodes=parent_nodes,
+            store=store if continuation_enabled else None,
+            thread_id=thread_id if continuation_enabled else None,
+            cleanup_pending=continuation_enabled,
+        )
+
+    def _new_failure_node(
+        plan: _TaskRun, exc: Exception, final_state: dict
+    ) -> SubAgentSnapshotNode:
+        produced = list((final_state or {}).get("messages") or [])
+        delta = build_delta(
+            plan.injected, produced, injected_ids=plan.injected_ids
+        )
+        if not delta:
+            delta = [HumanMessage(content=plan.instruction)]
+        error_type, error_message, retryable = classify_failure(exc)
+        parent = plan.parent
+        chain = [*parent.chain, parent.node_id] if parent is not None else []
+        return SubAgentSnapshotNode(
+            node_id=plan.tool_call_id,
+            parent_id=parent.node_id if parent is not None else None,
+            chain=chain,
+            depth=len(chain) + 1,
+            subagent_type=plan.subagent_type,
+            description=plan.instruction,
+            status="failed",
+            error_type=error_type,
+            error_message=error_message,
+            retryable=retryable,
+            available=retryable,
+            delta_messages=to_serialized(delta),
+            steps=plan.steps,
+            injected_prefix_len=len(plan.injected),
+            created_at=now_iso(),
+        )
+
+    def _retention(
+        plan: _TaskRun, node: SubAgentSnapshotNode, existing_roots: int
+    ) -> tuple[bool, bool, str | None]:
+        """``(should_write, available, reason)`` for a freshly built node."""
+        if plan.store is None or plan.thread_id is None:
+            return False, False, "snapshot_unavailable"
+        if not node.retryable:
+            return True, False, "not_retryable"
+        if node.depth > max_continue_attempts:
+            return True, False, "exhausted"
+        if node.parent_id is None and existing_roots >= max_root_failures_per_thread:
+            return False, False, "root_failures_exceeded"
+        return True, True, None
+
+    def _failure_result(
+        plan: _TaskRun,
+        node: SubAgentSnapshotNode,
+        available: bool,
+        reason: str | None,
+        final_state: dict,
+    ) -> Command:
+        node.available = available
+        content = build_failure_content(
+            subagent_type=plan.subagent_type,
+            error_type=node.error_type,
+            error_message=node.error_message,
+            steps=node.steps,
+            node_id=node.node_id if available else None,
+            retryable=node.retryable,
+            available=available,
+            reason=reason or "",
+        )
+        metadata = continuation_metadata(
+            node if (plan.store is not None and available) else None,
+            max_attempts=max_continue_attempts,
+            max_children=max_children,
+            available=available,
+            reason=reason,
+        )
+        return _return_command_with_message(
+            final_state,
+            ToolMessage(
+                content,
+                name="task",
+                tool_call_id=plan.tool_call_id,
+                status="error",
+                additional_kwargs={"subagent_continuation": metadata},
+            ),
+        )
+
+    def _failed(plan: _TaskRun, exc: Exception, final_state: dict) -> Command:
+        node = _new_failure_node(plan, exc, final_state)
+        existing_roots = 0
+        if plan.store is not None and plan.thread_id is not None and node.retryable:
+            try:
+                existing_roots = count_root_failures(
+                    list_nodes(plan.store, plan.thread_id)
+                )
+            except Exception:  # pragma: no cover - defensive
+                logger.warning("Failed to scan snapshots", exc_info=True)
+        write, available, reason = _retention(plan, node, existing_roots)
+        if write:
+            try:
+                put_node(plan.store, plan.thread_id, node)  # type: ignore[arg-type]
+                if get_node(plan.store, plan.thread_id, node.node_id) is None:  # type: ignore[arg-type]
+                    available, reason = False, "snapshot_write_failed"
+            except Exception:  # pragma: no cover - defensive
+                logger.warning("Failed to persist subagent snapshot", exc_info=True)
+                available, reason = False, "snapshot_write_failed"
+        return _failure_result(plan, node, available, reason, final_state)
+
+    async def _afailed(
+        plan: _TaskRun, exc: Exception, final_state: dict
+    ) -> Command:
+        node = _new_failure_node(plan, exc, final_state)
+        existing_roots = 0
+        if plan.store is not None and plan.thread_id is not None and node.retryable:
+            try:
+                existing_roots = count_root_failures(
+                    await alist_nodes(plan.store, plan.thread_id)
+                )
+            except Exception:  # pragma: no cover - defensive
+                logger.warning("Failed to scan snapshots", exc_info=True)
+        write, available, reason = _retention(plan, node, existing_roots)
+        if write:
+            try:
+                await aput_node(plan.store, plan.thread_id, node)  # type: ignore[arg-type]
+                if await aget_node(plan.store, plan.thread_id, node.node_id) is None:  # type: ignore[arg-type]
+                    available, reason = False, "snapshot_write_failed"
+            except Exception:  # pragma: no cover - defensive
+                logger.warning("Failed to persist subagent snapshot", exc_info=True)
+                available, reason = False, "snapshot_write_failed"
+        return _failure_result(plan, node, available, reason, final_state)
+
     # ---- sync task ----------------------------------------------------------
 
     def task(
         description: str,
         subagent_type: str,
         runtime: ToolRuntime,
+        continue_id: str | None = None,
         **_extra: object,
     ) -> str | Command:
         if subagent_type not in subagent_graphs:
@@ -547,39 +894,55 @@ def _build_task_tool(
                 f"not exist, the only allowed types are {allowed}"
             )
         if not runtime.tool_call_id:
-            raise ValueError("Tool call ID is required for subagent invocation")
+            return _NO_TOOL_CALL_ID
 
-        subagent, subagent_state, subagent_config = _validate_and_prepare_state(
-            subagent_type, description, runtime
-        )
+        plan = _begin(description, subagent_type, continue_id, runtime)
+        if isinstance(plan, str):
+            return plan
+
+        if plan.cleanup_pending and plan.store is not None and plan.thread_id:
+            try:
+                delete_node(plan.store, plan.thread_id, plan.tool_call_id)
+            except Exception:  # pragma: no cover - defensive
+                logger.warning("Failed to clear stale snapshot", exc_info=True)
 
         final_state: dict = {}
-        for chunk in subagent.stream(
-            subagent_state, subagent_config, stream_mode=_stream_modes
-        ):
-            if isinstance(chunk, tuple) and len(chunk) == 2:
-                mode, data = chunk
-                if mode == event_granularity:
+        try:
+            for chunk in plan.subagent.stream(
+                plan.state, plan.config, stream_mode=_stream_modes
+            ):
+                if isinstance(chunk, tuple) and len(chunk) == 2:
+                    mode, data = chunk
+                    if mode in (event_granularity, "custom"):
+                        _emit_custom_event(
+                            runtime.tool_call_id, subagent_type, data
+                        )
+                    if mode == "values":
+                        final_state = cast(dict, data)
+                        plan.steps += 1
+                else:
+                    # Single-mode output
                     _emit_custom_event(
-                        runtime.tool_call_id, subagent_type, data
+                        runtime.tool_call_id, subagent_type, chunk
                     )
-                elif mode == "custom":
-                    _emit_custom_event(
-                        runtime.tool_call_id, subagent_type, data
-                    )
-                if mode == "values":
-                    final_state = cast(dict, data)
-            else:
-                # Single-mode output
-                _emit_custom_event(
-                    runtime.tool_call_id, subagent_type, chunk
-                )
-                # In single-mode, assume "values" semantics
-                final_state = cast(dict, chunk)
+                    # In single-mode, assume "values" semantics
+                    final_state = cast(dict, chunk)
+                    plan.steps += 1
 
-        # If final_state is empty (shouldn't happen), fall back to invoke
-        if not final_state:
-            final_state = subagent.invoke(subagent_state, subagent_config)
+            # If final_state is empty (shouldn't happen), fall back to invoke
+            if not final_state:
+                final_state = plan.subagent.invoke(plan.state, plan.config)
+                plan.steps += 1
+        except GraphBubbleUp:
+            raise
+        except Exception as exc:
+            if is_cancellation_related(exc):
+                raise
+            if not catch_errors:
+                raise
+            return _failed(plan, exc, final_state)
+        finally:
+            _release_breakpoint(continue_id)
 
         return _return_command_with_state_update(
             final_state, runtime.tool_call_id
@@ -591,6 +954,7 @@ def _build_task_tool(
         description: str,
         subagent_type: str,
         runtime: ToolRuntime,
+        continue_id: str | None = None,
         **_extra: object,
     ) -> str | Command:
         if subagent_type not in subagent_graphs:
@@ -600,42 +964,58 @@ def _build_task_tool(
                 f"not exist, the only allowed types are {allowed}"
             )
         if not runtime.tool_call_id:
-            raise ValueError("Tool call ID is required for subagent invocation")
+            return _NO_TOOL_CALL_ID
 
-        subagent, subagent_state, subagent_config = _validate_and_prepare_state(
-            subagent_type, description, runtime
-        )
+        plan = _begin(description, subagent_type, continue_id, runtime)
+        if isinstance(plan, str):
+            return plan
+
+        if plan.cleanup_pending and plan.store is not None and plan.thread_id:
+            try:
+                await adelete_node(plan.store, plan.thread_id, plan.tool_call_id)
+            except Exception:  # pragma: no cover - defensive
+                logger.warning("Failed to clear stale snapshot", exc_info=True)
 
         final_state: dict = {}
-        async for chunk in subagent.astream(
-            subagent_state, subagent_config, stream_mode=_stream_modes
-        ):
-            if isinstance(chunk, tuple) and len(chunk) == 2:
-                mode, data = chunk
-                if mode == event_granularity:
+        try:
+            async for chunk in plan.subagent.astream(
+                plan.state, plan.config, stream_mode=_stream_modes
+            ):
+                if isinstance(chunk, tuple) and len(chunk) == 2:
+                    mode, data = chunk
+                    if mode in (event_granularity, "custom"):
+                        _emit_custom_event(
+                            runtime.tool_call_id, subagent_type, data
+                        )
+                    if mode == "values":
+                        final_state = cast(dict, data)
+                        plan.steps += 1
+                else:
+                    # Single-mode output
                     _emit_custom_event(
-                        runtime.tool_call_id, subagent_type, data
+                        runtime.tool_call_id, subagent_type, chunk
                     )
-                elif mode == "custom":
-                    _emit_custom_event(
-                        runtime.tool_call_id, subagent_type, data
-                    )
-                if mode == "values":
-                    final_state = cast(dict, data)
-            else:
-                # Single-mode output
-                _emit_custom_event(
-                    runtime.tool_call_id, subagent_type, chunk
-                )
-                # In single-mode, assume "values" semantics
-                final_state = cast(dict, chunk)
+                    # In single-mode, assume "values" semantics
+                    final_state = cast(dict, chunk)
+                    plan.steps += 1
 
-        # If streaming yielded no final state (e.g. empty subagent graph),
-        # fall back to a direct invoke.
-        if not final_state:
-            final_state = await subagent.ainvoke(
-                subagent_state, subagent_config
-            )
+            # If streaming yielded no final state (e.g. empty subagent graph),
+            # fall back to a direct invoke.
+            if not final_state:
+                final_state = await plan.subagent.ainvoke(
+                    plan.state, plan.config
+                )
+                plan.steps += 1
+        except GraphBubbleUp:
+            raise
+        except Exception as exc:
+            if is_cancellation_related(exc):
+                raise
+            if not catch_errors:
+                raise
+            return await _afailed(plan, exc, final_state)
+        finally:
+            _release_breakpoint(continue_id)
 
         return _return_command_with_state_update(
             final_state, runtime.tool_call_id
@@ -692,6 +1072,10 @@ class SubAgentMiddleware(AgentMiddleware[AgentState, ContextT, ResponseT]):
         event_granularity: EventGranularity = "updates",
         system_prompt: str | None = TASK_SYSTEM_PROMPT,
         task_description: str | None = None,
+        catch_errors: bool = True,
+        max_continue_attempts: int = 3,
+        max_children: int = 2,
+        max_root_failures_per_thread: int = 10,
     ) -> None:
         super().__init__()
 
@@ -707,6 +1091,10 @@ class SubAgentMiddleware(AgentMiddleware[AgentState, ContextT, ResponseT]):
             subagent_specs,
             event_granularity=event_granularity,
             task_description=task_description,
+            catch_errors=catch_errors,
+            max_continue_attempts=max_continue_attempts,
+            max_children=max_children,
+            max_root_failures_per_thread=max_root_failures_per_thread,
         )
 
         # Build system prompt with available agent descriptions
@@ -751,7 +1139,12 @@ class SubAgentMiddleware(AgentMiddleware[AgentState, ContextT, ResponseT]):
                     f"SubAgent '{spec.name}' must specify 'model'"
                 )
 
-            middleware: list[AgentMiddleware] = list(spec.middleware)
+            middleware: list[AgentMiddleware] = [
+                # A subagent tool failure must not abort the subagent's superstep
+                # (interrupts still bubble up untouched).
+                ToolCallErrorMiddleware(),
+                *spec.middleware,
+            ]
             if spec.interrupt_on:
                 middleware.append(
                     HumanInTheLoopMiddleware(interrupt_on=spec.interrupt_on)

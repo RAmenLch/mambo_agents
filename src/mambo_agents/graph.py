@@ -38,6 +38,7 @@ from mambo_agents.middleware.memory import (
     MemoryFormatHook,
 )
 from mambo_agents.middleware.patch_tool_calls import PatchToolCallsMiddleware
+from mambo_agents.middleware.tool_call_error import ToolCallErrorMiddleware
 from mambo_agents.middleware.goal_loop import GoalLoopConfig, GoalLoopMiddleware
 from mambo_agents.middleware.reorder_tool_messages import ReorderToolMessagesMiddleware
 from mambo_agents.middleware.security_review import (
@@ -393,6 +394,12 @@ def create_mambo_agent(
             custom_system_prompt=system_prompt or DEFAULT_SYSTEM_PROMPT,
             **_backend_tools_kwargs,
         ),
+        # Sits inside ``BackendToolsMiddleware`` on purpose: tool-execution
+        # exceptions must not abort the superstep (sibling tool results would be
+        # lost), but a failure in BackendTools' *post*-processing of an already
+        # successful result must still surface — internalizing it would drop the
+        # result and make the model redo side effects it already performed.
+        ToolCallErrorMiddleware(),
     ]
 
     # ---- Skills (opt-in) ---------------------------------------------------
@@ -578,12 +585,26 @@ def create_mambo_agent(
         )
         _subagent_task_prompt = subagents.task_system_prompt
         _subagent_task_description = subagents.task_description
+        _subagent_continuation_kwargs: dict[str, Any] = {}
+        if subagents.catch_errors is not None:
+            _subagent_continuation_kwargs["catch_errors"] = subagents.catch_errors
+        if subagents.max_continue_attempts is not None:
+            _subagent_continuation_kwargs["max_continue_attempts"] = (
+                subagents.max_continue_attempts
+            )
+        if subagents.max_children is not None:
+            _subagent_continuation_kwargs["max_children"] = subagents.max_children
+        if subagents.max_root_failures_per_thread is not None:
+            _subagent_continuation_kwargs["max_root_failures_per_thread"] = (
+                subagents.max_root_failures_per_thread
+            )
     else:
         inline_subagents = list(subagents or [])
         _gp_enabled = include_general_purpose
         _subagent_granularity = subagent_event_granularity
         _subagent_task_prompt = None
         _subagent_task_description = None
+        _subagent_continuation_kwargs = {}
 
     if _gp_enabled and not any(
         s.name == GENERAL_PURPOSE_NAME
@@ -613,6 +634,7 @@ def create_mambo_agent(
             _subagent_mw_kwargs["system_prompt"] = _subagent_task_prompt
         if _subagent_task_description is not None:
             _subagent_mw_kwargs["task_description"] = _subagent_task_description
+        _subagent_mw_kwargs.update(_subagent_continuation_kwargs)
         mw.append(
             SubAgentMiddleware(
                 backend=backend,
