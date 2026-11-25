@@ -15,6 +15,7 @@ from langgraph.prebuilt import ToolNode
 from mambo_agents.middleware.tool_call_error import (
     ToolCallErrorMiddleware,
     _is_retryable,
+    resolve_tool_error_middleware,
 )
 from mambo_agents.utils.cancellation import is_cancellation_related
 
@@ -263,6 +264,51 @@ class TestInternalization:
             for _ in range(3)
         ]
         assert flags == [False, False, False]
+
+
+class TestEscalationHook:
+    def test_hook_fires_only_when_escalated(self):
+        seen: list[tuple] = []
+        middleware = ToolCallErrorMiddleware(
+            max_consecutive_failures=2,
+            on_escalate=lambda *args: seen.append(args),
+        )
+        request = _FakeRequest(name="write", thread_id="t-hook")
+        for _ in range(3):
+            middleware.wrap_tool_call(request, _raise(RuntimeError("down")))
+        assert [(t, n, s) for t, n, s, _e in seen] == [("t-hook", "write", 3)]
+
+    def test_hook_exception_is_swallowed(self):
+        def boom(*_args):
+            raise ValueError("bad host callback")
+
+        middleware = ToolCallErrorMiddleware(
+            max_consecutive_failures=1, on_escalate=boom
+        )
+        request = _FakeRequest(thread_id="t-boom")
+        middleware.wrap_tool_call(request, _raise(RuntimeError("down")))
+        message = middleware.wrap_tool_call(request, _raise(RuntimeError("down")))
+        assert isinstance(message, ToolMessage)
+        assert message.additional_kwargs["tool_error"]["escalated"] is True
+
+
+class TestResolveToolErrorMiddleware:
+    def test_true_and_none_yield_a_default_instance(self):
+        assert isinstance(resolve_tool_error_middleware(True), ToolCallErrorMiddleware)
+        assert isinstance(
+            resolve_tool_error_middleware(None), ToolCallErrorMiddleware
+        )
+
+    def test_false_disables(self):
+        assert resolve_tool_error_middleware(False) is None
+
+    def test_instance_is_used_as_is(self):
+        instance = ToolCallErrorMiddleware(max_consecutive_failures=9)
+        assert resolve_tool_error_middleware(instance) is instance
+
+    def test_bad_type_raises(self):
+        with pytest.raises(TypeError):
+            resolve_tool_error_middleware("yes")  # type: ignore[arg-type]
 
 
 class TestRetryableClassification:

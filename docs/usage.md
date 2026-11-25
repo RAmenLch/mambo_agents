@@ -22,6 +22,7 @@
     - [Security Review Integration](#12x-security-review-integration)
     - [`mcp_tool_name()` Reference](#12x-mcp_tool_name-reference)
 13. [Multi-Agent Collaboration](#13-multi-agent-collaboration)
+    - [Sub-agent Failure Recovery & Continuation](#134-sub-agent-failure-recovery--continuation-continue_id)
 14. [Goal-Driven Loop Control](#14-goal-driven-loop-control)
 15. [Advanced Usage](#15-advanced-usage)
 
@@ -214,6 +215,7 @@ def create_mambo_agent(
     interrupt_on: dict[str, bool | InterruptOnConfig] | None = None,
     security_review: SecurityReviewConfig | None = None,
     version_control: VersionControlConfig | VersionStore | bool | None = None,
+    tool_error_handling: bool | ToolCallErrorMiddleware = True,
     checkpointer: BaseCheckpointSaver | None = None,
     store: BaseStore | None = None,
     name: str | None = None,
@@ -245,6 +247,7 @@ def create_mambo_agent(
 | `interrupt_on` | `dict` | `None` | Tool approval config. `{"write": True}` for simple enable, or `{"write": {"allowed_decisions": ["approve", "reject"]}}` to limit approval options |
 | `security_review` | `SecurityReviewConfig` | `None` | AI security pre-review config |
 | `version_control` | `VersionControlConfig` / `VersionStore` / `bool` | `None` | Version control config |
+| `tool_error_handling` | `bool` / `ToolCallErrorMiddleware` | `True` | `True` internalizes tool exceptions as error `ToolMessage`s, `False` fails fast (exception propagates), or pass an instance to tune `max_consecutive_failures` / `on_escalate` |
 | `checkpointer` | `BaseCheckpointSaver` | `InMemorySaver()` | Checkpoint persistence |
 | `store` | `BaseStore` | `None` | LangGraph Store (for backend persistence) |
 
@@ -1653,6 +1656,108 @@ calling `async_status()` or `async_list()` will auto-detect tasks that were in `
 whose threads have been lost, marking them as `crashed`. The agent can then decide whether to restart.
 
 > With the default `InMemorySaver`, state is not persisted, and all task records are lost on restart.
+
+### 13.4 Sub-agent Failure Recovery & Continuation (`continue_id`)
+
+When a synchronous sub-agent fails, `task` does not just return an error — it **saves a
+breakpoint** so the work already done is not thrown away. The model can then resume from that
+breakpoint with `continue_id`, and only the failed step is re-executed.
+
+```python
+# The model sees something like this after a failure:
+#   Subagent 'researcher' failed with TimeoutError: llm timeout
+#   Progress before failure: 3 step(s) in this run.
+#   Continuation saved: node_id="call_a1b2c3"
+#   To continue without repeating completed steps, call:
+#     task(subagent_type="researcher", continue_id="call_a1b2c3")
+
+# Resuming = one more `task` call with continue_id (description is optional;
+# it falls back to the original instruction):
+result = agent.invoke(
+    {"messages": [HumanMessage("Continue the failed research task")]},
+    config={"configurable": {"thread_id": "session-1"}},
+)
+```
+
+**What gets stored**
+
+Each failure writes a `SubAgentSnapshotNode` into the LangGraph store under the namespace
+`(thread_id, "mambo_subagent_history")` — the node keeps the chain (`parent_id` / `depth`),
+the run's own message delta, the error type/message and whether it is retryable. Snapshots are
+per-conversation, so a `continue_id` from another `thread_id` is never accepted.
+
+**Requirements**
+
+| Requirement | Notes |
+|-------------|-------|
+| A LangGraph `store` | `create_mambo_agent` defaults to `InMemoryStore()`; pass a persistent store (e.g. `AsyncSqliteStore` / `AsyncPostgresStore`) for cross-process resumption |
+| `thread_id` in the runnable config | Without it, no snapshot namespace exists and continuation degrades to "unavailable" |
+| A retryable error | Auth / validation / permission failures are marked `retryable=False`; no `continue_id` is handed back |
+
+> Async stores (`AsyncSqliteStore`, `AsyncPostgresStore`) are fully supported since 0.4.2b8 —
+> `atask` validates and writes through the async store API, so `agent.astream(...)` can resume
+> breakpoints without hitting `InvalidStateError`.
+
+**Metadata on the error `ToolMessage`**
+
+The failure message carries a machine-readable payload the host can act on:
+
+```python
+for message in result["messages"]:
+    meta = message.additional_kwargs.get("subagent_continuation")
+    if not meta:
+        continue
+    # {"available": True, "continue_id": "call_a1b2c3", "subagent_type": "researcher",
+    #  "status": "failed", "depth": 1, "max_attempts": 3, "max_children": 2,
+    #  "retryable": True, "error_type": "TimeoutError", "steps": 3, ...}
+    # available=False comes with a "reason": "not_retryable" | "exhausted"
+    #   | "root_failures_exceeded" | "snapshot_write_failed"
+    #   | "snapshot_unavailable" | "startup_failed" | "not_recorded"
+    print(meta["available"], meta.get("continue_id"), meta.get("reason"))
+```
+
+**Inspecting / validating snapshots yourself**
+
+```python
+from mambo_agents.middleware.subagent_snapshot import (
+    list_nodes,
+    validate_continuation,
+    avalidate_continuation,   # async twin — use it inside a running event loop
+)
+
+nodes = list_nodes(store, "session-1")          # every snapshot of one conversation
+check = validate_continuation(store, "session-1", "call_a1b2c3", "researcher")
+if check.ok:
+    print(check.node.depth, [m.type for m in check.history()])
+else:
+    print(check.status, check.message)
+```
+
+**Guard rails (configurable via `SubAgentConfig`)**
+
+| Field | Default | Meaning |
+|-------|---------|---------|
+| `max_continue_attempts` | `3` | Maximum chain depth a `continue_id` may reach |
+| `max_children` | `2` | How many continuations may branch off one breakpoint |
+| `max_root_failures_per_thread` | `10` | Cap on failed chain roots kept per conversation (bookkeeping only) |
+| `catch_errors` | `True` | `False` → a sub-agent exception aborts the turn instead of producing a breakpoint |
+
+```python
+from mambo_agents.middleware.subagents import SubAgentConfig
+
+agent = create_mambo_agent(
+    "gpt-4o",
+    subagents=SubAgentConfig(
+        subagents=[...],
+        max_continue_attempts=5,
+        max_children=1,
+    ),
+    store=persistent_store,
+)
+```
+
+> Continuation applies to **synchronous** sub-agents. Async sub-agents (`async_task`) use their own
+> `async_status` / crash-recovery flow described in 13.3.
 
 ---
 

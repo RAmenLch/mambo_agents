@@ -54,7 +54,10 @@ from pydantic import BaseModel, ConfigDict, Field
 
 from mambo_agents.backends.protocol import BackendProtocol
 from mambo_agents.middleware.subagents import CompiledSubAgent, SubAgent, _EXCLUDED_STATE_KEYS, _SubagentSpec
-from mambo_agents.middleware.tool_call_error import ToolCallErrorMiddleware
+from mambo_agents.middleware.tool_call_error import (
+    ToolCallErrorMiddleware,
+    resolve_tool_error_middleware,
+)
 
 # ---------------------------------------------------------------------------
 # Pydantic models
@@ -914,6 +917,7 @@ ASYNC_TASK_SYSTEM_PROMPT = """## 异步子代理 (async_task / async_status / as
 def _build_subagent_specs(
     subagents: Sequence[SubAgent | CompiledSubAgent],
     tracker: _AsyncTaskTracker,
+    tool_error_handling: bool | ToolCallErrorMiddleware = True,
 ) -> list[_SubagentSpec]:
     """Build runnable subagents from specs, injecting ``report_progress``.
 
@@ -922,6 +926,8 @@ def _build_subagent_specs(
     available).
     """
     from langchain.agents.middleware import HumanInTheLoopMiddleware
+
+    tool_error_middleware = resolve_tool_error_middleware(tool_error_handling)
 
     report_progress_tool = _build_report_progress_tool(tracker)
     specs: list[_SubagentSpec] = []
@@ -950,7 +956,11 @@ def _build_subagent_specs(
         middleware: list[Any] = [
             # A subagent tool failure must not abort the subagent's superstep
             # (interrupts still bubble up untouched).
-            ToolCallErrorMiddleware(),
+            *(
+                [tool_error_middleware]
+                if tool_error_middleware is not None
+                else []
+            ),
             *spec.middleware,
         ]
         if spec.interrupt_on:
@@ -1037,6 +1047,7 @@ class AsyncSubAgentMiddleware(AgentMiddleware[AgentState, ContextT, ResponseT]):
         async_subagents: Sequence[SubAgent | CompiledSubAgent],
         system_prompt: str | None = ASYNC_TASK_SYSTEM_PROMPT,
         default_timeout: float = 3600.0,
+        tool_error_handling: bool | ToolCallErrorMiddleware = True,
     ) -> None:
         super().__init__()
         warnings.warn(
@@ -1058,7 +1069,9 @@ class AsyncSubAgentMiddleware(AgentMiddleware[AgentState, ContextT, ResponseT]):
         self._default_timeout = default_timeout
 
         # Build subagent specs + inject report_progress
-        subagent_specs = _build_subagent_specs(async_subagents, self._tracker)
+        subagent_specs = _build_subagent_specs(
+            async_subagents, self._tracker, tool_error_handling
+        )
         subagent_graphs = {s.name: s.runnable for s in subagent_specs}
         subagent_descriptions = "\n".join(
             f"- {s.name}: {s.description}" for s in subagent_specs

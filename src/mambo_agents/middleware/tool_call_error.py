@@ -58,9 +58,15 @@ if TYPE_CHECKING:
     from langchain.agents.middleware.types import ToolCallRequest
     from langgraph.types import Command
 
+    ToolErrorEscalationHook = Callable[[str | None, str, int, BaseException], None]
+
 logger = logging.getLogger(__name__)
 
-__all__ = ["ToolCallErrorMiddleware", "is_retryable"]
+__all__ = [
+    "ToolCallErrorMiddleware",
+    "is_retryable",
+    "resolve_tool_error_middleware",
+]
 
 # Errors that point at a defect rather than at a runtime condition.  These keep
 # propagating: internalizing them would mask the bug (and the model would keep
@@ -159,6 +165,12 @@ class ToolCallErrorMiddleware(AgentMiddleware[AgentState, ContextT, ResponseT]):
             internalized.
         max_tracked_threads: Upper bound for the in-process streak table; the
             table is dropped wholesale when exceeded.
+        on_escalate: Optional hook called as
+            ``on_escalate(thread_id, tool_name, streak, exc)`` whenever a
+            failure is escalated (streak above ``max_consecutive_failures``).
+            Exceptions raised by the hook are logged and swallowed — it must
+            never affect the tool result.  This is the application-level signal
+            for "the tool subsystem is down"; use it to alert.
 
     The streak counter is process-local and only tracked when a ``thread_id`` is
     available in the runnable config — otherwise counting would lump unrelated
@@ -171,11 +183,13 @@ class ToolCallErrorMiddleware(AgentMiddleware[AgentState, ContextT, ResponseT]):
         enabled: bool = True,
         max_consecutive_failures: int = 3,
         max_tracked_threads: int = 1024,
+        on_escalate: ToolErrorEscalationHook | None = None,
     ) -> None:
         super().__init__()
         self.enabled = enabled
         self.max_consecutive_failures = max(1, int(max_consecutive_failures))
         self.max_tracked_threads = max(1, int(max_tracked_threads))
+        self.on_escalate = on_escalate
         self._lock = threading.Lock()
         self._fail_streak: dict[str, int] = {}
 
@@ -270,6 +284,7 @@ class ToolCallErrorMiddleware(AgentMiddleware[AgentState, ContextT, ResponseT]):
                 streak,
                 thread_id or "<none>",
             )
+            self._escalate(thread_id, name, streak, exc)
 
         return ToolMessage(
             content=f"Tool '{name}' failed: {detail}"[:_CONTENT_LIMIT],
@@ -291,6 +306,24 @@ class ToolCallErrorMiddleware(AgentMiddleware[AgentState, ContextT, ResponseT]):
     # ------------------------------------------------------------------
     # Failure streak bookkeeping
     # ------------------------------------------------------------------
+
+    def _escalate(
+        self,
+        thread_id: str | None,
+        tool_name: str,
+        streak: int,
+        exc: Exception,
+    ) -> None:
+        """Invoke the host hook; a broken hook must not fail the tool call."""
+        hook = self.on_escalate
+        if hook is None:
+            return
+        try:
+            hook(thread_id, tool_name, streak, exc)
+        except Exception:  # noqa: BLE001 - host code, never propagate
+            logger.warning(
+                "on_escalate hook raised; ignoring", exc_info=True
+            )
 
     @staticmethod
     def _thread_id(request: ToolCallRequest) -> str | None:
@@ -323,3 +356,24 @@ class ToolCallErrorMiddleware(AgentMiddleware[AgentState, ContextT, ResponseT]):
             return
         with self._lock:
             self._fail_streak.pop(thread_id, None)
+
+
+def resolve_tool_error_middleware(
+    setting: bool | ToolCallErrorMiddleware | None,
+) -> ToolCallErrorMiddleware | None:
+    """Normalize a host knob into a concrete instance (or ``None`` to disable).
+
+    ``True``/``None`` → a default instance, ``False`` → ``None`` (the
+    middleware is not installed at all, so exceptions propagate and the run
+    fails fast), an instance → used as-is.
+    """
+    if setting is None or setting is True:
+        return ToolCallErrorMiddleware()
+    if setting is False:
+        return None
+    if isinstance(setting, ToolCallErrorMiddleware):
+        return setting
+    raise TypeError(
+        "tool_error_handling must be a bool or a ToolCallErrorMiddleware "
+        f"instance, got {type(setting).__name__}"
+    )

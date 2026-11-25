@@ -279,6 +279,63 @@ class TestMiddlewareRouting:
         assert agent is not None
 
 
+class TestToolErrorHandling:
+    """``tool_error_handling`` controls the built-in error middleware."""
+
+    def _stack(self, monkeypatch, **kwargs) -> list:
+        import mambo_agents.graph as graph_module
+
+        captured: dict = {}
+        real = graph_module._langchain_create_agent
+
+        def spy(model, **call_kwargs):
+            captured["middleware"] = list(call_kwargs.get("middleware") or [])
+            return real(model, **call_kwargs)
+
+        monkeypatch.setattr(graph_module, "_langchain_create_agent", spy)
+        create_mambo_agent(_create_model(), backend=_make_backend(), **kwargs)
+        return captured["middleware"]
+
+    def test_default_installs_the_middleware(self, monkeypatch):
+        stack = self._stack(monkeypatch)
+        assert "ToolCallErrorMiddleware" in [type(m).__name__ for m in stack]
+
+    def test_false_leaves_it_out(self, monkeypatch):
+        stack = self._stack(monkeypatch, tool_error_handling=False)
+        assert "ToolCallErrorMiddleware" not in [type(m).__name__ for m in stack]
+
+    def test_instance_is_used_as_is(self, monkeypatch):
+        from mambo_agents.middleware.tool_call_error import ToolCallErrorMiddleware
+
+        custom = ToolCallErrorMiddleware(max_consecutive_failures=1)
+        stack = self._stack(monkeypatch, tool_error_handling=custom)
+        assert custom in stack
+
+    def test_setting_reaches_subagent_graphs(self, monkeypatch):
+        import mambo_agents.middleware.subagents as subagents_module
+
+        captured: list = []
+        real = subagents_module._langchain_create_agent
+
+        def spy(model, **call_kwargs):
+            captured.append(list(call_kwargs.get("middleware") or []))
+            return real(model, **call_kwargs)
+
+        monkeypatch.setattr(subagents_module, "_langchain_create_agent", spy)
+        create_mambo_agent(
+            _create_model(),
+            backend=_make_backend(),
+            include_general_purpose=True,
+            tool_error_handling=False,
+        )
+        assert captured
+        assert all(
+            "ToolCallErrorMiddleware"
+            not in [type(m).__name__ for m in middleware]
+            for middleware in captured
+        )
+
+
 # ============================================================================
 # Tools routing
 # ============================================================================

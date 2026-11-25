@@ -56,6 +56,7 @@ from mambo_agents.middleware.subagent_snapshot import (
     aget_node,
     alist_nodes,
     aput_node,
+    avalidate_continuation,
     build_continuation_prompt,
     build_delta,
     build_failure_content,
@@ -70,7 +71,10 @@ from mambo_agents.middleware.subagent_snapshot import (
     to_serialized,
     validate_continuation,
 )
-from mambo_agents.middleware.tool_call_error import ToolCallErrorMiddleware
+from mambo_agents.middleware.tool_call_error import (
+    ToolCallErrorMiddleware,
+    resolve_tool_error_middleware,
+)
 from mambo_agents.utils.cancellation import is_cancellation_related
 
 logger = logging.getLogger(__name__)
@@ -519,6 +523,7 @@ class _TaskRun:
     store: Any = None
     thread_id: str | None = None
     cleanup_pending: bool = False
+    breakpoint_claimed: bool = False
     steps: int = 0
 
 
@@ -664,48 +669,27 @@ def _build_task_tool(
         thread_id = configurable.get("thread_id")
         return store, (str(thread_id) if thread_id else None)
 
-    def _begin(
+    def _assemble(
         description: str,
         subagent_type: str,
         continue_id: str | None,
         runtime: ToolRuntime,
+        *,
+        store: Any,
+        thread_id: str | None,
+        continuation_enabled: bool,
+        parent: SubAgentSnapshotNode | None,
+        parent_nodes: tuple[SubAgentSnapshotNode, ...],
+        history: list[BaseMessage],
+        claimed: bool,
     ) -> _TaskRun | str:
-        """Validate the request and prepare the run; a ``str`` means rejected."""
-        store, thread_id = _snapshot_target(runtime)
-        continuation_enabled = store is not None and thread_id is not None
-
-        parent: SubAgentSnapshotNode | None = None
-        parent_nodes: tuple[SubAgentSnapshotNode, ...] = ()
-        history: list[BaseMessage] = []
-
-        if continue_id:
-            if not continuation_enabled:
-                return (
-                    "Continuation is unavailable (no store configured). "
-                    "Start a new task instead."
-                )
-            check = validate_continuation(
-                store,
-                thread_id,  # type: ignore[arg-type]
-                continue_id,
-                subagent_type,
-                max_continue_attempts=max_continue_attempts,
-                max_children=max_children,
-                in_flight=_in_flight,
-            )
-            if not check.ok:
-                return check.message
-            parent = check.node
-            parent_nodes = check.nodes
-            history = check.history()
-            if not _claim_breakpoint(continue_id):
-                return "该任务正在执行中，拒绝并发续连。"
-
+        """Build the run once the request is validated (sync/async shared)."""
         instruction = description or (
             parent.description if parent is not None else ""
         )
         if not instruction:
-            _release_breakpoint(continue_id)
+            if claimed:
+                _release_breakpoint(continue_id)
             return (
                 "Provide a `description` for a new task, or a valid "
                 "`continue_id` to resume a previous one."
@@ -752,6 +736,142 @@ def _build_task_tool(
             store=store if continuation_enabled else None,
             thread_id=thread_id if continuation_enabled else None,
             cleanup_pending=continuation_enabled,
+            breakpoint_claimed=claimed,
+        )
+
+    def _begin(
+        description: str,
+        subagent_type: str,
+        continue_id: str | None,
+        runtime: ToolRuntime,
+    ) -> _TaskRun | str:
+        """Validate the request and prepare the run; a ``str`` means rejected.
+
+        Contract: neither the ``str`` path nor an exception leaves a breakpoint
+        claim behind — only a returned :class:`_TaskRun` may hold one.
+        """
+        store, thread_id = _snapshot_target(runtime)
+        continuation_enabled = store is not None and thread_id is not None
+
+        parent: SubAgentSnapshotNode | None = None
+        parent_nodes: tuple[SubAgentSnapshotNode, ...] = ()
+        history: list[BaseMessage] = []
+        claimed = False
+
+        if continue_id:
+            if not continuation_enabled:
+                return (
+                    "Continuation is unavailable (no store configured). "
+                    "Start a new task instead."
+                )
+            check = validate_continuation(
+                store,
+                thread_id,  # type: ignore[arg-type]
+                continue_id,
+                subagent_type,
+                max_continue_attempts=max_continue_attempts,
+                max_children=max_children,
+                in_flight=_in_flight,
+            )
+            if not check.ok:
+                return check.message
+            parent = check.node
+            parent_nodes = check.nodes
+            history = check.history()
+            if not _claim_breakpoint(continue_id):
+                return "该任务正在执行中，拒绝并发续连。"
+            claimed = True
+
+        try:
+            return _assemble(
+                description,
+                subagent_type,
+                continue_id,
+                runtime,
+                store=store,
+                thread_id=thread_id,
+                continuation_enabled=continuation_enabled,
+                parent=parent,
+                parent_nodes=parent_nodes,
+                history=history,
+                claimed=claimed,
+            )
+        except BaseException:
+            if claimed:
+                _release_breakpoint(continue_id)
+            raise
+
+    async def _abegin(
+        description: str,
+        subagent_type: str,
+        continue_id: str | None,
+        runtime: ToolRuntime,
+    ) -> _TaskRun | str:
+        """Async twin of :func:`_begin` — uses the async store API throughout."""
+        store, thread_id = _snapshot_target(runtime)
+        continuation_enabled = store is not None and thread_id is not None
+
+        parent: SubAgentSnapshotNode | None = None
+        parent_nodes: tuple[SubAgentSnapshotNode, ...] = ()
+        history: list[BaseMessage] = []
+        claimed = False
+
+        if continue_id:
+            if not continuation_enabled:
+                return (
+                    "Continuation is unavailable (no store configured). "
+                    "Start a new task instead."
+                )
+            check = await avalidate_continuation(
+                store,
+                thread_id,  # type: ignore[arg-type]
+                continue_id,
+                subagent_type,
+                max_continue_attempts=max_continue_attempts,
+                max_children=max_children,
+                in_flight=_in_flight,
+            )
+            if not check.ok:
+                return check.message
+            parent = check.node
+            parent_nodes = check.nodes
+            history = check.history()
+            if not _claim_breakpoint(continue_id):
+                return "该任务正在执行中，拒绝并发续连。"
+            claimed = True
+
+        try:
+            return _assemble(
+                description,
+                subagent_type,
+                continue_id,
+                runtime,
+                store=store,
+                thread_id=thread_id,
+                continuation_enabled=continuation_enabled,
+                parent=parent,
+                parent_nodes=parent_nodes,
+                history=history,
+                claimed=claimed,
+            )
+        except BaseException:
+            if claimed:
+                _release_breakpoint(continue_id)
+            raise
+
+    def _synthetic_run(
+        tool_call_id: str, subagent_type: str, description: str
+    ) -> _TaskRun:
+        """Carrier for a failure raised before the real run could be built."""
+        return _TaskRun(
+            tool_call_id=tool_call_id,
+            subagent_type=subagent_type,
+            instruction=description,
+            subagent=None,  # type: ignore[arg-type]
+            state={},
+            config={},
+            injected=[],
+            injected_ids=set(),
         )
 
     def _new_failure_node(
@@ -878,6 +998,22 @@ def _build_task_tool(
                 available, reason = False, "snapshot_write_failed"
         return _failure_result(plan, node, available, reason, final_state)
 
+    def _startup_failure(
+        tool_call_id: str,
+        subagent_type: str,
+        description: str,
+        exc: Exception,
+    ) -> Command:
+        """Failure raised before the run could be assembled.
+
+        Mirrors ``_failed`` (same wording, same ``subagent_continuation``
+        metadata) but never touches the store: no run started, so there is
+        nothing to resume and a store write would likely fail again.
+        """
+        plan = _synthetic_run(tool_call_id, subagent_type, description)
+        node = _new_failure_node(plan, exc, {})
+        return _failure_result(plan, node, False, "startup_failed", {})
+
     # ---- sync task ----------------------------------------------------------
 
     def task(
@@ -896,18 +1032,24 @@ def _build_task_tool(
         if not runtime.tool_call_id:
             return _NO_TOOL_CALL_ID
 
-        plan = _begin(description, subagent_type, continue_id, runtime)
-        if isinstance(plan, str):
-            return plan
-
-        if plan.cleanup_pending and plan.store is not None and plan.thread_id:
-            try:
-                delete_node(plan.store, plan.thread_id, plan.tool_call_id)
-            except Exception:  # pragma: no cover - defensive
-                logger.warning("Failed to clear stale snapshot", exc_info=True)
-
+        startup = _synthetic_run(
+            runtime.tool_call_id, subagent_type, description
+        )
+        plan: _TaskRun | str = startup
         final_state: dict = {}
         try:
+            plan = _begin(description, subagent_type, continue_id, runtime)
+            if isinstance(plan, str):
+                return plan
+
+            if plan.cleanup_pending and plan.store is not None and plan.thread_id:
+                try:
+                    delete_node(plan.store, plan.thread_id, plan.tool_call_id)
+                except Exception:  # pragma: no cover - defensive
+                    logger.warning(
+                        "Failed to clear stale snapshot", exc_info=True
+                    )
+
             for chunk in plan.subagent.stream(
                 plan.state, plan.config, stream_mode=_stream_modes
             ):
@@ -940,9 +1082,14 @@ def _build_task_tool(
                 raise
             if not catch_errors:
                 raise
-            return _failed(plan, exc, final_state)
+            if plan is startup:
+                return _startup_failure(
+                    runtime.tool_call_id, subagent_type, description, exc
+                )
+            return _failed(cast(_TaskRun, plan), exc, final_state)
         finally:
-            _release_breakpoint(continue_id)
+            if isinstance(plan, _TaskRun) and plan.breakpoint_claimed:
+                _release_breakpoint(continue_id)
 
         return _return_command_with_state_update(
             final_state, runtime.tool_call_id
@@ -966,18 +1113,24 @@ def _build_task_tool(
         if not runtime.tool_call_id:
             return _NO_TOOL_CALL_ID
 
-        plan = _begin(description, subagent_type, continue_id, runtime)
-        if isinstance(plan, str):
-            return plan
-
-        if plan.cleanup_pending and plan.store is not None and plan.thread_id:
-            try:
-                await adelete_node(plan.store, plan.thread_id, plan.tool_call_id)
-            except Exception:  # pragma: no cover - defensive
-                logger.warning("Failed to clear stale snapshot", exc_info=True)
-
+        startup = _synthetic_run(
+            runtime.tool_call_id, subagent_type, description
+        )
+        plan: _TaskRun | str = startup
         final_state: dict = {}
         try:
+            plan = await _abegin(description, subagent_type, continue_id, runtime)
+            if isinstance(plan, str):
+                return plan
+
+            if plan.cleanup_pending and plan.store is not None and plan.thread_id:
+                try:
+                    await adelete_node(plan.store, plan.thread_id, plan.tool_call_id)
+                except Exception:  # pragma: no cover - defensive
+                    logger.warning(
+                        "Failed to clear stale snapshot", exc_info=True
+                    )
+
             async for chunk in plan.subagent.astream(
                 plan.state, plan.config, stream_mode=_stream_modes
             ):
@@ -1013,9 +1166,14 @@ def _build_task_tool(
                 raise
             if not catch_errors:
                 raise
-            return await _afailed(plan, exc, final_state)
+            if plan is startup:
+                return _startup_failure(
+                    runtime.tool_call_id, subagent_type, description, exc
+                )
+            return await _afailed(cast(_TaskRun, plan), exc, final_state)
         finally:
-            _release_breakpoint(continue_id)
+            if isinstance(plan, _TaskRun) and plan.breakpoint_claimed:
+                _release_breakpoint(continue_id)
 
         return _return_command_with_state_update(
             final_state, runtime.tool_call_id
@@ -1062,6 +1220,9 @@ class SubAgentMiddleware(AgentMiddleware[AgentState, ContextT, ResponseT]):
         system_prompt: Instructions appended to the main agent's system
             prompt about using the task tool.
         task_description: Custom description for the task tool.
+        tool_error_handling: ``True`` installs a ``ToolCallErrorMiddleware`` in
+            each auto-built subagent graph, ``False`` leaves it out (tool
+            exceptions propagate), or pass an instance to tune / observe it.
     """
 
     def __init__(
@@ -1076,6 +1237,7 @@ class SubAgentMiddleware(AgentMiddleware[AgentState, ContextT, ResponseT]):
         max_continue_attempts: int = 3,
         max_children: int = 2,
         max_root_failures_per_thread: int = 10,
+        tool_error_handling: bool | ToolCallErrorMiddleware = True,
     ) -> None:
         super().__init__()
 
@@ -1085,6 +1247,9 @@ class SubAgentMiddleware(AgentMiddleware[AgentState, ContextT, ResponseT]):
         self._backend = backend
         self._subagents = subagents
         self._event_granularity = event_granularity
+        self._tool_error_middleware = resolve_tool_error_middleware(
+            tool_error_handling
+        )
 
         subagent_specs = self._get_subagents()
         task_tool = _build_task_tool(
@@ -1142,7 +1307,11 @@ class SubAgentMiddleware(AgentMiddleware[AgentState, ContextT, ResponseT]):
             middleware: list[AgentMiddleware] = [
                 # A subagent tool failure must not abort the subagent's superstep
                 # (interrupts still bubble up untouched).
-                ToolCallErrorMiddleware(),
+                *(
+                    [self._tool_error_middleware]
+                    if self._tool_error_middleware is not None
+                    else []
+                ),
                 *spec.middleware,
             ]
             if spec.interrupt_on:

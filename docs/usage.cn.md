@@ -22,6 +22,7 @@
     - [安全审查集成](#12x-安全审查集成)
     - [`mcp_tool_name()` 参考](#12x-mcp_tool_name-参考)
 13. [多 Agent 协作](#13-多-agent-协作)
+    - [子代理失败恢复与续连](#134-子代理失败恢复与续连continue_id)
 14. [目标驱动循环](#14-目标驱动循环)
 15. [高级用法](#15-高级用法)
 
@@ -214,6 +215,7 @@ def create_mambo_agent(
     interrupt_on: dict[str, bool | InterruptOnConfig] | None = None,
     security_review: SecurityReviewConfig | None = None,
     version_control: VersionControlConfig | VersionStore | bool | None = None,
+    tool_error_handling: bool | ToolCallErrorMiddleware = True,
     checkpointer: BaseCheckpointSaver | None = None,
     store: BaseStore | None = None,
     name: str | None = None,
@@ -245,6 +247,7 @@ def create_mambo_agent(
 | `interrupt_on` | `dict` | `None` | 工具审批配置。`{"write": True}` 简单启用，或 `{"write": {"allowed_decisions": ["approve", "reject"]}}` 限制审批选项 |
 | `security_review` | `SecurityReviewConfig` | `None` | AI 安全预审配置 |
 | `version_control` | `VersionControlConfig` / `VersionStore` / `bool` | `None` | 版本控制配置 |
+| `tool_error_handling` | `bool` / `ToolCallErrorMiddleware` | `True` | `True` 把工具异常内化成错误 `ToolMessage`，`False` 快速失败（异常上抛），也可传实例以调节 `max_consecutive_failures` / `on_escalate` |
 | `checkpointer` | `BaseCheckpointSaver` | `InMemorySaver()` | 检查点持久化 |
 | `store` | `BaseStore` | `None` | LangGraph Store（用于后端持久化）|
 
@@ -1601,6 +1604,106 @@ result = agent.invoke(
 自动标记为 `crashed`，Agent 可据此决定是否重新启动任务。
 
 > 使用默认的 `InMemorySaver` 时状态不持久化，重启后所有任务记录丢失，无法恢复。
+
+### 13.4 子代理失败恢复与续连（`continue_id`）
+
+同步子代理失败时，`task` 不是简单返回错误，而是**保存一个断点**，让已经完成的步骤不被浪费。
+模型可以用 `continue_id` 从该断点继续，只重跑失败的那一步。
+
+```python
+# 失败后模型看到的返回大致如下：
+#   Subagent 'researcher' failed with TimeoutError: llm timeout
+#   Progress before failure: 3 step(s) in this run.
+#   Continuation saved: node_id="call_a1b2c3"
+#   To continue without repeating completed steps, call:
+#     task(subagent_type="researcher", continue_id="call_a1b2c3")
+
+# 续连 = 再发一次带 continue_id 的 task 调用（description 可省略，
+# 省略时沿用原始指令）：
+result = agent.invoke(
+    {"messages": [HumanMessage("继续完成刚才失败的研究任务")]},
+    config={"configurable": {"thread_id": "session-1"}},
+)
+```
+
+**存档位置**
+
+每次失败会把一个 `SubAgentSnapshotNode` 写入 LangGraph store 的
+`(thread_id, "mambo_subagent_history")` 命名空间 —— 节点里保存了链路（`parent_id` / `depth`）、
+本次运行自己的消息增量、错误类型/信息以及是否可重试。存档按会话隔离，所以别的
+`thread_id` 的 `continue_id` 不会被接受。
+
+**生效前提**
+
+| 前提 | 说明 |
+|------|------|
+| 存在 LangGraph `store` | `create_mambo_agent` 默认 `InMemoryStore()`；跨进程续连需传持久化 store（如 `AsyncSqliteStore` / `AsyncPostgresStore`）|
+| 运行配置里有 `thread_id` | 没有它就没有存档命名空间，续连会降级为「不可用」|
+| 错误可重试 | 认证/参数/权限类错误标记为 `retryable=False`，不会把 `continue_id` 交给模型 |
+
+> 自 0.4.2b8 起**完全支持异步 store**（`AsyncSqliteStore`、`AsyncPostgresStore`）：
+> `atask` 的校验与写入全部走异步 API，`agent.astream(...)` 续连不会再抛 `InvalidStateError`。
+
+**错误 `ToolMessage` 上的元数据**
+
+失败消息带一份宿主可直接使用的结构化载荷：
+
+```python
+for message in result["messages"]:
+    meta = message.additional_kwargs.get("subagent_continuation")
+    if not meta:
+        continue
+    # {"available": True, "continue_id": "call_a1b2c3", "subagent_type": "researcher",
+    #  "status": "failed", "depth": 1, "max_attempts": 3, "max_children": 2,
+    #  "retryable": True, "error_type": "TimeoutError", "steps": 3, ...}
+    # available=False 时会带 "reason"："not_retryable" | "exhausted"
+    #   | "root_failures_exceeded" | "snapshot_write_failed"
+    #   | "snapshot_unavailable" | "startup_failed" | "not_recorded"
+    print(meta["available"], meta.get("continue_id"), meta.get("reason"))
+```
+
+**自己校验/查看存档**
+
+```python
+from mambo_agents.middleware.subagent_snapshot import (
+    list_nodes,
+    validate_continuation,
+    avalidate_continuation,   # 异步孪生版 —— 在事件循环内请用这个
+)
+
+nodes = list_nodes(store, "session-1")          # 某会话的全部存档
+check = validate_continuation(store, "session-1", "call_a1b2c3", "researcher")
+if check.ok:
+    print(check.node.depth, [m.type for m in check.history()])
+else:
+    print(check.status, check.message)
+```
+
+**护栏（通过 `SubAgentConfig` 调整）**
+
+| 字段 | 默认值 | 含义 |
+|------|--------|------|
+| `max_continue_attempts` | `3` | `continue_id` 链路最大深度 |
+| `max_children` | `2` | 同一断点最多被续连几次 |
+| `max_root_failures_per_thread` | `10` | 每会话保留的失败链根上限（只影响存档记账）|
+| `catch_errors` | `True` | `False` 时子代理异常直接中断本轮，不产生断点 |
+
+```python
+from mambo_agents.middleware.subagents import SubAgentConfig
+
+agent = create_mambo_agent(
+    "gpt-4o",
+    subagents=SubAgentConfig(
+        subagents=[...],
+        max_continue_attempts=5,
+        max_children=1,
+    ),
+    store=persistent_store,
+)
+```
+
+> 续连仅适用于**同步**子代理。异步子代理（`async_task`）使用 13.3 介绍的
+> `async_status` / 崩溃恢复流程。
 
 ---
 

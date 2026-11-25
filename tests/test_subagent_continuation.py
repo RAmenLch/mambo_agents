@@ -9,11 +9,16 @@ import pytest
 from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
 from langchain_core.runnables import RunnableSerializable
 from langgraph.prebuilt.tool_node import ToolRuntime
+from langgraph.store.base import Item
+from langgraph.store.base.batch import AsyncBatchedBaseStore
 from langgraph.store.memory import InMemoryStore
+from langgraph.types import Command
 from pydantic import ConfigDict, Field
 
 from mambo_agents.middleware.subagent_snapshot import (
     SubAgentSnapshotNode,
+    aget_node,
+    aput_node,
     build_delta,
     get_chain,
     get_node,
@@ -515,3 +520,219 @@ class TestDelta:
         produced = [*history, instruction, AIMessage(content="ok", id="a1")]
         delta = build_delta(history, produced, injected_ids={"h1"})
         assert [type(m).__name__ for m in delta] == ["HumanMessage", "AIMessage"]
+
+
+# ---------------------------------------------------------------------------
+# async-only stores (AsyncSqliteStore / AsyncPostgresStore hosts)
+# ---------------------------------------------------------------------------
+_TS = "2024-01-01T00:00:00+00:00"
+
+
+class AsyncOnlyStore(AsyncBatchedBaseStore):
+    """In-memory ``AsyncBatchedBaseStore``: sync API raises inside a loop.
+
+    Same contract as ``AsyncSqliteStore`` — no extra dependency needed.
+    ``fail_next`` makes the next *async* read/write raise, to exercise the
+    startup-failure path.
+    """
+
+    def __init__(self) -> None:
+        super().__init__()
+        self._data: dict[tuple[tuple[str, ...], str], Any] = {}
+        self.fail_next = False
+
+    def _maybe_fail(self) -> None:
+        if self.fail_next:
+            self.fail_next = False
+            raise RuntimeError("store backend down")
+
+    async def aget(self, namespace, key, *, refresh_ttl=None):
+        self._maybe_fail()
+        return self._data.get((tuple(namespace), key))
+
+    async def aput(self, namespace, key, value, index=None, *, ttl=None):
+        self._maybe_fail()
+        item = Item(
+            namespace=tuple(namespace),
+            key=key,
+            value=value,
+            created_at=_TS,
+            updated_at=_TS,
+        )
+        self._data[(tuple(namespace), key)] = item
+        return None
+
+    async def adelete(self, namespace, key):
+        self._maybe_fail()
+        self._data.pop((tuple(namespace), key), None)
+
+    async def asearch(
+        self,
+        namespace_prefix,
+        /,
+        *,
+        query=None,
+        filter=None,
+        limit=10,
+        offset=0,
+        refresh_ttl=None,
+    ):
+        self._maybe_fail()
+        prefix = tuple(namespace_prefix)
+        items = [
+            value
+            for (namespace, _key), value in self._data.items()
+            if namespace[: len(prefix)] == prefix
+        ]
+        return items[offset : offset + limit]
+
+    async def alist_namespaces(
+        self, *, match=None, max_depth=None, limit=100, offset=0
+    ):
+        self._maybe_fail()
+        return []
+
+    async def abatch(self, ops):
+        raise NotImplementedError
+
+
+class FailingSyncStore(InMemoryStore):
+    """``InMemoryStore`` whose sync API can be made to blow up."""
+
+    fail_next: bool = False
+
+    def get(self, *args, **kwargs):  # noqa: A003
+        if self.fail_next:
+            self.fail_next = False
+            raise RuntimeError("store backend down")
+        return super().get(*args, **kwargs)
+
+
+class TestAsyncStoreContinuation:
+    def test_sync_validation_is_the_thing_that_breaks(self):
+        """Guards the reason ``_abegin`` exists: sync API dies in a loop."""
+
+        async def scenario() -> None:
+            store = AsyncOnlyStore()
+            node = SubAgentSnapshotNode(node_id="n1", subagent_type="x")
+            await aput_node(store, "t1", node)
+            assert (await aget_node(store, "t1", "n1")) is not None
+            with pytest.raises(asyncio.InvalidStateError):
+                validate_continuation(store, "t1", "n1", "x")
+
+        asyncio.run(scenario())
+
+    def test_async_failure_then_continue_on_async_only_store(self):
+        async def scenario() -> None:
+            tool, stub = make_tool()
+            store = AsyncOnlyStore()
+            runtime = make_runtime(store=store, tool_call_id="a1")
+
+            failed = await tool.coroutine(
+                description="scan src",
+                subagent_type="researcher",
+                runtime=runtime,
+            )
+            assert isinstance(failed, Command)
+            assert error_message(failed).status == "error"
+
+            done = await tool.coroutine(
+                description="",
+                subagent_type="researcher",
+                continue_id="a1",
+                runtime=make_runtime(store=store, tool_call_id="a2"),
+            )
+            assert isinstance(done, Command)
+            assert error_message(done).status == "success"
+            assert stub.fed[-1][0] == ("HumanMessage", "scan src")
+
+        asyncio.run(scenario())
+
+
+class TestStartupFailure:
+    """Failures raised by ``_begin`` itself must not escape the tool."""
+
+    def test_sync_begin_failure_becomes_error_tool_message(self):
+        tool, _ = make_tool()
+        store = FailingSyncStore()
+        put_node(store, "t1", SubAgentSnapshotNode(node_id="c1", subagent_type="researcher"))
+        store.fail_next = True
+
+        result = tool.func(
+            description="",
+            subagent_type="researcher",
+            continue_id="c1",
+            runtime=make_runtime(store=store, tool_call_id="c2"),
+        )
+        message = error_message(result)
+        assert message.status == "error"
+        assert "RuntimeError" in message.content
+        meta = message.additional_kwargs["subagent_continuation"]
+        assert meta["available"] is False
+        assert meta["reason"] == "startup_failed"
+
+    def test_begin_failure_does_not_leak_the_breakpoint(self):
+        tool, _ = make_tool()
+        store = FailingSyncStore()
+        put_node(store, "t1", SubAgentSnapshotNode(node_id="c1", subagent_type="researcher"))
+        store.fail_next = True
+
+        tool.func(
+            description="",
+            subagent_type="researcher",
+            continue_id="c1",
+            runtime=make_runtime(store=store, tool_call_id="c2"),
+        )
+        # A leaked claim would make the retry fail with "busy".
+        check = validate_continuation(store, "t1", "c1", "researcher")
+        assert check.ok, check.message
+
+    def test_async_begin_failure_is_internalized(self):
+        async def scenario() -> None:
+            tool, stub = make_tool()
+            store = AsyncOnlyStore()
+            await aput_node(
+                store, "t1", SubAgentSnapshotNode(node_id="a1", subagent_type="researcher")
+            )
+            store.fail_next = True
+
+            result = await tool.coroutine(
+                description="",
+                subagent_type="researcher",
+                continue_id="a1",
+                runtime=make_runtime(store=store, tool_call_id="a2"),
+            )
+            assert isinstance(result, Command)
+            message = error_message(result)
+            assert "RuntimeError" in message.content
+            assert (
+                message.additional_kwargs["subagent_continuation"]["reason"]
+                == "startup_failed"
+            )
+
+            # The stub raises on its first run per thread; the startup failure
+            # never reached it, so pre-mark the thread as already seen.
+            stub.seen["t1"] = 1
+            retry = await tool.coroutine(
+                description="scan src",
+                subagent_type="researcher",
+                continue_id="a1",
+                runtime=make_runtime(store=store, tool_call_id="a3"),
+            )
+            assert error_message(retry).status == "success"
+
+        asyncio.run(scenario())
+
+    def test_catch_errors_false_still_raises(self):
+        tool, _ = make_tool(catch_errors=False)
+        store = FailingSyncStore()
+        put_node(store, "t1", SubAgentSnapshotNode(node_id="c1", subagent_type="researcher"))
+        store.fail_next = True
+        with pytest.raises(RuntimeError):
+            tool.func(
+                description="",
+                subagent_type="researcher",
+                continue_id="c1",
+                runtime=make_runtime(store=store, tool_call_id="c2"),
+            )
+

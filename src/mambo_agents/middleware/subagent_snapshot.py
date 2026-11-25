@@ -49,6 +49,7 @@ __all__ = [
     "aget_node",
     "alist_nodes",
     "aput_node",
+    "avalidate_continuation",
     "build_continuation_prompt",
     "build_delta",
     "build_failure_content",

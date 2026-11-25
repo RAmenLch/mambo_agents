@@ -38,7 +38,10 @@ from mambo_agents.middleware.memory import (
     MemoryFormatHook,
 )
 from mambo_agents.middleware.patch_tool_calls import PatchToolCallsMiddleware
-from mambo_agents.middleware.tool_call_error import ToolCallErrorMiddleware
+from mambo_agents.middleware.tool_call_error import (
+    ToolCallErrorMiddleware,
+    resolve_tool_error_middleware,
+)
 from mambo_agents.middleware.goal_loop import GoalLoopConfig, GoalLoopMiddleware
 from mambo_agents.middleware.reorder_tool_messages import ReorderToolMessagesMiddleware
 from mambo_agents.middleware.security_review import (
@@ -113,6 +116,7 @@ def create_mambo_agent(
     interrupt_on: dict[str, bool | InterruptOnConfig] | None = None,
     security_review: SecurityReviewConfig | None = None,
     version_control: VersionControlConfig | VersionStore | bool | None = None,
+    tool_error_handling: bool | ToolCallErrorMiddleware = True,
     checkpointer: BaseCheckpointSaver | None = None,
     store: BaseStore | None = None,
     name: str | None = None,
@@ -305,6 +309,18 @@ def create_mambo_agent(
               (default 5, only used when ``review_mode="agent"``).
 
             Default: ``None`` (no AI pre-screening, classic HITL).
+        tool_error_handling: How tool-execution exceptions are handled.
+
+            - ``True`` (default): install a ``ToolCallErrorMiddleware`` that
+              converts exceptions into ``ToolMessage(status="error")`` so a
+              failing tool cannot abort the superstep.
+            - ``False``: do not install it — a tool exception propagates and
+              the run fails fast (easier to alert on, no silent degradation).
+            - A ``ToolCallErrorMiddleware`` instance: used as-is, so the host
+              can tune ``max_consecutive_failures`` or pass an
+              ``on_escalate`` hook to observe failures.
+
+            The setting also applies to auto-built subagent graphs.
         checkpointer: Optional LangGraph checkpointer.  Required when using
             ``interrupt_on``.
         store: Optional LangGraph store.
@@ -394,13 +410,15 @@ def create_mambo_agent(
             custom_system_prompt=system_prompt or DEFAULT_SYSTEM_PROMPT,
             **_backend_tools_kwargs,
         ),
-        # Sits inside ``BackendToolsMiddleware`` on purpose: tool-execution
-        # exceptions must not abort the superstep (sibling tool results would be
-        # lost), but a failure in BackendTools' *post*-processing of an already
-        # successful result must still surface — internalizing it would drop the
-        # result and make the model redo side effects it already performed.
-        ToolCallErrorMiddleware(),
     ]
+    # Sits inside ``BackendToolsMiddleware`` on purpose: tool-execution
+    # exceptions must not abort the superstep (sibling tool results would be
+    # lost), but a failure in BackendTools' *post*-processing of an already
+    # successful result must still surface — internalizing it would drop the
+    # result and make the model redo side effects it already performed.
+    _tool_error_middleware = resolve_tool_error_middleware(tool_error_handling)
+    if _tool_error_middleware is not None:
+        mw.append(_tool_error_middleware)
 
     # ---- Skills (opt-in) ---------------------------------------------------
     if skills is not None:
@@ -640,6 +658,7 @@ def create_mambo_agent(
                 backend=backend,
                 subagents=inline_subagents,
                 event_granularity=_subagent_granularity,
+                tool_error_handling=tool_error_handling,
                 **_subagent_mw_kwargs,
             )
         )
@@ -666,6 +685,7 @@ def create_mambo_agent(
                 backend=backend,
                 async_subagents=_async_list,
                 default_timeout=_async_timeout,
+                tool_error_handling=tool_error_handling,
                 **_async_mw_kwargs,
             )
         )
